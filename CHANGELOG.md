@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `false` to keep per-thread sessions while requiring a trigger or app mention.
 - **Matrix explicit-trigger mode** - Set `matrix.respondToThreadReplies` to
   `false` to keep per-thread sessions while requiring explicit invocation.
+- **Telegram explicit-trigger mode** - Set
+  `telegram.respondToImplicitTopicReplies` to `false` to keep per-topic
+  sessions while requiring explicit invocation, except direct bot replies.
 
 ### Fixed
 - **ACP debug log startup** - `BRIDGE_DEBUG=1` now creates the missing `logs/`

@@ -9,6 +9,7 @@ import {
   buildTelegramSessionId,
   normalizeTelegramEventContext,
   shouldHandleImplicitTopicReply,
+  canTelegramAttachmentsBypassTrigger,
   shouldHandleTelegramBotReply,
   type TelegramNormalizeInput,
 } from "../../connectors/telegram"
@@ -253,6 +254,18 @@ describe("shouldHandleImplicitTopicReply", () => {
     ).toBe(true)
   })
 
+  test("rejects plain topic replies when implicit follow-ups are disabled", () => {
+    expect(
+      shouldHandleImplicitTopicReply({
+        enabled: false,
+        text: "continue this",
+        isPrivate: false,
+        messageThreadId: 7,
+        trigger: "!oc",
+      })
+    ).toBe(false)
+  })
+
   test("rejects DM (private chat)", () => {
     expect(
       shouldHandleImplicitTopicReply({
@@ -353,6 +366,48 @@ describe("shouldHandleImplicitTopicReply", () => {
         trigger: "!oc",
       })
     ).toBe(true)
+  })
+})
+
+// =============================================================================
+// canTelegramAttachmentsBypassTrigger
+// =============================================================================
+
+const ATTACHMENT_BASE = {
+  hasAttachments: true,
+  isPrivate: false,
+  implicitTopicRepliesEnabled: true,
+  threadIsolation: true,
+  messageThreadId: 7,
+  isReplyToThisBot: false,
+  hasActiveSession: true,
+}
+
+describe("canTelegramAttachmentsBypassTrigger", () => {
+  test("accepts attachments in an active topic", () => {
+    expect(canTelegramAttachmentsBypassTrigger(ATTACHMENT_BASE)).toBe(true)
+  })
+
+  test("rejects implicit topic attachments when follow-ups are disabled", () => {
+    expect(canTelegramAttachmentsBypassTrigger({
+      ...ATTACHMENT_BASE,
+      implicitTopicRepliesEnabled: false,
+    })).toBe(false)
+  })
+
+  test("still accepts direct replies to the bot when topic follow-ups are disabled", () => {
+    expect(canTelegramAttachmentsBypassTrigger({
+      ...ATTACHMENT_BASE,
+      implicitTopicRepliesEnabled: false,
+      isReplyToThisBot: true,
+    })).toBe(true)
+  })
+
+  test("requires an active session outside direct messages", () => {
+    expect(canTelegramAttachmentsBypassTrigger({
+      ...ATTACHMENT_BASE,
+      hasActiveSession: false,
+    })).toBe(false)
   })
 })
 

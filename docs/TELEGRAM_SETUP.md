@@ -61,6 +61,7 @@ installations), add to `chat-bridge.json`:
     "token": "{env:TELEGRAM_BOT_TOKEN}",
     "respondToMentions": true,
     "threadIsolation": true,
+    "respondToImplicitTopicReplies": true,
     "respondToReplies": true,
     "attachments": {
       "enabled": true,
@@ -77,9 +78,11 @@ installations), add to `chat-bridge.json`:
 All keys are optional except `enabled` and `token`. `respondToMentions` (default
 `true`) makes the bot also reply when you `@`-mention it in groups (in
 addition to the trigger prefix). `threadIsolation` (default `true`) gives each
-forum topic its own isolated OpenCode session. `respondToReplies` (default
-`true`) makes the bot also reply when you swipe-reply to one of its own
-messages, even without a trigger prefix; set it to `false` to disable.
+forum topic its own isolated OpenCode session. `respondToImplicitTopicReplies`
+(default `true`) allows plain and attachment-only messages to continue an
+active topic; set it to `false` to require a trigger or mention there.
+`respondToReplies` (default `true`) separately controls swipe-replies to the
+bot's own messages, even without a trigger prefix.
 `attachments.enabled` (default `true`) controls incoming file downloads;
 `attachments.maxFileBytes` is capped at Telegram Bot API's 20 MB limit and
 `attachments.maxFilesPerMessage` defaults to 4.
@@ -99,6 +102,8 @@ Expected output:
   Session storage: ~/.cache/opencode-chat-bridge/sessions
   Thread isolation: on (per-topic sessions)
   Respond to mentions: on
+  Implicit topic replies: on
+  Respond to replies: on
 [TELEGRAM] Cleaning up old sessions...
   Bot: @your_bot (id=1234567890)
   Webhook cleared
@@ -138,8 +143,8 @@ A message becomes a query when:
 1. It starts with `${TRIGGER}` (e.g., `!oc summarize this`), or
 2. It `@`-mentions the bot (e.g., `@your_bot hello`), or
 3. It is sent to the bot in a private chat (auto-handled, no prefix needed), or
-4. It is a plain reply inside an active topic when `threadIsolation` is on
-   (the connector continues the conversation without re-mentioning), or
+4. It is a plain reply inside an active topic when `threadIsolation` and
+   `respondToImplicitTopicReplies` are on, or
 5. It is a swipe-reply to one of this bot's own messages, when
    `respondToReplies` is on (default `true`). This makes the bot answer when
    you long-press its message and tap "Reply", even in a regular group with
@@ -169,6 +174,8 @@ is an independent sub-chat identified by `message_thread_id`.
   `${chatId}:${messageThreadId}`. Each topic has its own conversation history.
 - `threadIsolation: false`: one session per `chatId`. All topics in the
   supergroup share conversation history.
+- `respondToImplicitTopicReplies: false`: keep isolated topic sessions but
+  require a trigger or mention for messages that are not direct replies to the bot.
 
 In both cases, **replies are always posted inside the topic the user wrote
 from** (using `message_thread_id`). `threadIsolation` only controls SESSION
@@ -202,8 +209,9 @@ LLM alongside the message caption, so:
   reads the file directly.
 - **Caption-less attachment in a DM** -> the bot still triggers because the
   presence of an attachment counts as engagement. In groups the trigger
-  requirement still applies unless the message is inside an active topic or is
-  a reply to this bot in an active session.
+  requirement still applies unless the message is inside an active topic with
+  `respondToImplicitTopicReplies` enabled or is a reply to this bot in an
+  active session.
 - **Voice / video / animation** -> downloaded with default MIME types; the LLM
   treats them as opaque file paths for whatever tool you have configured
   (e.g., a transcription MCP server).

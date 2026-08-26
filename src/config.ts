@@ -75,6 +75,8 @@ export interface TelegramConfig {
   /** Per-topic sessions in forum supergroups (chatId:messageThreadId).
    *  When false, all messages in a chat share one session. */
   threadIsolation: boolean
+  /** Forward plain messages and attachment-only messages in active topics. */
+  respondToImplicitTopicReplies: boolean
   /** Respond when the user replies (swipe-reply) to a message from this bot,
    *  even when the message doesn't start with the trigger or @mention.
    *  Always on in DMs (no-op), and in groups/topic replies the connector
@@ -237,6 +239,7 @@ const defaultConfig: ChatBridgeConfig = {
     token: "",
     respondToMentions: true,
     threadIsolation: true,
+    respondToImplicitTopicReplies: true,
     respondToReplies: true,
     attachments: {
       enabled: true,

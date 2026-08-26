@@ -443,12 +443,14 @@ export function normalizeTelegramEventContext(
  * context.sessionId; this only decides eligibility.
  */
 export function shouldHandleImplicitTopicReply(input: {
+  enabled?: boolean
   text: string
   isPrivate: boolean
   messageThreadId: number | null
   trigger: string
   botUsername?: string
 }): boolean {
+  if (input.enabled === false) return false
   if (!input.text) return false
   if (input.isPrivate) return false
   if (input.messageThreadId === null) return false
@@ -464,20 +466,26 @@ export function shouldHandleImplicitTopicReply(input: {
   return true
 }
 
+/** Decide whether attachments alone are enough to invoke the bot. */
+export function canTelegramAttachmentsBypassTrigger(input: {
+  hasAttachments: boolean
+  isPrivate: boolean
+  implicitTopicRepliesEnabled: boolean
+  threadIsolation: boolean
+  messageThreadId: number | null
+  isReplyToThisBot: boolean
+  hasActiveSession: boolean
+}): boolean {
+  if (!input.hasAttachments) return false
+  if (input.isPrivate) return true
+  if (!input.hasActiveSession) return false
+  if (input.isReplyToThisBot) return true
+  return input.implicitTopicRepliesEnabled && input.threadIsolation && input.messageThreadId !== null
+}
+
 /**
- * Decide whether a plain message that is a swipe-reply to one of this bot's
- * own messages should be forwarded without a trigger/mention.
- *
- * The connector still has to verify an active session exists for the
- * relevant chat/topic. Pure data only -- the `ourBotId` parameter lets the
- * caller narrow the match to "this bot" rather than any bot in the chat.
- *
- * Returns false when the option is disabled, when the message is not a
- * reply, when the parent message was not authored by a bot at all, when the
- * parent author doesn't match our bot id, or when the message text is empty.
- * The trigger/mention guards are inherited from `shouldHandleImplicitTopicReply`:
- * a swipe-reply to the bot whose text also starts with the trigger is fine
- * here -- the trigger-prefix branch is what catches it in the caller.
+ * Decide whether a plain swipe-reply to this bot should bypass explicit
+ * invocation. The caller still verifies that the session is active.
  */
 export function shouldHandleTelegramBotReply(input: {
   enabled: boolean
@@ -692,6 +700,7 @@ export class TelegramConnector extends BaseConnector<ChatSession> {
   private maxReconnectAttempts = 20
   private threadIsolation: boolean
   private respondToMentions: boolean
+  private respondToImplicitTopicReplies: boolean
   private respondToReplies: boolean
 
   constructor() {
@@ -705,6 +714,7 @@ export class TelegramConnector extends BaseConnector<ChatSession> {
     })
     this.threadIsolation = THREAD_ISOLATION
     this.respondToMentions = config.telegram.respondToMentions
+    this.respondToImplicitTopicReplies = config.telegram.respondToImplicitTopicReplies
     this.respondToReplies = config.telegram.respondToReplies
   }
 
@@ -723,6 +733,7 @@ export class TelegramConnector extends BaseConnector<ChatSession> {
     this.logStartup()
     console.log(`  Thread isolation: ${this.threadIsolation ? "on (per-topic sessions)" : "off (per-chat sessions)"}`)
     console.log(`  Respond to mentions: ${this.respondToMentions ? "on" : "off"}`)
+    console.log(`  Implicit topic replies: ${this.respondToImplicitTopicReplies ? "on" : "off"}`)
     console.log(`  Respond to replies: ${this.respondToReplies ? "on" : "off"}`)
     if (DROP_PENDING) console.log(`  Will drop pending updates on startup`)
 
@@ -1041,13 +1052,15 @@ export class TelegramConnector extends BaseConnector<ChatSession> {
       ctx.replyToMessageIsBot &&
       ctx.replyToMessageFromId === String(this.botId)
 
-    const canBypassTriggerForAttachments =
-      attachments.length > 0 &&
-      (ctx.isPrivate ||
-        (this.threadIsolation &&
-          ctx.messageThreadId !== null &&
-          this.sessionManager.has(ctx.sessionId)) ||
-        (isReplyToThisBot && this.sessionManager.has(ctx.sessionId)))
+    const canBypassTriggerForAttachments = canTelegramAttachmentsBypassTrigger({
+      hasAttachments: attachments.length > 0,
+      isPrivate: ctx.isPrivate,
+      implicitTopicRepliesEnabled: this.respondToImplicitTopicReplies,
+      threadIsolation: this.threadIsolation,
+      messageThreadId: ctx.messageThreadId,
+      isReplyToThisBot,
+      hasActiveSession: this.sessionManager.has(ctx.sessionId),
+    })
 
     if (text.startsWith(TRIGGER + " ")) {
       query = text.slice(TRIGGER.length + 1).trim()
@@ -1069,6 +1082,7 @@ export class TelegramConnector extends BaseConnector<ChatSession> {
     } else if (
       this.threadIsolation &&
       shouldHandleImplicitTopicReply({
+        enabled: this.respondToImplicitTopicReplies,
         text,
         isPrivate: false,
         messageThreadId: ctx.messageThreadId,

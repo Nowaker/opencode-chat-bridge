@@ -54,6 +54,7 @@ describe("config", () => {
       expect(config.matrix.respondToThreadReplies).toBe(true)
       expect(config.mattermost.respondToThreadReplies).toBe(true)
       expect(config.slack.respondToThreadReplies).toBe(true)
+      expect(config.telegram.respondToImplicitTopicReplies).toBe(true)
       expect(config.whatsapp.enabled).toBe(false)
     })
 
@@ -65,6 +66,7 @@ describe("config", () => {
         matrix: { respondToThreadReplies: false },
         mattermost: { respondToThreadReplies: false },
         slack: { respondToThreadReplies: false },
+        telegram: { respondToImplicitTopicReplies: false },
       }
       fs.writeFileSync(
         path.join(testDir, "chat-bridge.json"),
@@ -80,6 +82,7 @@ describe("config", () => {
       expect(config.matrix.respondToThreadReplies).toBe(false)
       expect(config.mattermost.respondToThreadReplies).toBe(false)
       expect(config.slack.respondToThreadReplies).toBe(false)
+      expect(config.telegram.respondToImplicitTopicReplies).toBe(false)
     })
 
     test("migrates legacy streamTools into toolMessages", () => {

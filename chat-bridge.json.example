@@ -75,6 +75,7 @@
     "token": "{env:TELEGRAM_BOT_TOKEN}",
     "respondToMentions": true,
     "threadIsolation": true,
+    "respondToImplicitTopicReplies": true,
     "respondToReplies": true,
     "attachments": {
       "enabled": true,
