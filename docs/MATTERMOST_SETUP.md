@@ -102,6 +102,7 @@ And configure the connector in `chat-bridge.json`:
 | `token` | string | `""` | Bot access token |
 | `teamName` | string | `""` | Team slug (empty = auto-detect) |
 | `respondToMentions` | boolean | `true` | Respond when @mentioned (in addition to trigger) |
+| `respondToThreadReplies` | boolean | `true` | Forward plain replies in active bot threads |
 | `ignoreChannels` | string[] | `[]` | Channel IDs to ignore |
 | `ignoreUsers` | string[] | `[]` | User IDs to ignore |
 
@@ -178,6 +179,20 @@ Configure in `chat-bridge.json`:
 ```
 
 Set to `false` for per-channel sessions (old behavior).
+
+To keep per-thread sessions but require every channel message to use the trigger
+or @mention, disable implicit thread follow-ups:
+
+```json
+{
+  "mattermost": {
+    "threadIsolation": true,
+    "respondToThreadReplies": false
+  }
+}
+```
+
+Direct messages remain trigger-free.
 
 ### Commands
 

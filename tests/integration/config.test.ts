@@ -51,6 +51,7 @@ describe("config", () => {
         maxTraceEntries: 20,
       })
       expect(config.matrix.enabled).toBe(false)
+      expect(config.mattermost.respondToThreadReplies).toBe(true)
       expect(config.whatsapp.enabled).toBe(false)
     })
 
@@ -58,7 +59,8 @@ describe("config", () => {
       const configContent = {
         botName: "custom-bot",
         trigger: "!bot",
-        rateLimitSeconds: 10
+        rateLimitSeconds: 10,
+        mattermost: { respondToThreadReplies: false },
       }
       fs.writeFileSync(
         path.join(testDir, "chat-bridge.json"),
@@ -71,6 +73,7 @@ describe("config", () => {
       expect(config.botName).toBe("custom-bot")
       expect(config.trigger).toBe("!bot")
       expect(config.rateLimitSeconds).toBe(10)
+      expect(config.mattermost.respondToThreadReplies).toBe(false)
     })
 
     test("migrates legacy streamTools into toolMessages", () => {

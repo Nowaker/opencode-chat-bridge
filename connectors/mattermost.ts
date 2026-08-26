@@ -193,11 +193,13 @@ export function normalizeMattermostEventContext(
  * The caller must still check whether an active session exists for the thread.
  */
 export function shouldHandleThreadReply(input: {
+  enabled?: boolean
   text: string
   rootId: string
   trigger: string
   botUsername: string
 }): boolean {
+  if (input.enabled === false) return false
   const text = input.text.trim()
   if (!text) return false
   if (!input.rootId) return false
@@ -477,6 +479,7 @@ export class MattermostConnector extends BaseConnector<ChannelSession> {
       } else if (isDM) {
         query = message
       } else if (this.threadIsolation && shouldHandleThreadReply({
+        enabled: config.mattermost.respondToThreadReplies,
         text: message,
         rootId: context.rootId,
         trigger: TRIGGER,

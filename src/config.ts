@@ -33,6 +33,7 @@ export interface MattermostConfig {
   token: string          // Bot access token
   teamName: string       // Team to connect to (URL slug, e.g., "myteam")
   respondToMentions: boolean // Respond when @mentioned (in addition to trigger)
+  respondToThreadReplies: boolean // Forward plain replies in active threads
   ignoreChannels: string[] // Channel IDs to ignore
   ignoreUsers: string[]    // User IDs to ignore
   allowedUsers: string[]
@@ -206,6 +207,7 @@ const defaultConfig: ChatBridgeConfig = {
     token: "",
     teamName: "",
     respondToMentions: true,
+    respondToThreadReplies: true,
     ignoreChannels: [],
     ignoreUsers: [],
     allowedUsers: [],

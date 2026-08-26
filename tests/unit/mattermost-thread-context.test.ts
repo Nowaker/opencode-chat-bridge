@@ -125,6 +125,16 @@ describe("shouldHandleThreadReply", () => {
     })).toBe(true)
   })
 
+  test("rejects plain thread replies when implicit follow-ups are disabled", () => {
+    expect(shouldHandleThreadReply({
+      enabled: false,
+      text: "continue this",
+      rootId: "root123",
+      trigger: "!oc",
+      botUsername: "ocbot",
+    })).toBe(false)
+  })
+
   test("rejects non-thread messages (no rootId)", () => {
     expect(shouldHandleThreadReply({
       text: "hello",
