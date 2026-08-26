@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-26
+
 ### Added
 - **Mattermost explicit-trigger mode** - Set
   `mattermost.respondToThreadReplies` to `false` to keep per-thread sessions
@@ -18,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Telegram explicit-trigger mode** - Set
   `telegram.respondToImplicitTopicReplies` to `false` to keep per-topic
   sessions while requiring explicit invocation, except direct bot replies.
+- **Configurable Web image input** - Protected deployments can enable validated
+  JPEG, PNG, and WebP selection or clipboard paste. Images are previewed,
+  optionally resized in-browser, revalidated server-side, and sent as native
+  ACP prompt content without persisting original image bytes in localStorage or
+  workspaces. Bounded sessionStorage thumbnails survive page reloads.
 
 ### Fixed
 - **ACP debug log startup** - `BRIDGE_DEBUG=1` now creates the missing `logs/`
@@ -43,13 +50,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Web restart continuity** - Reconnecting browsers recognize persisted ACP
   mappings after bridge restarts, and local chat history is retained through
   reconnects, invalidations, and backend errors until an explicit clear.
-
-### Added
-- **Configurable Web image input** - Protected deployments can enable validated
-  JPEG, PNG, and WebP selection or clipboard paste. Images are previewed,
-  optionally resized in-browser, revalidated server-side, and sent as native
-  ACP prompt content without persisting original image bytes in localStorage or
-  workspaces. Bounded sessionStorage thumbnails survive page reloads.
 
 ## [0.6.0] - 2026-07-26
 
