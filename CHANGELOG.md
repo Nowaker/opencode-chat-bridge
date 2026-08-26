@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while requiring a trigger or @mention for each channel message.
 - **Slack explicit-trigger mode** - Set `slack.respondToThreadReplies` to
   `false` to keep per-thread sessions while requiring a trigger or app mention.
+- **Matrix explicit-trigger mode** - Set `matrix.respondToThreadReplies` to
+  `false` to keep per-thread sessions while requiring explicit invocation.
 
 ### Fixed
 - **ACP debug log startup** - `BRIDGE_DEBUG=1` now creates the missing `logs/`

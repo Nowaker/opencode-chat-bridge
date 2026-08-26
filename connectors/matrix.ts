@@ -417,6 +417,7 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
     } else if (isDM) {
       query = body
     } else if (this.threadIsolation && shouldHandleThreadReply({
+      enabled: config.matrix.respondToThreadReplies,
       text: body,
       threadRootEventId,
       trigger: TRIGGER,

@@ -128,11 +128,13 @@ export function buildThreadRelation(threadRootEventId: string, lastEventId: stri
  * considered for forwarding to the bot.
  */
 export function shouldHandleThreadReply(input: {
+  enabled?: boolean
   text: string
   threadRootEventId: string
   trigger: string
   botUserId: string
 }): boolean {
+  if (input.enabled === false) return false
   const text = input.text.trim()
   if (!text) return false
   if (!input.threadRootEventId) return false

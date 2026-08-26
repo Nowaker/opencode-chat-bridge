@@ -51,6 +51,7 @@ describe("config", () => {
         maxTraceEntries: 20,
       })
       expect(config.matrix.enabled).toBe(false)
+      expect(config.matrix.respondToThreadReplies).toBe(true)
       expect(config.mattermost.respondToThreadReplies).toBe(true)
       expect(config.slack.respondToThreadReplies).toBe(true)
       expect(config.whatsapp.enabled).toBe(false)
@@ -61,6 +62,7 @@ describe("config", () => {
         botName: "custom-bot",
         trigger: "!bot",
         rateLimitSeconds: 10,
+        matrix: { respondToThreadReplies: false },
         mattermost: { respondToThreadReplies: false },
         slack: { respondToThreadReplies: false },
       }
@@ -75,6 +77,7 @@ describe("config", () => {
       expect(config.botName).toBe("custom-bot")
       expect(config.trigger).toBe("!bot")
       expect(config.rateLimitSeconds).toBe(10)
+      expect(config.matrix.respondToThreadReplies).toBe(false)
       expect(config.mattermost.respondToThreadReplies).toBe(false)
       expect(config.slack.respondToThreadReplies).toBe(false)
     })

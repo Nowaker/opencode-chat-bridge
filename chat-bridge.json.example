@@ -39,7 +39,8 @@
     "ignoreUsers": [],
     "allowedUsers": [],
     "formatHtml": false,
-    "threadIsolation": true
+    "threadIsolation": true,
+    "respondToThreadReplies": true
   },
   "mattermost": {
     "enabled": false,

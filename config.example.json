@@ -30,7 +30,8 @@
     ],
     
     "ignoreRooms": [],
-    "ignoreUsers": []
+    "ignoreUsers": [],
+    "respondToThreadReplies": true
   },
   
   "mattermost": {

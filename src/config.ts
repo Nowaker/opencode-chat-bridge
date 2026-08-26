@@ -25,6 +25,7 @@ export interface MatrixConfig {
   allowedUsers: string[]
   formatHtml: boolean
   threadIsolation: boolean  // true: per-thread sessions + thread replies, false: per-room
+  respondToThreadReplies: boolean // Forward plain replies in active threads
 }
 
 export interface MattermostConfig {
@@ -201,6 +202,7 @@ const defaultConfig: ChatBridgeConfig = {
     allowedUsers: [],
     formatHtml: false,
     threadIsolation: true,  // Per-thread sessions by default
+    respondToThreadReplies: true,
   },
   mattermost: {
     enabled: false,

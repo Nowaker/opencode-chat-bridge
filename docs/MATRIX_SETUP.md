@@ -144,6 +144,20 @@ Configure in `chat-bridge.json`:
 
 Set to `false` for per-room sessions (old behavior).
 
+To keep per-thread sessions but require each room message to use the trigger,
+configured bot name, or mention, disable implicit thread follow-ups:
+
+```json
+{
+  "matrix": {
+    "threadIsolation": true,
+    "respondToThreadReplies": false
+  }
+}
+```
+
+Direct messages remain trigger-free.
+
 ### Commands
 
 | Command | Description |
