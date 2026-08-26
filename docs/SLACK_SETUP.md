@@ -118,6 +118,18 @@ Every conversation happens inside a Slack thread:
 
 This means multiple conversations can run in parallel in the same channel without interfering with each other.
 
+To keep per-thread sessions but require each message to use the trigger or an
+app mention, disable implicit thread follow-ups in `chat-bridge.json`:
+
+```json
+{
+  "slack": {
+    "threadIsolation": true,
+    "respondToThreadReplies": false
+  }
+}
+```
+
 ### Session Expiry
 
 Inactive sessions are cleaned up automatically:

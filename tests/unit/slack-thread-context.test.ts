@@ -143,6 +143,15 @@ describe("shouldHandleThreadMessage", () => {
     })).toBe(true)
   })
 
+  test("rejects plain thread replies when implicit follow-ups are disabled", () => {
+    expect(shouldHandleThreadMessage({
+      enabled: false,
+      text: "continue this",
+      threadTs: "1710000000.123",
+      trigger: "!oc",
+    })).toBe(false)
+  })
+
   test("rejects non-thread messages", () => {
     expect(shouldHandleThreadMessage({
       text: "continue this",

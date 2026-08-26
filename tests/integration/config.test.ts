@@ -52,6 +52,7 @@ describe("config", () => {
       })
       expect(config.matrix.enabled).toBe(false)
       expect(config.mattermost.respondToThreadReplies).toBe(true)
+      expect(config.slack.respondToThreadReplies).toBe(true)
       expect(config.whatsapp.enabled).toBe(false)
     })
 
@@ -61,6 +62,7 @@ describe("config", () => {
         trigger: "!bot",
         rateLimitSeconds: 10,
         mattermost: { respondToThreadReplies: false },
+        slack: { respondToThreadReplies: false },
       }
       fs.writeFileSync(
         path.join(testDir, "chat-bridge.json"),
@@ -74,6 +76,7 @@ describe("config", () => {
       expect(config.trigger).toBe("!bot")
       expect(config.rateLimitSeconds).toBe(10)
       expect(config.mattermost.respondToThreadReplies).toBe(false)
+      expect(config.slack.respondToThreadReplies).toBe(false)
     })
 
     test("migrates legacy streamTools into toolMessages", () => {

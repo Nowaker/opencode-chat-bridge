@@ -62,7 +62,8 @@
   "slack": {
     "enabled": false,
     "allowedUsers": [],
-    "threadIsolation": true
+    "threadIsolation": true,
+    "respondToThreadReplies": true
   },
   "discord": {
     "enabled": false,

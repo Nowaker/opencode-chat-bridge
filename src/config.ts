@@ -51,6 +51,7 @@ export interface SlackConfig {
   enabled: boolean
   allowedUsers: string[]
   threadIsolation: boolean  // true: per-thread sessions + thread replies, false: per-channel
+  respondToThreadReplies: boolean // Forward plain replies in active threads
 }
 
 export interface DiscordConfig {
@@ -223,6 +224,7 @@ const defaultConfig: ChatBridgeConfig = {
     enabled: false,
     allowedUsers: [],
     threadIsolation: true,  // Per-thread sessions by default
+    respondToThreadReplies: true,
   },
   discord: {
     enabled: false,

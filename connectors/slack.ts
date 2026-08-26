@@ -170,12 +170,14 @@ export async function postThreadReply(
  * The caller must still check whether an active session exists for the thread.
  */
 export function shouldHandleThreadMessage(input: {
+  enabled?: boolean
   text: string
   threadTs?: string
   trigger: string
   subtype?: string
   botId?: string
 }): boolean {
+  if (input.enabled === false) return false
   const blockedSubtypes = new Set(["bot_message", "message_changed", "message_deleted"])
   const text = input.text.trim()
   if (!text) return false
@@ -351,6 +353,7 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
 
       const msgAny = message as any
       if (!shouldHandleThreadMessage({
+        enabled: config.slack.respondToThreadReplies,
         text: message.text,
         threadTs: msgAny.thread_ts,
         trigger: TRIGGER,
