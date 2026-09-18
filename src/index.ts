@@ -21,6 +21,8 @@ export {
 export { getConfig, loadConfig, clearConfigCache, type ChatBridgeConfig, type ACPConfig, type MatrixConfig, type MattermostConfig, type WhatsAppConfig, type SlackConfig, type DiscordConfig, type TelegramConfig, type TelegramAttachmentsConfig, type WebConfig, type WebAttachmentsConfig, type ToolMessageMode, type ToolMessagesConfig, type ToolSummariesConfig, type UnlistedToolPresentation, type SafeOutputConfig, type PermissionsConfig } from "./config"
 export { 
   getSessionDir, 
+  resolveSessionWorkspace,
+  type ResolvedSessionWorkspace,
   ensureSessionDir, 
   cleanupOldSessions, 
   getSessionStorageInfo, 

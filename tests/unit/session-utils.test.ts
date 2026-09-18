@@ -17,7 +17,39 @@ import {
   removeImageMarkers,
   copyOpenCodeConfig,
   copyACPProfile,
+  resolveSessionWorkspace,
 } from "../../src/session-utils"
+
+describe("resolveSessionWorkspace", () => {
+  test("generates an isolated directory per thread by default", () => {
+    const first = resolveSessionWorkspace("slack", "C1:111")
+    const second = resolveSessionWorkspace("slack", "C1:222")
+
+    expect(first.pinned).toBe(false)
+    expect(first.dir).not.toBe(second.dir)
+  })
+
+  test("pins every thread of a connector to one configured project", () => {
+    const first = resolveSessionWorkspace("whatsapp", "a@g.us", "/home/example/projects/ai-bridge")
+    const second = resolveSessionWorkspace("whatsapp", "b@g.us", "/home/example/projects/ai-bridge")
+
+    expect(first.pinned).toBe(true)
+    expect(first.dir).toBe("/home/example/projects/ai-bridge")
+    expect(second.dir).toBe(first.dir)
+  })
+
+  test("expands a home-relative pinned path", () => {
+    const resolved = resolveSessionWorkspace("whatsapp", "a@g.us", "~/projects/ai-bridge")
+
+    expect(resolved.dir).toBe(path.join(os.homedir(), "projects/ai-bridge"))
+  })
+
+  test("treats blank configuration as unpinned", () => {
+    expect(resolveSessionWorkspace("slack", "C1:111", "   ").pinned).toBe(false)
+    expect(resolveSessionWorkspace("slack", "C1:111", "").pinned).toBe(false)
+    expect(resolveSessionWorkspace("slack", "C1:111", undefined).pinned).toBe(false)
+  })
+})
 
 // =============================================================================
 // estimateTokens

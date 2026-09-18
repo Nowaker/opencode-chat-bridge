@@ -26,7 +26,7 @@ import {
 } from "./permission-broker"
 import { ACPSessionStore } from "./session-store"
 import { 
-  getSessionDir, 
+  resolveSessionWorkspace,
   ensureSessionDir, 
   cleanupOldSessions, 
   estimateTokens,
@@ -943,11 +943,17 @@ export abstract class BaseConnector<TSession extends BaseSession> {
     let session = this.sessionManager.get(id)
     
     if (!session) {
-      const sessionDir = getSessionDir(this.config.connector, id)
-      ensureSessionDir(sessionDir)
-      copyOpenCodeConfig(sessionDir)  // Apply security permissions
-      copyACPProfile(sessionDir, this.acpConfig.profileDir)
-      const canonicalDir = fs.realpathSync(sessionDir)
+      const workspace = this.resolveWorkspace(id)
+      if (workspace.pinned && !fs.existsSync(workspace.dir)) {
+        this.logError(`Pinned ACP workspace does not exist: ${workspace.dir}`)
+        return null
+      }
+      if (!workspace.pinned) {
+        ensureSessionDir(workspace.dir)
+        copyOpenCodeConfig(workspace.dir)  // Apply security permissions
+        copyACPProfile(workspace.dir, this.acpConfig.profileDir)
+      }
+      const canonicalDir = fs.realpathSync(workspace.dir)
       const client = this.createACPClient(canonicalDir)
       
       try {
@@ -980,7 +986,7 @@ export abstract class BaseConnector<TSession extends BaseSession> {
         session = createSessionData(client)
         this.sessionManager.set(id, session)
         this.log(`Created session: ${id}`)
-        console.log(`  Directory: ${sessionDir}`)
+        console.log(`  Directory: ${canonicalDir}${workspace.pinned ? " (pinned)" : ""}`)
       } catch (err) {
         this.logError(`Failed to create session:`, err)
         return null
@@ -1036,6 +1042,10 @@ export abstract class BaseConnector<TSession extends BaseSession> {
       ...this.acpConfig.args,
     ])
     return `command-sha256:${createHash("sha256").update(commandIdentity).digest("hex")}`
+  }
+
+  private resolveWorkspace(id: string) {
+    return resolveSessionWorkspace(this.config.connector, id, this.acpConfig.sessionCwd)
   }
 
   private createACPClient(cwd: string): ACPClient {
@@ -1303,10 +1313,14 @@ export abstract class BaseConnector<TSession extends BaseSession> {
    * Delete the on-disk session cache directory for an expired session.
    */
   private deleteSessionCacheDir(id: string): void {
-    const dir = getSessionDir(this.config.connector, id)
+    const workspace = this.resolveWorkspace(id)
+    // A pinned workspace is the operator's own project, not a cache this
+    // bridge created. Expiry must never recursively delete it.
+    if (workspace.pinned) return
+
     try {
-      if (fs.existsSync(dir)) {
-        fs.rmSync(dir, { recursive: true, force: true })
+      if (fs.existsSync(workspace.dir)) {
+        fs.rmSync(workspace.dir, { recursive: true, force: true })
       }
     } catch (err) {
       this.logError(`[SESSION_EXPIRY] Failed to clean cache for ${id}:`, err)
@@ -1968,11 +1982,18 @@ export abstract class BaseConnector<TSession extends BaseSession> {
       await this.acpSessionStore.delete(this.config.connector, id)
       await sendFn(CommandHandler.formatSessionClearedMessage())
     } else if (stored) {
-      const sessionDir = getSessionDir(this.config.connector, id)
-      ensureSessionDir(sessionDir)
-      copyOpenCodeConfig(sessionDir)
-      copyACPProfile(sessionDir, this.acpConfig.profileDir)
-      const expectedDir = fs.realpathSync(sessionDir)
+      const workspace = this.resolveWorkspace(id)
+      if (workspace.pinned && !fs.existsSync(workspace.dir)) {
+        await this.acpSessionStore.delete(this.config.connector, id)
+        await sendFn(CommandHandler.formatSessionClearedMessage())
+        return true
+      }
+      if (!workspace.pinned) {
+        ensureSessionDir(workspace.dir)
+        copyOpenCodeConfig(workspace.dir)
+        copyACPProfile(workspace.dir, this.acpConfig.profileDir)
+      }
+      const expectedDir = fs.realpathSync(workspace.dir)
       if (stored.cwd === expectedDir && stored.backendId === this.backendId) {
         const client = this.createACPClient(expectedDir)
         try {

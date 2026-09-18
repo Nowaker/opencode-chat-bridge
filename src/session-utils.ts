@@ -63,6 +63,42 @@ export function getSessionDir(
   return path.join(sessionRoot, leaf)
 }
 
+export interface ResolvedSessionWorkspace {
+  dir: string
+  /**
+   * True when the workspace is a directory the operator owns rather than one
+   * this bridge generated. A pinned workspace is never written to and never
+   * deleted: it holds the operator's real project.
+   */
+  pinned: boolean
+}
+
+/**
+ * Resolve the working directory an ACP session runs in.
+ *
+ * By default each connector thread gets its own generated directory outside
+ * any git repository, because opencode derives a project identity by hashing
+ * the working directory: sessions sharing a directory share a project, so
+ * bot sessions would appear in the operator's own session lists and every
+ * thread would collide with every other.
+ *
+ * Pinning trades that isolation away deliberately. Every thread then runs in
+ * one real project and inherits its AGENTS.md and configuration, which is the
+ * point, but they also share a project identity in opencode.
+ */
+export function resolveSessionWorkspace(
+  connector: string,
+  identifier: string,
+  pinnedDir?: string,
+  config: SessionConfig = {},
+): ResolvedSessionWorkspace {
+  const pinned = (pinnedDir || "").trim()
+  if (pinned) {
+    return { dir: path.resolve(pinned.startsWith("~") ? pinned.replace(/^~/, os.homedir()) : pinned), pinned: true }
+  }
+  return { dir: getSessionDir(connector, identifier, config), pinned: false }
+}
+
 /**
  * Ensure session directory exists, create if needed
  */
