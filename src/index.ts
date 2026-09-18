@@ -7,7 +7,17 @@
  *   Library: import { ACPClient } from "opencode-chat-bridge"
  */
 
-export { ACPClient, type ACPClientOptions, type MCPServer, type SessionUpdate, type ActivityEvent, type ToolActivityRevision, type ImageContent, type PromptImage, type OpenCodeCommand } from "./acp-client"
+export { ACPClient, type ACPClientOptions, type MCPServer, type SessionUpdate, type ActivityEvent, type ToolActivityRevision, type ImageContent, type PromptImage, type OpenCodeCommand, type PermissionOption, type PermissionRequest } from "./acp-client"
+
+export {
+  PermissionBroker,
+  formatPermissionPrompt,
+  generateCorrelationToken,
+  resolveRejectOption,
+  type PendingPermission,
+  type PermissionReplyOutcome,
+  type PermissionRequestInput,
+} from "./permission-broker"
 export { getConfig, loadConfig, clearConfigCache, type ChatBridgeConfig, type ACPConfig, type MatrixConfig, type MattermostConfig, type WhatsAppConfig, type SlackConfig, type DiscordConfig, type TelegramConfig, type TelegramAttachmentsConfig, type WebConfig, type WebAttachmentsConfig, type ToolMessageMode, type ToolMessagesConfig, type ToolSummariesConfig, type UnlistedToolPresentation, type SafeOutputConfig, type PermissionsConfig } from "./config"
 export { 
   getSessionDir, 

@@ -26,7 +26,7 @@ import makeWASocket, {
 } from "baileys"
 import { Boom } from "@hapi/boom"
 import * as qrcode from "qrcode-terminal"
-import { ACPClient, type ImageContent } from "../src"
+import { ACPClient, type ImageContent, type PermissionRequest } from "../src"
 import { getConfig } from "../src/config"
 import {
   BaseConnector,
@@ -366,9 +366,12 @@ export class WhatsAppConnector extends BaseConnector<ChatSession> {
 
     if (!query) return
 
-    await this.stopMirrorForUserActivity(chatId, query, async (text) => {
-      await this.sendMessage(chatId, text)
-    })
+    // Before anything that could start or abort a turn: a permission reply
+    // answers the turn that is already waiting, it does not supersede it.
+    const reply = (text: string) => this.sendMessage(chatId, text)
+    if (await this.handlePermissionReply(chatId, senderId, query, reply)) return
+
+    await this.stopMirrorForUserActivity(chatId, query, reply)
 
     // Handle commands
     if (query.startsWith("/")) {
@@ -546,7 +549,12 @@ export class WhatsAppConnector extends BaseConnector<ChatSession> {
     client.on("chunk", chunkHandler)
     client.on("update", updateHandler)
     client.on("image", imageHandler)
+    const permissionRequestHandler = async (request: PermissionRequest) => {
+      await this.presentPermissionRequest(chatId, request, client, (text) => this.sendMessage(chatId, text))
+    }
+
     client.on("permission_rejected", permissionHandler)
+    client.on("permission_requested", permissionRequestHandler)
 
     // Timeout to prevent stuck requests (5 minutes)
     const QUERY_TIMEOUT_MS = 5 * 60 * 1000
@@ -590,6 +598,7 @@ export class WhatsAppConnector extends BaseConnector<ChatSession> {
       client.off("update", updateHandler)
       client.off("image", imageHandler)
       client.off("permission_rejected", permissionHandler)
+      client.off("permission_requested", permissionRequestHandler)
       session.lastActivity = new Date()
       this.markQueryDone(chatId, activeQuery)
       await stopComposing()

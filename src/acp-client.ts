@@ -50,6 +50,41 @@ export interface ACPClientOptions {
   mcpServers?: MCPServer[]
   command?: string
   args?: string[]
+  /**
+   * Hold `session/request_permission` open for an authenticated chat reply.
+   * Defaults to upstream's immediate auto-reject, so a library consumer that
+   * does not answer permissions cannot leave the agent blocked forever.
+   */
+  interactivePermissions?: boolean
+}
+
+export interface PermissionOption {
+  optionId: string
+  name: string
+  kind?: string
+}
+
+export interface PermissionRequest {
+  requestId: string | number
+  permission: string
+  toolName: string
+  input: any
+  path: string | null
+  options: PermissionOption[]
+}
+
+/** Used only when an agent sends a request without any options of its own. */
+const DEFAULT_PERMISSION_OPTIONS: PermissionOption[] = [
+  { optionId: "once", kind: "allow_once", name: "Allow once" },
+  { optionId: "always", kind: "allow_always", name: "Always allow" },
+  { optionId: "reject", kind: "reject_once", name: "Reject" },
+]
+
+function resolveRejectOptionId(options: PermissionOption[]): string {
+  const explicit = options.find(
+    (option) => option.optionId === "reject" || (option.kind || "").startsWith("reject"),
+  )
+  return explicit?.optionId || "reject"
 }
 
 export interface MCPServer {
@@ -135,6 +170,8 @@ export class ACPClient extends EventEmitter {
   private mcpServers: MCPServer[]
   private command: string
   private args: string[]
+  private interactivePermissions: boolean
+  private heldPermissions = new Map<string | number, { title: string; options: PermissionOption[] }>()
   private _availableCommands: OpenCodeCommand[] = []
   // Track cumulative output per tool call to compute actual deltas
   private toolOutputSeen = new Map<string, number>()
@@ -155,6 +192,7 @@ export class ACPClient extends EventEmitter {
       ? findOpencode()
       : options.command
     this.args = options.args || ["acp"]
+    this.interactivePermissions = options.interactivePermissions === true
   }
   
   /**
@@ -198,6 +236,7 @@ export class ACPClient extends EventEmitter {
     })
     this.acp.on("close", (code) => {
       this.rejectPending(new Error(`ACP process exited${code === null ? "" : ` with code ${code}`}`))
+      this.rejectHeldPermissions()
       this.emit("close", code)
     })
     
@@ -464,6 +503,7 @@ export class ACPClient extends EventEmitter {
   
   async disconnect(): Promise<void> {
     this.clearPendingToolActivities()
+    this.rejectHeldPermissions()
     if (this.acp) {
       this.acp.kill()
       this.acp = null
@@ -548,47 +588,81 @@ export class ACPClient extends EventEmitter {
   }
   
   private handlePermissionRequest(msg: any): void {
-    const params = msg.params
+    const params = msg.params || {}
     const toolCall = params.toolCall || {}
     const title = toolCall.title || params.title || "unknown"
+    const toolName = toolCall.kind || params.permission || title
     const rawInput = toolCall.rawInput || {}
-    
-    // Path can be in many places - check all possibilities
+    const options: PermissionOption[] = Array.isArray(params.options) && params.options.length > 0
+      ? params.options.map((option: any) => ({
+        optionId: String(option?.optionId ?? ""),
+        name: String(option?.name ?? option?.optionId ?? ""),
+        kind: option?.kind ? String(option.kind) : undefined,
+      })).filter((option: PermissionOption) => option.optionId)
+      : DEFAULT_PERMISSION_OPTIONS
+
+    // Path lookup never falls back to stringifying rawInput: that would put
+    // unfiltered tool arguments into a chat message.
     const path = rawInput.filepath || rawInput.filePath || rawInput.path ||
                  rawInput.directory || rawInput.dir ||
                  toolCall.locations?.[0]?.path ||
                  params.path || params.directory ||
-                 // Last resort: stringify rawInput if not empty
-                 (Object.keys(rawInput).length > 0 
-                   ? JSON.stringify(rawInput).slice(0, 100) 
-                   : null)
-    
-    // Format message - if no path available, just show the permission type
-    const displayPath = path || title
-    
-    console.error(`[ACP] Permission requested: ${title} - auto-rejecting`)
-    
-    // Emit an event so the connector can show the user what happened
-    // Only show path if it's different from the permission type
-    const showPath = path && path !== title
-    this.emit("permission_rejected", {
+                 null
+
+    if (!this.interactivePermissions) {
+      console.error(`[ACP] Permission requested: ${title} - auto-rejecting`)
+      const showPath = path && path !== title
+      this.emit("permission_rejected", {
+        permission: title,
+        path: path || null,
+        message: showPath ? `Permission denied: ${title} (${path})` : `Permission denied: ${title}`,
+      })
+      this.respondToPermission(msg.id, resolveRejectOptionId(options))
+      return
+    }
+
+    console.error(`[ACP] Permission requested: ${title} - awaiting an authenticated reply`)
+    this.heldPermissions.set(msg.id, { title, options })
+    this.emit("permission_requested", {
+      requestId: msg.id,
       permission: title,
+      toolName,
+      input: rawInput,
       path: path || null,
-      message: showPath ? `Permission denied: ${title} (${path})` : `Permission denied: ${title}`,
-    })
-    
-    // Send rejection response
+      options,
+    } satisfies PermissionRequest)
+  }
+
+  /**
+   * Answer a held permission request. Returns false when the request is no
+   * longer outstanding, which happens when the agent gave up or the process
+   * was replaced while a human was deciding.
+   */
+  respondToPermission(requestId: string | number, optionId: string): boolean {
+    if (!this.acp?.stdin || this.acp.stdin.destroyed) {
+      this.heldPermissions.delete(requestId)
+      return false
+    }
+
+    this.heldPermissions.delete(requestId)
     const response = {
       jsonrpc: "2.0",
-      id: msg.id,
+      id: requestId,
       result: {
         outcome: {
           outcome: "selected",
-          optionId: "reject",
+          optionId,
         },
       },
     }
-    this.acp!.stdin!.write(JSON.stringify(response) + "\n")
+    this.acp.stdin.write(JSON.stringify(response) + "\n")
+    return true
+  }
+
+  rejectHeldPermissions(): void {
+    for (const [requestId, held] of [...this.heldPermissions]) {
+      this.respondToPermission(requestId, resolveRejectOptionId(held.options))
+    }
   }
   
   private handleSessionUpdate(params: any): void {

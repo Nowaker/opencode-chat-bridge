@@ -429,7 +429,7 @@ class TestConnector extends BaseConnector<BaseSession> {
   }
 
   async start(): Promise<void> {}
-  async stop(): Promise<void> {}
+  async stop(): Promise<void> { await this.disconnectAllSessions() }
   async sendMessage(): Promise<void> {}
 
   public canUserAccess(userId: string): boolean {
@@ -463,7 +463,132 @@ class TestConnector extends BaseConnector<BaseSession> {
   public formatUserError(generic: string, err: unknown): string {
     return this.userErrorMessage(generic, err)
   }
+
+  public present(
+    threadId: string,
+    request: Parameters<TestConnector["presentPermissionRequest"]>[1],
+    client: any,
+    sendFn: (text: string) => Promise<void>,
+  ) {
+    return this.presentPermissionRequest(threadId, request, client, sendFn)
+  }
+
+  public replyToPermission(
+    threadId: string,
+    senderId: string,
+    text: string,
+    sendFn: (text: string) => Promise<void>,
+  ) {
+    return this.handlePermissionReply(threadId, senderId, text, sendFn)
+  }
 }
+
+describe("BaseConnector permission round trip", () => {
+  const OWNER = "owner-1"
+  const THREAD = "C0C2U4Q51HP:1712345678.0001"
+  const OPTIONS = [
+    { optionId: "once", kind: "allow_once", name: "Allow once" },
+    { optionId: "always", kind: "allow_always", name: "Always allow" },
+    { optionId: "reject", kind: "reject_once", name: "Reject" },
+  ]
+
+  let connector: TestConnector
+  let answers: Array<{ requestId: string | number; optionId: string }>
+  let posted: string[]
+  let fakeClient: any
+
+  beforeEach(() => {
+    connector = new TestConnector([OWNER], ["C0C2U4Q51HP"])
+    answers = []
+    posted = []
+    fakeClient = {
+      respondToPermission: (requestId: string | number, optionId: string) => {
+        answers.push({ requestId, optionId })
+        return true
+      },
+    }
+  })
+
+  async function present(input: Record<string, unknown> = {}) {
+    await connector.present(THREAD, {
+      requestId: "req-1",
+      permission: "edit",
+      toolName: "edit",
+      input,
+      path: null,
+      options: OPTIONS,
+    }, fakeClient, async (text) => { posted.push(text) })
+    return posted[0].match(/[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{6}/)![0]
+  }
+
+  test("posts a numbered prompt and answers nothing yet", async () => {
+    const token = await present()
+
+    expect(posted[0]).toContain("1. Allow once")
+    expect(posted[0]).toContain("3. Reject")
+    expect(posted[0]).toContain(token)
+    expect(answers).toHaveLength(0)
+  })
+
+  test("never puts raw tool arguments in the prompt", async () => {
+    await present({ filePath: "/etc/shadow", diff: "SECRET-DIFF-BODY" })
+
+    expect(posted[0]).not.toContain("SECRET-DIFF-BODY")
+    expect(posted[0]).not.toContain("/etc/shadow")
+  })
+
+  test("delivers the selected option for an authenticated reply", async () => {
+    const token = await present()
+
+    const consumed = await connector.replyToPermission(THREAD, OWNER, `${token} 1`, async (t) => { posted.push(t) })
+
+    expect(consumed).toBe(true)
+    expect(answers).toEqual([{ requestId: "req-1", optionId: "once" }])
+  })
+
+  test("answers nothing for a reply from another sender", async () => {
+    const token = await present()
+
+    const consumed = await connector.replyToPermission(THREAD, "intruder", `${token} 1`, async (t) => { posted.push(t) })
+
+    expect(consumed).toBe(true)
+    expect(answers).toHaveLength(0)
+  })
+
+  test("answers nothing for a reply in another thread", async () => {
+    const token = await present()
+
+    await connector.replyToPermission("C0C2U4Q51HP:9999.0", OWNER, `${token} 1`, async (t) => { posted.push(t) })
+
+    expect(answers).toHaveLength(0)
+  })
+
+  test("answers nothing for ambiguous free text", async () => {
+    const token = await present()
+
+    await connector.replyToPermission(THREAD, OWNER, `${token} yes do it`, async (t) => { posted.push(t) })
+
+    expect(answers).toHaveLength(0)
+    expect(posted.at(-1)).toContain("Nothing was approved")
+  })
+
+  test("leaves an unrelated message for the agent", async () => {
+    await present()
+
+    const consumed = await connector.replyToPermission(THREAD, OWNER, "what is the status?", async (t) => { posted.push(t) })
+
+    expect(consumed).toBe(false)
+    expect(answers).toHaveLength(0)
+  })
+
+  test("denies everything still pending when the connector shuts down", async () => {
+    await present()
+
+    await connector.stop()
+
+    expect(answers).toEqual([{ requestId: "req-1", optionId: "reject" }])
+  })
+})
 
 describe("parseCsvList", () => {
   test("parses comma-separated values", () => {

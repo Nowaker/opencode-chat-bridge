@@ -9,7 +9,7 @@
 import fs from "fs"
 import path from "path"
 import { createHash } from "crypto"
-import { ACPClient, type ACPSessionInfo, type ActivityEvent, type LoadedSessionHistoryItem, type OpenCodeCommand, type ToolActivityRevision } from "./acp-client"
+import { ACPClient, type ACPSessionInfo, type ActivityEvent, type LoadedSessionHistoryItem, type OpenCodeCommand, type PermissionRequest, type ToolActivityRevision } from "./acp-client"
 import {
   getConfig,
   type ACPConfig,
@@ -18,7 +18,12 @@ import {
   type ToolMessagesConfig,
   type ToolSummariesConfig,
 } from "./config"
-import { summarizeToolCall } from "./safe-output"
+import { redactSecrets, summarizeToolCall } from "./safe-output"
+import {
+  PermissionBroker,
+  formatPermissionPrompt,
+  resolveRejectOption,
+} from "./permission-broker"
 import { ACPSessionStore } from "./session-store"
 import { 
   getSessionDir, 
@@ -663,6 +668,11 @@ export class CommandHandler {
 /** Default session expiry sweep interval: 60 seconds */
 const EXPIRY_SWEEP_INTERVAL_MS = 60_000
 
+/** Permission windows are short, so they are swept far more often than sessions. */
+const PERMISSION_SWEEP_INTERVAL_MS = 5_000
+
+const PERMISSION_TITLE_MAX_LENGTH = 160
+
 /**
  * Parse SESSION_RETENTION_MINS from environment.
  * Returns undefined if not set or invalid (connector uses no runtime expiry).
@@ -710,6 +720,11 @@ export abstract class BaseConnector<TSession extends BaseSession> {
   private selectedProjectCwd = new Map<string, string>()
   private pickerSessions = new Map<string, ACPSessionInfo[]>()
   private mirrors = new Map<string, MirrorState>()
+  private toolMessagesConfig = getConfig().toolMessages
+  private permissionsConfig = getConfig().permissions
+  private permissionBroker: PermissionBroker
+  private permissionClients = new Map<string, ACPClient>()
+  private permissionExpiryTimer: NodeJS.Timeout | null = null
   
   constructor(config: ConnectorConfig) {
     this.sessionManager = new SessionManager<TSession>()
@@ -721,6 +736,12 @@ export abstract class BaseConnector<TSession extends BaseSession> {
     this.sessionPickerConfig = globalConfig.sessionPicker
     this.acpSessionStore = new ACPSessionStore(globalConfig.sessionStorePath)
     this.verboseErrors = globalConfig.verboseErrors
+    this.toolMessagesConfig = globalConfig.toolMessages
+    this.permissionsConfig = globalConfig.permissions
+    this.permissionBroker = new PermissionBroker({
+      timeoutMs: this.permissionsConfig.timeoutSeconds * 1000,
+      authorize: (senderId) => isAllowedId(senderId, this.allowedUsers),
+    })
     
     // Apply SESSION_RETENTION_MINS from env if not set in config
     if (this.config.sessionRetentionMins === undefined) {
@@ -1022,7 +1043,137 @@ export abstract class BaseConnector<TSession extends BaseSession> {
       cwd,
       command: this.acpConfig.command,
       args: this.acpConfig.args,
+      interactivePermissions: this.permissionsConfig.interactive,
     })
+  }
+
+  // ---------------------------------------------------------------------------
+  // Permission round trip
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Post a held permission request into a thread and arm its expiry.
+   *
+   * The title is agent-supplied and derived from tool input -- a URL, a path,
+   * a command -- so it is summarized, redacted and bounded exactly like any
+   * other tool detail rather than echoed.
+   */
+  protected async presentPermissionRequest(
+    threadId: string,
+    request: PermissionRequest,
+    client: ACPClient,
+    sendFn: (text: string) => Promise<void>,
+  ): Promise<void> {
+    const pending = this.permissionBroker.create({
+      requestId: request.requestId,
+      title: this.describePermission(request),
+      threadId,
+      options: request.options,
+    })
+
+    this.permissionClients.set(pending.token, client)
+    this.armPermissionExpiry(sendFn)
+    await sendFn(formatPermissionPrompt(pending, this.config.trigger))
+  }
+
+  private describePermission(request: PermissionRequest): string {
+    const summary = summarizeToolCall(
+      request.toolName || request.permission,
+      request.input,
+      resolveToolSummaries(this.toolMessagesConfig),
+    )
+    const title = redactSecrets(String(request.permission || "unknown")).replace(/\s+/g, " ").trim()
+    const bounded = title.length > PERMISSION_TITLE_MAX_LENGTH
+      ? `${title.slice(0, PERMISSION_TITLE_MAX_LENGTH - 3)}...`
+      : title
+    return summary ? `${bounded} -- ${summary}` : bounded
+  }
+
+  /**
+   * Classify an inbound message as a permission reply.
+   *
+   * Returns true when the message was consumed, so the caller must not also
+   * forward it to the agent as a prompt.
+   */
+  protected async handlePermissionReply(
+    threadId: string,
+    senderId: string,
+    text: string,
+    sendFn: (text: string) => Promise<void>,
+  ): Promise<boolean> {
+    const outcome = this.permissionBroker.resolveReply({ text, senderId, threadId })
+
+    switch (outcome.status) {
+      case "no_token":
+        return false
+
+      case "accepted": {
+        const client = this.permissionClients.get(outcome.pending.token)
+        this.permissionClients.delete(outcome.pending.token)
+        const delivered = client?.respondToPermission(outcome.pending.requestId, outcome.optionId)
+        const choice = outcome.pending.options.find((option) => option.optionId === outcome.optionId)
+        await sendFn(delivered
+          ? `Permission ${outcome.pending.token}: ${choice?.name || outcome.optionId}.`
+          : `Permission ${outcome.pending.token} could not be delivered; the request is no longer open.`)
+        return true
+      }
+
+      case "unknown_token":
+        await sendFn("That permission request is no longer open.")
+        return true
+
+      case "expired":
+        await sendFn(`Permission ${outcome.pending.token} already expired and was denied.`)
+        return true
+
+      case "wrong_thread":
+        await sendFn(`Permission ${outcome.pending.token} must be answered in the thread that asked for it.`)
+        return true
+
+      case "wrong_sender":
+        this.log(`[PERMISSION] Reply to ${outcome.pending.token} from non-allowed sender: ${senderId}`)
+        return true
+
+      case "ambiguous":
+        await sendFn(
+          `Permission ${outcome.pending.token} needs an option number, e.g. ` +
+          `"${this.config.trigger} ${outcome.pending.token} 1". Nothing was approved.`,
+        )
+        return true
+    }
+  }
+
+  /**
+   * Answer every request whose window closed with its reject option.
+   *
+   * The agent is blocked on the held JSON-RPC request, so an unanswered
+   * request must be refused rather than abandoned.
+   */
+  private armPermissionExpiry(sendFn: (text: string) => Promise<void>): void {
+    if (this.permissionExpiryTimer) return
+
+    this.permissionExpiryTimer = setInterval(() => {
+      const expired = this.permissionBroker.takeExpired()
+      if (this.permissionBroker.size === 0) this.disarmPermissionExpiry()
+
+      for (const pending of expired) {
+        const client = this.permissionClients.get(pending.token)
+        this.permissionClients.delete(pending.token)
+        client?.respondToPermission(pending.requestId, resolveRejectOption(pending.options))
+        this.log(`[PERMISSION] ${pending.token} expired without a reply; denied`)
+        void sendFn(`Permission ${pending.token} expired without a reply and was denied.`)
+          .catch((err) => this.logError("Failed to announce permission expiry:", err))
+      }
+    }, PERMISSION_SWEEP_INTERVAL_MS)
+    // A request nobody is around to answer must not keep the process alive.
+    this.permissionExpiryTimer.unref?.()
+  }
+
+  private disarmPermissionExpiry(): void {
+    if (this.permissionExpiryTimer) {
+      clearInterval(this.permissionExpiryTimer)
+      this.permissionExpiryTimer = null
+    }
   }
 
   /**
@@ -1071,6 +1222,12 @@ export abstract class BaseConnector<TSession extends BaseSession> {
    */
   protected async disconnectAllSessions(): Promise<void> {
     this.stopSessionExpiryLoop()
+    this.disarmPermissionExpiry()
+    for (const pending of this.permissionBroker.takeAll()) {
+      const client = this.permissionClients.get(pending.token)
+      this.permissionClients.delete(pending.token)
+      client?.respondToPermission(pending.requestId, resolveRejectOption(pending.options))
+    }
     for (const [id, session] of this.sessionManager.sessions) {
       try {
         await session.client.disconnect()
