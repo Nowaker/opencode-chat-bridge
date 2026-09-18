@@ -23,7 +23,7 @@
 import fs from "fs"
 import path from "path"
 import { App } from "@slack/bolt"
-import { ACPClient } from "../src"
+import { ACPClient, type PermissionRequest } from "../src"
 import { getConfig } from "../src/config"
 import {
   BaseConnector,
@@ -260,11 +260,25 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
       appToken: APP_TOKEN,
       socketMode: true,
     })
+    this.registerHandlers(this.app)
 
+    await this.app.start()
+    this.startSessionExpiryLoop()
+    this.log("Started! Listening for messages...")
+  }
+
+  /**
+   * Register the inbound handlers on a Bolt app.
+   *
+   * Kept separate from start() so the handlers can be driven without a Socket
+   * Mode connection. A guard missing from one of them is otherwise observable
+   * only against a live workspace.
+   */
+  registerHandlers(app: Pick<App, "event" | "message">): void {
     // -------------------------------------------------------------------------
     // Handler 1: @mention
     // -------------------------------------------------------------------------
-    this.app.event("app_mention", async ({ event, body, client }) => {
+    app.event("app_mention", async ({ event, body, client }) => {
       let context: SlackEventContext
       try {
         context = normalizeSlackEventContext({
@@ -289,6 +303,7 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
 
       const query = context.text.replace(/<@[A-Z0-9]+>/g, "").trim()
       if (!query) return
+      if (await this.interceptPermissionReply(context, sessionId, query, client)) return
       if (!this.checkRateLimit(context.userId)) return
 
       await this.processQuery(context, sessionId, query, client)
@@ -297,7 +312,7 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
     // -------------------------------------------------------------------------
     // Handler 2: trigger prefix (!oc ...)
     // -------------------------------------------------------------------------
-    this.app.message(new RegExp(`^${TRIGGER}\\s+(.+)`, "i"), async ({ message, body, client }) => {
+    app.message(new RegExp(`^${TRIGGER}\\s+(.+)`, "i"), async ({ message, body, client }) => {
       if (!("text" in message) || !message.text) return
       if (!("user" in message) || !message.user) return
       if (!("channel" in message) || !message.channel) return
@@ -329,6 +344,8 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
       if (!match) return
       const query = match[1].trim()
 
+      if (await this.interceptPermissionReply(context, sessionId, query, client)) return
+
       await this.stopMirrorForUserActivity(sessionId, query, async (text) => {
         await this.sendReply(client, context, text)
       })
@@ -350,7 +367,7 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
     // Only forwarded when an active session already exists for that thread.
     // Only active when threadIsolation is enabled.
     // -------------------------------------------------------------------------
-    this.app.message(async ({ message, body, client }) => {
+    app.message(async ({ message, body, client }) => {
       if (!this.threadIsolation) return
       if (!("text" in message) || !message.text) return
       if (!("user" in message) || !message.user) return
@@ -393,16 +410,13 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
 
       this.log(`[THREAD] ${context.userId} in ${sessionId}: ${context.text}`)
       this.touchSessionActivity(sessionId)
+      if (await this.interceptPermissionReply(context, sessionId, context.text.trim(), client)) return
       await this.stopMirrorForUserActivity(sessionId, context.text.trim(), async (text) => {
         await this.sendReply(client, context, text)
       })
       if (!this.checkRateLimit(context.userId)) return
       await this.processQuery(context, sessionId, context.text.trim(), client)
     })
-
-    await this.app.start()
-    this.startSessionExpiryLoop()
-    this.log("Started! Listening for messages...")
   }
 
   async stop(): Promise<void> {
@@ -430,6 +444,31 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
     } else {
       await slackClient.chat.postMessage({ channel: context.channelId, text })
     }
+  }
+
+  /**
+   * Consume a message that answers a held permission request.
+   *
+   * Every inbound handler calls this before rate limiting and before starting a
+   * turn: an approval throttled away, or forwarded to the model as a prompt,
+   * leaves the agent blocked on the request it was meant to settle.
+   *
+   * `sessionId` is the caller's own resolveSessionId() result -- channel:thread
+   * under thread isolation, bare channel without it -- which is the same id
+   * processQuery presents under, so the broker compares one namespace.
+   */
+  private async interceptPermissionReply(
+    context: SlackEventContext,
+    sessionId: string,
+    text: string,
+    slackClient: any,
+  ): Promise<boolean> {
+    return await this.handlePermissionReply(
+      sessionId,
+      context.userId,
+      text,
+      (reply) => this.sendReply(slackClient, context, reply),
+    )
   }
 
   /**
@@ -519,6 +558,16 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
       this.log(`[PERMISSION] Rejected: ${event.permission}${event.path ? ` (${event.path})` : ""}`)
       await this.sendReply(slackClient, context, `> ${event.message}`)
     }
+    const permissionRequestHandler = async (request: PermissionRequest) => {
+      const acp = client
+      if (!acp) return
+      await this.presentPermissionRequest(
+        sessionId,
+        request,
+        acp,
+        (text) => this.sendReply(slackClient, context, text),
+      )
+    }
 
     try {
       session = await this.getOrCreateSession(sessionId, (client) => ({
@@ -540,6 +589,7 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
       client.on("chunk", chunkHandler)
       client.on("update", updateHandler)
       client.on("permission_rejected", permissionHandler)
+      client.on("permission_requested", permissionRequestHandler)
 
       await client.prompt(query)
 
@@ -583,6 +633,7 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
       client?.off("chunk", chunkHandler)
       client?.off("update", updateHandler)
       client?.off("permission_rejected", permissionHandler)
+      client?.off("permission_requested", permissionRequestHandler)
       // Reset inactivity clock from moment of delivery
       if (session) session.lastActivity = new Date()
       this.markQueryDone(sessionId)

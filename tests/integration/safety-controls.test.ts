@@ -22,6 +22,8 @@ import path from "path"
 import { ACPClient } from "../../src/acp-client"
 import { resolveSessionWorkspace } from "../../src/session-utils"
 import { WhatsAppConnector } from "../../connectors/whatsapp"
+import { MatrixConnector } from "../../connectors/matrix"
+import { SlackConnector } from "../../connectors/slack"
 
 const REPO_ROOT = path.resolve(import.meta.dir, "../..")
 
@@ -188,8 +190,8 @@ describe("inbound gating driven by a real config file", () => {
 })
 
 /** An ACP client whose child process is replaced by in-memory stdio. */
-function buildACPClient() {
-  const client = new ACPClient({ cwd: project, interactivePermissions: true })
+function buildACPClient(extra: { permissionTimeoutMs?: number } = {}) {
+  const client = new ACPClient({ cwd: project, interactivePermissions: true, ...extra })
   const agentSaw: string[] = []
   const stdout = new EventEmitter()
 
@@ -380,5 +382,353 @@ describe("pinned workspace", () => {
     ;(connector as any).deleteSessionCacheDir(GROUP)
 
     expect(fs.existsSync(path.join(project, "AGENTS.md"))).toBe(true)
+  })
+})
+
+// =============================================================================
+// Presenting a held permission in every connector that keys sessions by thread
+// =============================================================================
+
+/**
+ * The permission round trip has to be wired per connector, and a connector that
+ * holds a request without presenting it stalls the turn with no way to settle
+ * it. These drive each connector's real query path and real inbound handlers,
+ * so the listener registration itself is under test rather than assumed.
+ */
+
+const MATRIX_ROOM = "!vibeterm:desktop.ts.nowaker.net"
+const MATRIX_ROOT = "$root-event"
+const MATRIX_OTHER_ROOT = "$other-event"
+const MATRIX_BOT = "@bridge:desktop.ts.nowaker.net"
+const MATRIX_OWNER = "@nowaker:desktop.ts.nowaker.net"
+const MATRIX_STRANGER = "@stranger:desktop.ts.nowaker.net"
+
+const SLACK_CHANNEL = "C0C2U4Q51HP"
+const SLACK_ROOT_TS = "1700000000.000100"
+const SLACK_OTHER_TS = "1700000000.000900"
+const SLACK_OWNER = "U01OWNER"
+const SLACK_STRANGER = "U01STRANGER"
+
+const PERMISSION_TOOL_MESSAGES = {
+  mode: "events",
+  showCalls: true,
+  showArguments: true,
+  showOutputFor: [],
+  summaries: {
+    allowedTools: ["webfetch"],
+    allowedFields: ["url"],
+    maxFieldLength: 120,
+    unlistedTools: "name",
+  },
+}
+
+/** An ACP client whose prompt stays in flight until the test releases it. */
+function buildDrivableClient() {
+  const built = buildACPClient()
+  const prompts: string[] = []
+  let release: () => void = () => {}
+  const inFlight = new Promise<void>((resolve) => { release = resolve })
+
+  ;(built.client as any).prompt = async (text: string) => {
+    prompts.push(text)
+    await inFlight
+    built.client.emit("chunk", "done")
+    return "done"
+  }
+
+  return { ...built, prompts, release }
+}
+
+interface HeldTurn {
+  chat: string[]
+  agentSaw: string[]
+  prompts: string[]
+  token: string
+  threadId: string
+  pending: () => number
+  reply: (text: string, opts?: { sender?: string; otherThread?: boolean }) => Promise<void>
+  finish: () => Promise<void>
+}
+
+const tick = () => new Promise((resolve) => setTimeout(resolve, 20))
+
+function tokenIn(chat: string[]): string {
+  return chat.join("\n").match(/\b[A-Z2-9]{6}\b/)?.[0] || ""
+}
+
+async function matrixHeldTurn(): Promise<HeldTurn> {
+  const chat: string[] = []
+  const connector = new MatrixConnector()
+  const { client, agentSaw, emitRequest, prompts, release } = buildDrivableClient()
+  let events = 0
+
+  ;(connector as any).matrix = {
+    sendMessage: async (_roomId: string, content: any) => {
+      if (typeof content.body === "string") chat.push(content.body)
+      return `$sent-${++events}`
+    },
+    sendNotice: async (_roomId: string, text: string) => { chat.push(text) },
+    sendText: async (_roomId: string, text: string) => { chat.push(text) },
+    getUserId: async () => MATRIX_BOT,
+    getJoinedRoomMembers: async () => [MATRIX_BOT, MATRIX_OWNER, MATRIX_STRANGER],
+  }
+  ;(connector as any).allowedUsers = new Set([MATRIX_OWNER])
+  ;(connector as any).allowedChannels = new Set([MATRIX_ROOM])
+  ;(connector as any).toolMessagesConfig = PERMISSION_TOOL_MESSAGES
+
+  const threadId = `${MATRIX_ROOM}:${MATRIX_ROOT}`
+  ;(connector as any).sessionManager.set(threadId, {
+    client,
+    createdAt: new Date(),
+    lastActivity: new Date(),
+    messageCount: 0,
+    inputChars: 0,
+    outputChars: 0,
+    lastEventIds: new Map<string, string>(),
+  })
+
+  const inbound = (body: string, opts: { sender?: string; root?: string } = {}) => ({
+    type: "m.room.message",
+    event_id: `$in-${++events}`,
+    sender: opts.sender || MATRIX_OWNER,
+    content: {
+      msgtype: "m.text",
+      body,
+      ...(opts.root ? { "m.relates_to": { rel_type: "m.thread", event_id: opts.root } } : {}),
+    },
+  })
+
+  const root = inbound("!oc fetch the report")
+  root.event_id = MATRIX_ROOT
+  const turn = (connector as any).handleRoomMessage(MATRIX_ROOM, root)
+  await tick()
+
+  emitRequest(41, WEBFETCH_REQUEST)
+  await tick()
+
+  return {
+    chat,
+    agentSaw,
+    prompts,
+    token: tokenIn(chat),
+    threadId,
+    pending: () => (connector as any).permissionBroker.size,
+    reply: async (text, opts = {}) => {
+      await (connector as any).handleRoomMessage(MATRIX_ROOM, inbound(text, {
+        sender: opts.sender,
+        root: opts.otherThread ? MATRIX_OTHER_ROOT : MATRIX_ROOT,
+      }))
+    },
+    finish: async () => { release(); await turn },
+  }
+}
+
+async function slackHeldTurn(): Promise<HeldTurn> {
+  const chat: string[] = []
+  const connector = new SlackConnector()
+  const { client, agentSaw, emitRequest, prompts, release } = buildDrivableClient()
+  let events = 0
+
+  const handlers: Record<string, any> = {}
+  connector.registerHandlers({
+    event: (_name: string, fn: any) => { handlers.mention = fn },
+    message: (first: any, second?: any) => {
+      if (typeof first === "function") handlers.thread = first
+      else handlers.trigger = second
+    },
+  } as any)
+
+  const slackClient = {
+    chat: {
+      postMessage: async (payload: any) => {
+        if (typeof payload.text === "string") chat.push(payload.text)
+        return { ts: `ts-sent-${++events}` }
+      },
+      update: async () => {},
+    },
+  }
+
+  ;(connector as any).allowedUsers = new Set([SLACK_OWNER])
+  ;(connector as any).allowedChannels = new Set([SLACK_CHANNEL])
+  ;(connector as any).toolMessagesConfig = PERMISSION_TOOL_MESSAGES
+
+  const threadId = `${SLACK_CHANNEL}:${SLACK_ROOT_TS}`
+  ;(connector as any).sessionManager.set(threadId, {
+    client,
+    createdAt: new Date(),
+    lastActivity: new Date(),
+    messageCount: 0,
+    inputChars: 0,
+    outputChars: 0,
+  })
+
+  const deliver = (text: string, opts: { sender?: string; threadTs?: string } = {}) =>
+    handlers.trigger({
+      message: {
+        text,
+        user: opts.sender || SLACK_OWNER,
+        channel: SLACK_CHANNEL,
+        ts: `${Date.now()}.${++events}`,
+        thread_ts: opts.threadTs || SLACK_ROOT_TS,
+      },
+      body: { team_id: "T04FXV713" },
+      client: slackClient,
+    })
+
+  const turn = handlers.trigger({
+    message: {
+      text: "!oc fetch the report",
+      user: SLACK_OWNER,
+      channel: SLACK_CHANNEL,
+      ts: SLACK_ROOT_TS,
+    },
+    body: { team_id: "T04FXV713" },
+    client: slackClient,
+  })
+  await tick()
+
+  emitRequest(41, WEBFETCH_REQUEST)
+  await tick()
+
+  return {
+    chat,
+    agentSaw,
+    prompts,
+    token: tokenIn(chat),
+    threadId,
+    pending: () => (connector as any).permissionBroker.size,
+    reply: async (text, opts = {}) => {
+      await deliver(text, {
+        sender: opts.sender,
+        threadTs: opts.otherThread ? SLACK_OTHER_TS : SLACK_ROOT_TS,
+      })
+    },
+    finish: async () => { release(); await turn },
+  }
+}
+
+const CONNECTOR_TURNS: Array<[string, () => Promise<HeldTurn>, string]> = [
+  ["matrix", matrixHeldTurn, `${MATRIX_ROOM}:${MATRIX_ROOT}`],
+  ["slack", slackHeldTurn, `${SLACK_CHANNEL}:${SLACK_ROOT_TS}`],
+]
+
+for (const [name, openTurn, expectedThreadId] of CONNECTOR_TURNS) {
+  describe(`${name} permission round trip`, () => {
+    test("presents the held request under the connector's own session key", async () => {
+      const turn = await openTurn()
+      try {
+        expect(turn.threadId).toBe(expectedThreadId)
+        expect(turn.token).toMatch(/^[A-Z2-9]{6}$/)
+        expect(turn.chat.join("\n")).toContain("Permission requested")
+        expect(turn.chat.join("\n")).toMatch(/\b1\.\s/)
+        expect(turn.pending()).toBe(1)
+      } finally {
+        await turn.finish()
+      }
+    })
+
+    test("renders the allowlisted field and withholds the credential", async () => {
+      const turn = await openTurn()
+      try {
+        const prompt = turn.chat.join("\n")
+        expect(prompt).toContain("url=https://example.invalid/report")
+        expect(prompt).not.toContain("header")
+        expect(prompt).not.toContain("abcdefghijklmnopqrstuvwxyz012345")
+      } finally {
+        await turn.finish()
+      }
+    })
+
+    test("keeps the agent waiting until somebody answers", async () => {
+      const turn = await openTurn()
+      try {
+        expect(turn.agentSaw).toHaveLength(0)
+      } finally {
+        await turn.finish()
+      }
+    })
+
+    test("leaves the request pending for a sender who is not allowlisted", async () => {
+      const turn = await openTurn()
+      try {
+        await turn.reply(`!oc ${turn.token} 1`, { sender: "stranger" })
+
+        expect(turn.agentSaw).toHaveLength(0)
+        expect(turn.pending()).toBe(1)
+      } finally {
+        await turn.finish()
+      }
+    })
+
+    test("leaves the request pending for a reply in a different thread", async () => {
+      const turn = await openTurn()
+      try {
+        await turn.reply(`!oc ${turn.token} 1`, { otherThread: true })
+
+        expect(turn.agentSaw).toHaveLength(0)
+        expect(turn.pending()).toBe(1)
+      } finally {
+        await turn.finish()
+      }
+    })
+
+    test("leaves the request pending for ambiguous prose", async () => {
+      const turn = await openTurn()
+      try {
+        await turn.reply(`!oc ${turn.token} yes go ahead`)
+
+        expect(turn.agentSaw).toHaveLength(0)
+        expect(turn.pending()).toBe(1)
+      } finally {
+        await turn.finish()
+      }
+    })
+
+    test("settles on a correlated reply and does not also prompt the agent", async () => {
+      const turn = await openTurn()
+      try {
+        expect(turn.prompts).toHaveLength(1)
+
+        await turn.reply(`!oc ${turn.token} 1`)
+
+        expect(turn.agentSaw).toHaveLength(1)
+        const answer = JSON.parse(turn.agentSaw[0])
+        expect(answer.id).toBe(41)
+        expect(answer.result.outcome.optionId).toBe("once")
+        expect(turn.pending()).toBe(0)
+        // The reply settled the waiting turn; it must not have started another.
+        expect(turn.prompts).toHaveLength(1)
+      } finally {
+        await turn.finish()
+      }
+    })
+  })
+}
+
+// =============================================================================
+// A request nobody presented
+// =============================================================================
+
+describe("held requests nobody presented", () => {
+  test("are denied so the turn ends instead of hanging", async () => {
+    const { agentSaw, emitRequest } = buildACPClient({ permissionTimeoutMs: 30 })
+
+    emitRequest(51, WEBFETCH_REQUEST)
+    expect(agentSaw).toHaveLength(0)
+
+    await new Promise((resolve) => setTimeout(resolve, 150))
+
+    expect(agentSaw).toHaveLength(1)
+    expect(JSON.parse(agentSaw[0]).result.outcome.optionId).toBe("reject")
+  })
+
+  test("are answered exactly once even if something answers late", async () => {
+    const { client, agentSaw, emitRequest } = buildACPClient({ permissionTimeoutMs: 30 })
+
+    emitRequest(52, WEBFETCH_REQUEST)
+    await new Promise((resolve) => setTimeout(resolve, 150))
+
+    expect(client.respondToPermission(52, "once")).toBe(false)
+    expect(agentSaw).toHaveLength(1)
   })
 })

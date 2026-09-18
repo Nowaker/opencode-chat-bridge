@@ -38,7 +38,7 @@ import {
   SimpleFsStorageProvider,
 } from "matrix-bot-sdk"
 
-import { ACPClient, type ImageContent } from "../src"
+import { ACPClient, type ImageContent, type PermissionRequest } from "../src"
 import { getConfig } from "../src/config"
 import { marked } from "marked"
 import {
@@ -443,6 +443,11 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
     query = query.replace(/^[:\s]+/, "").trim()
     if (!query) return
 
+    // Before anything that could start a turn or be rate limited: a permission
+    // reply answers the turn already waiting, it does not open a new one.
+    const permissionReply = async (text: string) => { await this.sendReply(context, text) }
+    if (await this.handlePermissionReply(context.sessionId, message.sender, query, permissionReply)) return
+
     this.log(`[MSG] ${message.sender} in ${context.sessionId}: ${body}`)
 
     await this.stopMirrorForUserActivity(context.sessionId, query, async (text) => {
@@ -585,6 +590,21 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
         await this.sendNoticeReply(context, `> ${event.message}`)
       }
       client.on("permission_rejected", permissionHandler)
+
+      // context.sessionId is this connector's session key -- room:threadRoot
+      // under thread isolation, bare room without it. The reply interception in
+      // handleRoomMessage resolves the same expression, so the broker's
+      // wrong-thread check compares two ids from one namespace.
+      const permissionRequestHandler = async (request: PermissionRequest) => {
+        hadToolActivity = true
+        await this.presentPermissionRequest(
+          context.sessionId,
+          request,
+          client,
+          async (text) => { await this.sendReply(context, text) },
+        )
+      }
+      client.on("permission_requested", permissionRequestHandler)
       client.on("activity", toolActivity.handleActivity)
       client.on("tool_activity", toolActivity.handleRevision)
 
@@ -607,6 +627,7 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
         client.off("update", updateHandler)
         client.off("image", imageHandler)
         client.off("permission_rejected", permissionHandler)
+        client.off("permission_requested", permissionRequestHandler)
       }
     }
 
