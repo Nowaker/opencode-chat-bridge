@@ -315,6 +315,21 @@ export interface ConnectorConfig {
   sessionRetentionDays: number // 7 (startup cleanup)
   sessionRetentionMins?: number // 30 (runtime expiry, optional)
   allowedUsers?: string[]
+  /** Stable channel/room/group IDs this connector may serve. */
+  allowedChannels?: string[]
+}
+
+/**
+ * Fail-closed membership test.
+ *
+ * Upstream treats an empty allowlist as "no restriction". This fork inverts
+ * that: an absent or empty allowlist denies every ID, so a half-configured
+ * deployment stays silent instead of answering everyone who can reach it.
+ */
+export function isAllowedId(id: string, allowlist: ReadonlySet<string> | null | undefined): boolean {
+  if (!id) return false
+  if (!allowlist || allowlist.size === 0) return false
+  return allowlist.has(id)
 }
 
 export function parseCsvList(value?: string): string[] {
@@ -642,7 +657,8 @@ export abstract class BaseConnector<TSession extends BaseSession> {
   /** Session IDs with an in-flight query -- never evict these */
   protected activeQueries = new Map<string, ActiveQueryHandle & { abort: () => void; aborted: boolean }>()
   private nextActiveQueryId = 0
-  private allowedUsers: Set<string> | null = null
+  private allowedUsers: Set<string>
+  private allowedChannels: Set<string>
   private expiryInterval: NodeJS.Timeout | null = null
   private acpConfig: ACPConfig
   private sessionPickerConfig = getConfig().sessionPicker
@@ -669,9 +685,8 @@ export abstract class BaseConnector<TSession extends BaseSession> {
       this.config.sessionRetentionMins = parseSessionRetentionMins(process.env)
     }
 
-    if (this.config.allowedUsers && this.config.allowedUsers.length > 0) {
-      this.allowedUsers = new Set(this.config.allowedUsers)
-    }
+    this.allowedUsers = new Set(this.config.allowedUsers || [])
+    this.allowedChannels = new Set(this.config.allowedChannels || [])
   }
   
   /**
@@ -720,9 +735,8 @@ export abstract class BaseConnector<TSession extends BaseSession> {
     console.log(`  Bot name: ${this.config.botName}`)
     console.log(`  Session storage: ${storageInfo.baseDir}`)
     console.log(`    (${storageInfo.source})`)
-    if (this.allowedUsers) {
-      console.log(`  Allowed users: ${Array.from(this.allowedUsers).join(", ")}`)
-    }
+    console.log(`  Allowed users: ${Array.from(this.allowedUsers).join(", ") || "(none -- every sender is denied)"}`)
+    console.log(`  Allowed channels: ${Array.from(this.allowedChannels).join(", ") || "(none -- every channel is denied)"}`)
     if (this.config.sessionRetentionMins) {
       console.log(`  Session expiry: ${this.config.sessionRetentionMins} min (inactivity)`)
     }
@@ -744,10 +758,17 @@ export abstract class BaseConnector<TSession extends BaseSession> {
   }
 
   protected isUserAllowed(userId: string): boolean {
-    if (!this.allowedUsers) return true
-    const allowed = this.allowedUsers.has(userId)
+    const allowed = isAllowedId(userId, this.allowedUsers)
     if (!allowed) {
       this.log(`[IGNORED] Message from non-allowed user: ${userId}`)
+    }
+    return allowed
+  }
+
+  protected isChannelAllowed(channelId: string): boolean {
+    const allowed = isAllowedId(channelId, this.allowedChannels)
+    if (!allowed) {
+      this.log(`[IGNORED] Message from non-allowed channel: ${channelId}`)
     }
     return allowed
   }

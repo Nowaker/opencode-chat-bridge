@@ -51,6 +51,8 @@ const RATE_LIMIT_SECONDS = 5
 const THREAD_ISOLATION = config.slack.threadIsolation
 const ENV_ALLOWED_USERS = parseCsvList(process.env.SLACK_ALLOWED_USERS)
 const ALLOWED_USERS = ENV_ALLOWED_USERS.length > 0 ? ENV_ALLOWED_USERS : config.slack.allowedUsers
+const ENV_ALLOWED_CHANNELS = parseCsvList(process.env.SLACK_ALLOWED_CHANNELS)
+const ALLOWED_CHANNELS = ENV_ALLOWED_CHANNELS.length > 0 ? ENV_ALLOWED_CHANNELS : config.slack.allowedChannels
 
 function parseSessionRetentionMins(env: NodeJS.ProcessEnv): number {
   const raw = env.SESSION_RETENTION_MINS
@@ -228,6 +230,7 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
       sessionRetentionDays: SESSION_RETENTION_DAYS,
       sessionRetentionMins: SESSION_RETENTION_MINS,
       allowedUsers: ALLOWED_USERS,
+      allowedChannels: ALLOWED_CHANNELS,
     })
     this.threadIsolation = THREAD_ISOLATION
   }
@@ -277,6 +280,7 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
         return
       }
 
+      if (!this.isChannelAllowed(context.channelId)) return
       if (this.isDuplicateEvent(context.dedupeId)) return
       if (!this.isUserAllowed(context.userId)) return
       const sessionId = resolveSessionId(context.channelId, context.replyThreadTs, this.threadIsolation)
@@ -314,6 +318,7 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
         return
       }
 
+      if (!this.isChannelAllowed(context.channelId)) return
       if (this.isDuplicateEvent(context.dedupeId)) return
       if (!this.isUserAllowed(context.userId)) return
       const sessionId = resolveSessionId(context.channelId, context.replyThreadTs, this.threadIsolation)
@@ -376,6 +381,7 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
         return
       }
 
+      if (!this.isChannelAllowed(context.channelId)) return
       if (this.isDuplicateEvent(context.dedupeId)) return
       if (!this.isUserAllowed(context.userId)) return
 

@@ -34,6 +34,7 @@ export {
   EventDeduplicator,
   CommandHandler,
   parseCsvList,
+  isAllowedId,
   formatToolCallMessage,
   resolveToolMessageMode,
   ToolActivityPresenter,

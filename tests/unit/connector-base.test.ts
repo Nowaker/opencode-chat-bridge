@@ -10,6 +10,7 @@ import {
   CommandHandler,
   BaseConnector,
   parseCsvList,
+  isAllowedId,
   formatToolCallMessage,
   resolveToolMessageMode,
   ToolActivityPresenter,
@@ -345,7 +346,7 @@ describe("RateLimiter", () => {
 // =============================================================================
 
 class TestConnector extends BaseConnector<BaseSession> {
-  constructor(allowedUsers?: string[]) {
+  constructor(allowedUsers?: string[], allowedChannels?: string[]) {
     super({
       connector: "test",
       trigger: "!oc",
@@ -353,6 +354,7 @@ class TestConnector extends BaseConnector<BaseSession> {
       rateLimitSeconds: 5,
       sessionRetentionDays: 7,
       allowedUsers,
+      allowedChannels,
     })
   }
 
@@ -362,6 +364,10 @@ class TestConnector extends BaseConnector<BaseSession> {
 
   public canUserAccess(userId: string): boolean {
     return this.isUserAllowed(userId)
+  }
+
+  public canChannelAccess(channelId: string): boolean {
+    return this.isChannelAllowed(channelId)
   }
 
   public startQuery(sessionId: string, abortFn?: () => void) {
@@ -404,10 +410,40 @@ describe("parseCsvList", () => {
   })
 })
 
+describe("isAllowedId", () => {
+  test("denies when the allowlist is empty", () => {
+    expect(isAllowedId("anything", new Set())).toBe(false)
+  })
+
+  test("denies when the allowlist is absent", () => {
+    expect(isAllowedId("anything", null)).toBe(false)
+    expect(isAllowedId("anything", undefined)).toBe(false)
+  })
+
+  test("denies an empty id even against a populated allowlist", () => {
+    expect(isAllowedId("", new Set(["C0C2U4Q51HP"]))).toBe(false)
+  })
+
+  test("allows an exactly listed id", () => {
+    expect(isAllowedId("C0C2U4Q51HP", new Set(["C0C2U4Q51HP"]))).toBe(true)
+  })
+
+  test("matches on exact id only, never on a prefix or substring", () => {
+    const allowlist = new Set(["C0C2U4Q51HP"])
+    expect(isAllowedId("C0C2U4Q51H", allowlist)).toBe(false)
+    expect(isAllowedId("C0C2U4Q51HPX", allowlist)).toBe(false)
+  })
+})
+
 describe("BaseConnector allowlist", () => {
-  test("allows all users when allowlist is empty", () => {
+  test("denies every user when the user allowlist is empty", () => {
     const connector = new TestConnector([])
-    expect(connector.canUserAccess("user-1")).toBe(true)
+    expect(connector.canUserAccess("user-1")).toBe(false)
+  })
+
+  test("denies every user when the user allowlist is absent", () => {
+    const connector = new TestConnector()
+    expect(connector.canUserAccess("user-1")).toBe(false)
   })
 
   test("allows listed users", () => {
@@ -418,6 +454,34 @@ describe("BaseConnector allowlist", () => {
   test("blocks unlisted users", () => {
     const connector = new TestConnector(["user-1", "user-2"])
     expect(connector.canUserAccess("user-3")).toBe(false)
+  })
+
+  test("denies every channel when the channel allowlist is empty", () => {
+    const connector = new TestConnector(["user-1"], [])
+    expect(connector.canChannelAccess("C0C2U4Q51HP")).toBe(false)
+  })
+
+  test("denies every channel when the channel allowlist is absent", () => {
+    const connector = new TestConnector(["user-1"])
+    expect(connector.canChannelAccess("C0C2U4Q51HP")).toBe(false)
+  })
+
+  test("allows a listed channel", () => {
+    const connector = new TestConnector(["user-1"], ["C0C2U4Q51HP"])
+    expect(connector.canChannelAccess("C0C2U4Q51HP")).toBe(true)
+  })
+
+  test("blocks an unlisted channel", () => {
+    const connector = new TestConnector(["user-1"], ["C0C2U4Q51HP"])
+    expect(connector.canChannelAccess("C0OTHERCHAN")).toBe(false)
+  })
+
+  test("gates users and channels independently", () => {
+    const connector = new TestConnector(["user-1"], ["C0C2U4Q51HP"])
+    expect(connector.canUserAccess("user-1")).toBe(true)
+    expect(connector.canChannelAccess("C0OTHERCHAN")).toBe(false)
+    expect(connector.canUserAccess("user-2")).toBe(false)
+    expect(connector.canChannelAccess("C0C2U4Q51HP")).toBe(true)
   })
 })
 

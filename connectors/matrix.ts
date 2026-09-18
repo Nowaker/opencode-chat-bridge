@@ -69,6 +69,9 @@ const SESSION_RETENTION_DAYS = parseInt(process.env.SESSION_RETENTION_DAYS || "7
 const THREAD_ISOLATION = config.matrix.threadIsolation
 const ENV_ALLOWED_USERS = parseCsvList(process.env.MATRIX_ALLOWED_USERS)
 const ALLOWED_USERS = ENV_ALLOWED_USERS.length > 0 ? ENV_ALLOWED_USERS : config.matrix.allowedUsers
+const ENV_ALLOWED_ROOMS = parseCsvList(process.env.MATRIX_ALLOWED_ROOMS)
+const ALLOWED_ROOMS = ENV_ALLOWED_ROOMS.length > 0 ? ENV_ALLOWED_ROOMS : config.matrix.allowedRooms
+const IGNORE_ROOMS = new Set(config.matrix.ignoreRooms)
 
 // Storage paths
 const STORAGE_PATH = process.env.MATRIX_STORAGE_PATH ||
@@ -127,6 +130,7 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
       rateLimitSeconds: RATE_LIMIT_SECONDS,
       sessionRetentionDays: SESSION_RETENTION_DAYS,
       allowedUsers: ALLOWED_USERS,
+      allowedChannels: ALLOWED_ROOMS,
     })
     this.threadIsolation = THREAD_ISOLATION
   }
@@ -374,6 +378,12 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
     const message = new MessageEvent(event)
 
     if (message.messageType !== "m.text") return
+
+    if (!this.isChannelAllowed(roomId)) return
+    if (IGNORE_ROOMS.has(roomId)) {
+      this.log(`[IGNORED] Message from ignored room: ${roomId}`)
+      return
+    }
 
     const myUserId = await this.matrix!.getUserId()
     if (message.sender === myUserId) return

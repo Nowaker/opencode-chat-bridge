@@ -63,6 +63,8 @@ const BOT_NAME = config.botName
 const RATE_LIMIT_SECONDS = config.rateLimitSeconds
 const ENV_ALLOWED_USERS = parseCsvList(process.env.WHATSAPP_ALLOWED_USERS)
 const ALLOWED_USERS = ENV_ALLOWED_USERS.length > 0 ? ENV_ALLOWED_USERS : config.whatsapp.allowedUsers
+const ENV_ALLOWED_GROUPS = parseCsvList(process.env.WHATSAPP_ALLOWED_GROUPS)
+const ALLOWED_GROUPS = ENV_ALLOWED_GROUPS.length > 0 ? ENV_ALLOWED_GROUPS : config.whatsapp.allowedGroups
 const AUTH_FOLDER = path.resolve(process.cwd(), config.whatsapp.authFolder)
 const SESSION_RETENTION_DAYS = parseInt(process.env.SESSION_RETENTION_DAYS || "7", 10)
 const RESPOND_TO_OTHERS = process.env.WHATSAPP_RESPOND_TO_OTHERS === undefined
@@ -95,6 +97,7 @@ class WhatsAppConnector extends BaseConnector<ChatSession> {
       rateLimitSeconds: RATE_LIMIT_SECONDS,
       sessionRetentionDays: SESSION_RETENTION_DAYS,
       allowedUsers: ALLOWED_USERS,
+      allowedChannels: ALLOWED_GROUPS,
     })
   }
 
@@ -267,6 +270,10 @@ class WhatsAppConnector extends BaseConnector<ChatSession> {
   private async handleMessage(msg: any): Promise<void> {
     const chatId = msg.key.remoteJid
     if (!chatId) return
+
+    // The chat allowlist binds the owner too: `fromMe` exempts a sender from the
+    // user allowlist, never from the set of chats this bridge may read or write.
+    if (!this.isChannelAllowed(chatId)) return
 
     // Get message text
     const text = msg.message?.conversation ||
