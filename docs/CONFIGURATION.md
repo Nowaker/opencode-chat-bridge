@@ -858,6 +858,10 @@ Enforcement sits at each connector's inbound edge, before deduplication and befo
 
 A reply is accepted only when it names the request's correlation token, comes from an allowlisted stable sender ID, arrives in the same thread the request was posted to, and lands inside the window. The decision must be an option's 1-based number or its exact ID or name; ambiguous text such as "yes" or "sure, go ahead" is refused explicitly. See [Fork deviations](FORK_DEVIATIONS.md#8-permissions-round-trip-to-chat).
 
+Presenting a held request is wired per connector. **WhatsApp, Matrix and Slack** post it and accept a reply. **Discord, Mattermost, Telegram and Web** do not: with `interactive: true` their requests are denied automatically once the window plus a grace margin has passed, so the turn ends with a refusal instead of stalling. Set `interactive: false` on those deployments to get the immediate refusal instead of a delayed one.
+
+Answer in the thread that asked. Each connector treats its own session key as the thread: the chat on WhatsApp, `roomId:threadRootEventId` on Matrix, `channelId:threadTs` on Slack. A reply in a different thread is never an approval.
+
 Interactive **questions** (opencode's `question` tool and Vibeterm's `vibeterm_async_question`) are **not reachable over ACP at all** and no setting enables them. See [Fork deviations](FORK_DEVIATIONS.md#interactive-questions-over-acp).
 
 ### WhatsApp output boundary

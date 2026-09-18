@@ -169,6 +169,23 @@ denies.
 - `permissions.interactive` defaults to true in configuration but false in the
   ACP client itself, so a library consumer that never answers cannot leave an
   agent blocked forever.
+- The round trip is wired **per connector**, and only WhatsApp, Matrix and Slack
+  have it. Holding a request without presenting it is worse than upstream's
+  immediate deny -- the agent waits on a reply nobody can send, and on Matrix
+  and Slack there is no query timeout to end the turn -- so the ACP client
+  denies any request still held well after the configured window. Discord,
+  Mattermost, Telegram and Web therefore end the turn with a delayed refusal
+  rather than stalling, but cannot approve anything.
+- Each connector passes its **own session key** as the thread the request
+  belongs to: `chatId` on WhatsApp, `roomId:threadRootEventId` on Matrix,
+  `channelId:threadTs` on Slack. The same expression settles the reply, so the
+  thread check compares two ids from one namespace. Passing a bare room or
+  channel id where the session key is a thread key would either refuse every
+  valid reply or accept a cross-thread one.
+- Reply interception runs before rate limiting and before anything that can
+  start or abort a turn. Below the rate limiter an approval sent inside the
+  limit window is silently dropped; below the query path it reaches the model
+  as a fresh prompt.
 
 ## 9. Session workspaces can be pinned to a real project
 
