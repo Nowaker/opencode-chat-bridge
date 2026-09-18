@@ -839,7 +839,9 @@ Enforcement sits at each connector's inbound edge, before deduplication and befo
 }
 ```
 
-- `redactSecrets` (default `true`) masks credential shapes -- provider tokens, JWTs, private key blocks, `Bearer` headers, URL userinfo, and `NAME=value` where the name announces a secret -- in everything the bridge sends. It is a backstop behind the allowlists, not a replacement for them.
+- `redactSecrets` (default `true`) masks credential shapes -- provider tokens, JWTs, private key blocks, `Bearer` headers, URL userinfo, and `NAME=value` where the name announces a secret. It is a backstop behind the allowlists, not a replacement for them: a tool summary is already redacted field by field, but the final assistant answer is model-authored text no allowlist has inspected.
+
+  Applied at each connector's send chokepoint on **WhatsApp, Matrix and Slack**, so it covers final answers, tool notices, errors, permission prompts and captions alike. **Discord, Mattermost, Telegram and Web send their own text unredacted** -- tool summaries are still safe there, but their final answers are not. Inbound text is never redacted.
 - `allowRawToolOutput` (default `false`) is a second gate in front of `toolMessages.showOutputFor`. Both must be true before a whole raw tool result is forwarded verbatim. Raw results are unbounded and cannot be filtered per field, so upstream's behaviour requires opting back in.
 
 ### Permissions

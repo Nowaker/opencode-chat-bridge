@@ -112,13 +112,30 @@ results is a disclosure decision.
 **This fork:** `safeOutput.redactSecrets` masks provider tokens, JWTs, private
 key blocks, `Bearer` headers, URL userinfo, and `NAME=value` where the name
 announces a secret. It runs inside summarized field values and again over the
-assembled message at the WhatsApp send boundary.
+assembled message at each connector's own send chokepoint.
 
 **Why:** a backstop behind the allowlists, not a replacement for them. A value
-that is legitimately allowlisted still must not carry a token out.
+that is legitimately allowlisted still must not carry a token out. A tool
+summary is redacted field by field, but the final assistant answer is
+model-authored text that no allowlist has inspected, so the outbound edge needs
+its own pass.
 
-**Notes:** redaction is idempotent, because the same text is redacted more than
-once on its way out.
+**Notes:**
+
+- Redaction is idempotent, because the same text is redacted more than once on
+  its way out -- `sendReply` on a non-thread Matrix room passes through
+  `sendMessage`, which redacts again.
+- It is applied at the chokepoint every outbound path already funnels through,
+  not at the call sites that reach it, so a new send site cannot reintroduce
+  the gap: `emitText`/`editText` on WhatsApp, `sendReply` plus the notice and
+  tool-activity helpers on Matrix, `sendReply` plus the tool-activity and
+  upload helpers on Slack.
+- **Connectors below honour the flag:** WhatsApp, Matrix, Slack. Discord,
+  Mattermost, Telegram and Web send their own text unredacted -- they predate
+  this fork's controls and are not wired. Tool *summaries* are still safe
+  everywhere, because `summarizeToolCall` redacts each field centrally.
+- Inbound text is never redacted. The model needs what the human actually
+  typed, and the flag governs what leaves the bridge, not what enters it.
 
 ## 7. WhatsApp file upload and message logging are opt-in
 
