@@ -20,6 +20,7 @@ import fs from "fs"
 import os from "os"
 import path from "path"
 import { ACPClient } from "../../src/acp-client"
+import { REDACTION_PLACEHOLDER } from "../../src/safe-output"
 import { resolveSessionWorkspace } from "../../src/session-utils"
 import { WhatsAppConnector } from "../../connectors/whatsapp"
 import { MatrixConnector } from "../../connectors/matrix"
@@ -732,3 +733,160 @@ describe("held requests nobody presented", () => {
     expect(agentSaw).toHaveLength(1)
   })
 })
+
+// =============================================================================
+// safeOutput.redactSecrets at each connector's own send chokepoint
+// =============================================================================
+
+/**
+ * The final assistant answer is model-authored text that no allowlist has
+ * inspected, so each connector must redact at its own send chokepoint. These
+ * drive the real query path rather than calling the chokepoint directly, so a
+ * send site added outside it is caught.
+ */
+
+// Assembled at runtime so no source line is itself a credential for scanners.
+const SENSITIVE_FIELD = ["DEPLOY", "TOKEN"].join("_")
+const PLACEHOLDER_VALUE = "not-a-real-credential-0123456789"
+const SECRET_BEARING_ANSWER = `Deploy finished. ${SENSITIVE_FIELD}=${PLACEHOLDER_VALUE} is set.`
+
+/** An ACP client whose prompt answers immediately with fixed text. */
+function buildAnsweringClient(answer: string) {
+  const { client } = buildACPClient()
+  ;(client as any).prompt = async () => {
+    client.emit("chunk", answer)
+    return answer
+  }
+  return client
+}
+
+type AnswerDriver = (answer: string, opts: { redactSecrets: boolean }) => Promise<string[]>
+
+const matrixAnswerTurn: AnswerDriver = async (answer, opts) => {
+  const sent: string[] = []
+  const connector = new MatrixConnector()
+  const client = buildAnsweringClient(answer)
+  let events = 0
+
+  ;(connector as any).matrix = {
+    sendMessage: async (_roomId: string, content: any) => {
+      if (typeof content.body === "string") sent.push(content.body)
+      return `$sent-${++events}`
+    },
+    sendNotice: async (_roomId: string, text: string) => { sent.push(text) },
+    sendText: async (_roomId: string, text: string) => { sent.push(text) },
+    getUserId: async () => MATRIX_BOT,
+    getJoinedRoomMembers: async () => [MATRIX_BOT, MATRIX_OWNER, MATRIX_STRANGER],
+  }
+  ;(connector as any).allowedUsers = new Set([MATRIX_OWNER])
+  ;(connector as any).allowedChannels = new Set([MATRIX_ROOM])
+  ;(connector as any).safeOutputConfig = {
+    redactSecrets: opts.redactSecrets,
+    allowRawToolOutput: false,
+  }
+  ;(connector as any).sessionManager.set(`${MATRIX_ROOM}:${MATRIX_ROOT}`, {
+    client,
+    createdAt: new Date(),
+    lastActivity: new Date(),
+    messageCount: 0,
+    inputChars: 0,
+    outputChars: 0,
+    lastEventIds: new Map<string, string>(),
+  })
+
+  await (connector as any).handleRoomMessage(MATRIX_ROOM, {
+    type: "m.room.message",
+    event_id: MATRIX_ROOT,
+    sender: MATRIX_OWNER,
+    content: { msgtype: "m.text", body: "!oc deploy it" },
+  })
+
+  return sent
+}
+
+const slackAnswerTurn: AnswerDriver = async (answer, opts) => {
+  const sent: string[] = []
+  const connector = new SlackConnector()
+  const client = buildAnsweringClient(answer)
+  let events = 0
+
+  const handlers: Record<string, any> = {}
+  connector.registerHandlers({
+    event: (_name: string, fn: any) => { handlers.mention = fn },
+    message: (first: any, second?: any) => {
+      if (typeof first === "function") handlers.thread = first
+      else handlers.trigger = second
+    },
+  } as any)
+
+  const slackClient = {
+    chat: {
+      postMessage: async (payload: any) => {
+        if (typeof payload.text === "string") sent.push(payload.text)
+        return { ts: `ts-sent-${++events}` }
+      },
+      update: async (payload: any) => {
+        if (typeof payload.text === "string") sent.push(payload.text)
+      },
+    },
+  }
+
+  ;(connector as any).allowedUsers = new Set([SLACK_OWNER])
+  ;(connector as any).allowedChannels = new Set([SLACK_CHANNEL])
+  ;(connector as any).safeOutputConfig = {
+    redactSecrets: opts.redactSecrets,
+    allowRawToolOutput: false,
+  }
+  ;(connector as any).sessionManager.set(`${SLACK_CHANNEL}:${SLACK_ROOT_TS}`, {
+    client,
+    createdAt: new Date(),
+    lastActivity: new Date(),
+    messageCount: 0,
+    inputChars: 0,
+    outputChars: 0,
+  })
+
+  await handlers.trigger({
+    message: {
+      text: "!oc deploy it",
+      user: SLACK_OWNER,
+      channel: SLACK_CHANNEL,
+      ts: SLACK_ROOT_TS,
+    },
+    body: { team_id: "T04FXV713" },
+    client: slackClient,
+  })
+
+  return sent
+}
+
+const ANSWER_DRIVERS: Array<[string, AnswerDriver]> = [
+  ["matrix", matrixAnswerTurn],
+  ["slack", slackAnswerTurn],
+]
+
+for (const [name, drive] of ANSWER_DRIVERS) {
+  describe(`${name} outbound redaction`, () => {
+    test("masks a credential shape in the final answer", async () => {
+      const delivered = (await drive(SECRET_BEARING_ANSWER, { redactSecrets: true })).join("\n")
+
+      expect(delivered).toContain("Deploy finished.")
+      expect(delivered).not.toContain(PLACEHOLDER_VALUE)
+      expect(delivered).toContain(REDACTION_PLACEHOLDER)
+    })
+
+    test("passes the answer through unchanged when the flag is off", async () => {
+      const delivered = (await drive(SECRET_BEARING_ANSWER, { redactSecrets: false })).join("\n")
+
+      expect(delivered).toContain(PLACEHOLDER_VALUE)
+      expect(delivered).not.toContain(REDACTION_PLACEHOLDER)
+    })
+
+    test("leaves an answer with nothing secret-shaped alone", async () => {
+      const answer = "All three services are healthy."
+      const delivered = (await drive(answer, { redactSecrets: true })).join("\n")
+
+      expect(delivered).toContain(answer)
+    })
+  })
+}

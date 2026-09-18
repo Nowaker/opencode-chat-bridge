@@ -438,7 +438,8 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
    * When true: always reply in thread via thread_ts.
    * When false: reply in channel (no thread_ts).
    */
-  private async sendReply(slackClient: any, context: SlackEventContext, text: string): Promise<void> {
+  private async sendReply(slackClient: any, context: SlackEventContext, rawText: string): Promise<void> {
+    const text = this.safeOutboundText(rawText)
     if (this.threadIsolation) {
       await postThreadReply(slackClient, context.channelId, context.replyThreadTs, text)
     } else {
@@ -504,7 +505,7 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
       create: async (text) => {
         const result = await slackClient.chat.postMessage({
           channel: context.channelId,
-          text: `> ${text}`,
+          text: this.safeOutboundText(`> ${text}`),
           ...(this.threadIsolation ? { thread_ts: context.replyThreadTs } : {}),
         })
         return result.ts || null
@@ -513,7 +514,7 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
         await slackClient.chat.update({
           channel: context.channelId,
           ts: messageTs,
-          text: `> ${text}`,
+          text: this.safeOutboundText(`> ${text}`),
         })
       },
       onError: (error) => this.logError("Failed to update tool activity:", error),
@@ -647,7 +648,7 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
         return
       }
 
-      const fileName = path.basename(filePath)
+      const fileName = this.safeOutboundText(path.basename(filePath))
       const fileBuffer = fs.readFileSync(filePath)
 
       await this.app!.client.files.uploadV2({

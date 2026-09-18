@@ -192,8 +192,9 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
     this.log("Stopped.")
   }
 
-  async sendMessage(roomId: string, text: string): Promise<void> {
+  async sendMessage(roomId: string, rawText: string): Promise<void> {
     try {
+      const text = this.safeOutboundText(rawText)
       if (FORMAT_HTML) {
         const html = await marked.parse(text)
         await this.matrix!.sendMessage(roomId, {
@@ -216,8 +217,9 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
    * When false: send plain message to room.
    * Returns the event ID of the sent message (for tracking lastEventId).
    */
-  private async sendReply(context: MatrixEventContext, text: string): Promise<string | null> {
+  private async sendReply(context: MatrixEventContext, rawText: string): Promise<string | null> {
     try {
+      const text = this.safeOutboundText(rawText)
       if (this.threadIsolation) {
         const session = this.sessionManager.get(context.sessionId)
         const lastEventId = session?.lastEventIds.get(context.replyThreadRootId) || context.replyThreadRootId
@@ -260,8 +262,9 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
   /**
    * Send a notice (for tool activity), respecting thread isolation.
    */
-  private async sendNoticeReply(context: MatrixEventContext, text: string): Promise<void> {
+  private async sendNoticeReply(context: MatrixEventContext, rawText: string): Promise<void> {
     try {
+      const text = this.safeOutboundText(rawText)
       if (this.threadIsolation) {
         const session = this.sessionManager.get(context.sessionId)
         const lastEventId = session?.lastEventIds.get(context.replyThreadRootId) || context.replyThreadRootId
@@ -287,7 +290,7 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
     if (!this.matrix) return null
     const content: Record<string, unknown> = {
       msgtype: "m.notice",
-      body: `> ${text}`,
+      body: this.safeOutboundText(`> ${text}`),
     }
     if (this.threadIsolation) {
       const session = this.sessionManager.get(context.sessionId)
@@ -304,7 +307,7 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
 
   private async updateToolActivityMessage(context: MatrixEventContext, eventId: string, text: string): Promise<void> {
     if (!this.matrix) return
-    const body = `> ${text}`
+    const body = this.safeOutboundText(`> ${text}`)
     await this.matrix.sendMessage(context.roomId, {
       msgtype: "m.notice",
       body: `* ${body}`,
@@ -773,7 +776,7 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
 
       const content: any = {
         msgtype: "m.image",
-        body: image.alt || "Image",
+        body: this.safeOutboundText(image.alt || "Image"),
         url: mxcUrl,
         info: { mimetype: image.mimeType, size: buffer.length },
       }
@@ -812,7 +815,7 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
 
       const content: any = {
         msgtype: "m.image",
-        body: fileName,
+        body: this.safeOutboundText(fileName),
         url: mxcUrl,
         info: { mimetype: "image/png", size: buffer.length },
       }

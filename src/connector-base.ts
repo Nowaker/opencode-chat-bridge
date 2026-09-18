@@ -730,6 +730,7 @@ export abstract class BaseConnector<TSession extends BaseSession> {
   private mirrors = new Map<string, MirrorState>()
   private toolMessagesConfig = getConfig().toolMessages
   private permissionsConfig = getConfig().permissions
+  private safeOutputConfig = getConfig().safeOutput
   private permissionBroker: PermissionBroker
   private permissionClients = new Map<string, ACPClient>()
   private permissionExpiryTimer: NodeJS.Timeout | null = null
@@ -746,6 +747,7 @@ export abstract class BaseConnector<TSession extends BaseSession> {
     this.verboseErrors = globalConfig.verboseErrors
     this.toolMessagesConfig = globalConfig.toolMessages
     this.permissionsConfig = globalConfig.permissions
+    this.safeOutputConfig = globalConfig.safeOutput
     this.permissionBroker = new PermissionBroker({
       timeoutMs: this.permissionsConfig.timeoutSeconds * 1000,
       authorize: (senderId) => isAllowedId(senderId, this.allowedUsers),
@@ -794,6 +796,17 @@ export abstract class BaseConnector<TSession extends BaseSession> {
    */
   protected userErrorMessage(generic: string, err: unknown): string {
     return buildUserErrorMessage(generic, err, this.verboseErrors)
+  }
+
+  /**
+   * Mask credential shapes in text a connector is about to send.
+   *
+   * Call this from the connector's own send chokepoint, not from the call sites
+   * that reach it: a summary is already redacted field by field, but the final
+   * assistant answer is model-authored text that no allowlist has seen.
+   */
+  protected safeOutboundText(text: string): string {
+    return this.safeOutputConfig.redactSecrets ? redactSecrets(text) : text
   }
   
   /**
