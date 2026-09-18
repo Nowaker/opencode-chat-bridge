@@ -1,0 +1,384 @@
+/**
+ * The safety controls as an operator actually meets them.
+ *
+ * Every other suite exercises one piece in isolation. This one drives the
+ * composed stack: a chat-bridge.json on disk, the connector's real inbound
+ * path, and the ACP client parsing real JSON-RPC bytes. A control that works
+ * alone but is not wired up fails here.
+ *
+ * The config-driven cases run in a child process with its own working
+ * directory, because connectors read configuration once at module scope --
+ * exactly as they do under `bun connectors/whatsapp.ts`. Running them
+ * in-process would test a module that had already captured whichever config
+ * some earlier test file happened to load.
+ */
+
+import { describe, test, expect, beforeAll, afterAll } from "bun:test"
+import { EventEmitter } from "events"
+import { spawnSync } from "child_process"
+import fs from "fs"
+import os from "os"
+import path from "path"
+import { ACPClient } from "../../src/acp-client"
+import { resolveSessionWorkspace } from "../../src/session-utils"
+import { WhatsAppConnector } from "../../connectors/whatsapp"
+
+const REPO_ROOT = path.resolve(import.meta.dir, "../..")
+
+const GROUP = "120363111122223333@g.us"
+const OTHER_GROUP = "120363999988887777@g.us"
+const OWNER = "15551234567"
+const STRANGER = "15559998888"
+
+let workdir = ""
+let project = ""
+
+beforeAll(() => {
+  workdir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-safety-"))
+  project = path.join(workdir, "pinned-project")
+  fs.mkdirSync(project)
+  fs.writeFileSync(path.join(project, "AGENTS.md"), "# pinned project\n")
+
+  fs.writeFileSync(path.join(workdir, "chat-bridge.json"), JSON.stringify({
+    botName: "opencode",
+    trigger: "!oc",
+    rateLimitSeconds: 0,
+    sessionStorePath: path.join(workdir, "sessions.json"),
+    toolMessages: {
+      mode: "events",
+      showArguments: true,
+      showOutputFor: [],
+      summaries: {
+        allowedTools: ["webfetch"],
+        allowedFields: ["url"],
+        maxFieldLength: 120,
+        unlistedTools: "name",
+      },
+    },
+    safeOutput: { redactSecrets: true, allowRawToolOutput: false },
+    permissions: { interactive: true, timeoutSeconds: 180 },
+    acp: { command: "opencode", args: ["acp"], backendId: "opencode", sessionCwd: project },
+    whatsapp: {
+      enabled: true,
+      authFolder: path.join(workdir, "wa-auth"),
+      allowedUsers: [OWNER],
+      allowedGroups: [GROUP],
+      respondToOthers: true,
+      autoUploadFiles: false,
+      logInboundMessages: false,
+    },
+  }))
+})
+
+afterAll(() => {
+  if (workdir) fs.rmSync(workdir, { recursive: true, force: true })
+})
+
+/**
+ * Run a script in a fresh process whose working directory holds the config
+ * file, and return whatever it printed after a RESULT: marker.
+ */
+function runInConfiguredProcess(body: string): any {
+  const script = path.join(workdir, `drive-${Math.random().toString(36).slice(2)}.ts`)
+  fs.writeFileSync(script, `
+    const REPO = ${JSON.stringify(REPO_ROOT)}
+    const GROUP = ${JSON.stringify(GROUP)}
+    const OTHER_GROUP = ${JSON.stringify(OTHER_GROUP)}
+    const OWNER = ${JSON.stringify(OWNER)}
+    const STRANGER = ${JSON.stringify(STRANGER)}
+    const { WhatsAppConnector } = await import(REPO + "/connectors/whatsapp.ts")
+
+    const chat = []
+    const routed = []
+    const connector = new WhatsAppConnector()
+    let counter = 0
+    connector.sock = {
+      sendMessage: async (_chatId, content) => {
+        if (typeof content.text === "string") chat.push(content.text)
+        return { key: { id: "emitted-" + ++counter, fromMe: true } }
+      },
+      sendPresenceUpdate: async () => {},
+    }
+    connector.processQuery = async (chatId, _sender, query) => { routed.push(chatId + "|" + query) }
+
+    const inbound = (text, opts = {}) => ({
+      key: {
+        id: opts.id || "msg-" + Math.random().toString(36).slice(2),
+        remoteJid: opts.chatId || GROUP,
+        participant: (opts.sender || OWNER) + "@s.whatsapp.net",
+        fromMe: false,
+      },
+      message: { conversation: text },
+    })
+    const deliver = (msg) => connector.handleMessage(msg)
+
+    ${body}
+  `)
+
+  const result = spawnSync("bun", [script], {
+    cwd: workdir,
+    encoding: "utf-8",
+    timeout: 60_000,
+  })
+
+  const marker = (result.stdout || "").split("RESULT:")[1]
+  if (!marker) {
+    throw new Error(`driver produced no result\nstdout: ${result.stdout}\nstderr: ${result.stderr}`)
+  }
+  return JSON.parse(marker.trim())
+}
+
+describe("inbound gating driven by a real config file", () => {
+  test("serves only the allowlisted sender in the allowlisted chat", () => {
+    const result = runInConfiguredProcess(`
+      await deliver(inbound("!oc from an unlisted chat", { chatId: OTHER_GROUP }))
+      const afterUnlistedChat = routed.length
+
+      await deliver(inbound("!oc from an unlisted sender", { sender: STRANGER }))
+      const afterUnlistedSender = routed.length
+
+      await deliver(inbound("!oc hello"))
+      const afterAllowed = routed.length
+
+      await deliver(inbound("!oc retry", { id: "dup-1" }))
+      await deliver(inbound("!oc retry", { id: "dup-1" }))
+      const afterRetry = routed.length
+
+      console.log("RESULT:" + JSON.stringify({
+        afterUnlistedChat, afterUnlistedSender, afterAllowed, afterRetry, routed,
+      }))
+    `)
+
+    expect(result.afterUnlistedChat).toBe(0)
+    expect(result.afterUnlistedSender).toBe(0)
+    expect(result.afterAllowed).toBe(1)
+    expect(result.routed[0]).toBe(`${GROUP}|hello`)
+    expect(result.afterRetry).toBe(2)
+  })
+
+  test("marks every chunk of an answer long enough to split", () => {
+    const result = runInConfiguredProcess(`
+      await connector.sendMessage(GROUP, "x".repeat(9000))
+      console.log("RESULT:" + JSON.stringify({
+        chunks: chat.length,
+        allMarked: chat.every((text) => text.startsWith("[AI] ")),
+      }))
+    `)
+
+    expect(result.chunks).toBeGreaterThan(1)
+    expect(result.allMarked).toBe(true)
+  })
+
+  test("keeps inbound message bodies out of the log by default", () => {
+    const result = runInConfiguredProcess(`
+      const lines = []
+      const original = console.log
+      console.log = (...args) => { lines.push(args.join(" ")) }
+      await deliver(inbound("!oc a very distinctive private sentence"))
+      console.log = original
+      console.log("RESULT:" + JSON.stringify({
+        routed: routed.length,
+        leaked: lines.some((line) => line.includes("distinctive private sentence")),
+      }))
+    `)
+
+    expect(result.routed).toBe(1)
+    expect(result.leaked).toBe(false)
+  })
+})
+
+/** An ACP client whose child process is replaced by in-memory stdio. */
+function buildACPClient() {
+  const client = new ACPClient({ cwd: project, interactivePermissions: true })
+  const agentSaw: string[] = []
+  const stdout = new EventEmitter()
+
+  ;(client as any).acp = {
+    stdout,
+    stderr: new EventEmitter(),
+    killed: false,
+    kill: () => {},
+    on: () => {},
+    stdin: { write: (line: string) => { agentSaw.push(line); return true }, destroyed: false },
+  }
+  stdout.on("data", (data: Buffer) => (client as any).handleData(data))
+
+  const emitRequest = (id: number, params: any) => {
+    stdout.emit("data", Buffer.from(JSON.stringify({
+      jsonrpc: "2.0", id, method: "session/request_permission", params,
+    }) + "\n"))
+  }
+
+  return { client, agentSaw, emitRequest }
+}
+
+const WEBFETCH_REQUEST = {
+  sessionId: "ses_x",
+  permission: "webfetch",
+  toolCall: {
+    toolCallId: "call-1",
+    title: "https://example.invalid/report",
+    kind: "webfetch",
+    rawInput: {
+      url: "https://example.invalid/report",
+      header: "Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345",
+    },
+  },
+  options: [
+    { optionId: "once", kind: "allow_once", name: "Allow once" },
+    { optionId: "always", kind: "allow_always", name: "Always allow" },
+    { optionId: "reject", kind: "reject_once", name: "Reject" },
+  ],
+}
+
+describe("permission round trip over real JSON-RPC bytes", () => {
+  async function present() {
+    const chat: string[] = []
+    const connector = new WhatsAppConnector()
+    let counter = 0
+
+    ;(connector as any).sock = {
+      sendMessage: async (_chatId: string, content: any) => {
+        if (typeof content.text === "string") chat.push(content.text)
+        return { key: { id: `emitted-${++counter}`, fromMe: true } }
+      },
+    }
+    ;(connector as any).allowedUsers = new Set([OWNER])
+    ;(connector as any).allowedChannels = new Set([GROUP])
+    ;(connector as any).toolMessagesConfig = {
+      mode: "events",
+      showCalls: true,
+      showArguments: true,
+      showOutputFor: [],
+      summaries: {
+        allowedTools: ["webfetch"],
+        allowedFields: ["url"],
+        maxFieldLength: 120,
+        unlistedTools: "name",
+      },
+    }
+
+    const { client, agentSaw, emitRequest } = buildACPClient()
+
+    client.on("permission_requested", async (request: any) => {
+      await (connector as any).presentPermissionRequest(
+        GROUP, request, client, (text: string) => connector.sendMessage(GROUP, text),
+      )
+    })
+
+    emitRequest(41, WEBFETCH_REQUEST)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+
+    const prompt = chat.join("\n")
+    const token = prompt.match(/\b[A-Z2-9]{6}\b/)?.[0] || ""
+
+    const reply = (text: string, opts: { sender?: string; threadId?: string } = {}) =>
+      (connector as any).handlePermissionReply(
+        opts.threadId || GROUP,
+        opts.sender || OWNER,
+        text,
+        (t: string) => connector.sendMessage(GROUP, t),
+      )
+
+    return { prompt, token, agentSaw, reply }
+  }
+
+  test("posts a marked, numbered prompt and keeps the agent waiting", async () => {
+    const { prompt, token, agentSaw } = await present()
+
+    expect(prompt.startsWith("[AI] ")).toBe(true)
+    expect(prompt).toMatch(/\b1\.\s/)
+    expect(token).toHaveLength(6)
+    expect(agentSaw).toEqual([])
+  })
+
+  test("renders allowlisted argument fields and withholds the rest", async () => {
+    const { prompt } = await present()
+
+    expect(prompt).toContain("example.invalid")
+    expect(prompt).not.toContain("header=")
+    expect(prompt).not.toContain("abcdefghijklmnopqrstuvwxyz012345")
+  })
+
+  test("refuses a reply from a sender who is not allowlisted", async () => {
+    const { token, agentSaw, reply } = await present()
+
+    await reply(`${token} 1`, { sender: STRANGER })
+
+    expect(agentSaw).toEqual([])
+  })
+
+  test("refuses a reply posted in a different thread", async () => {
+    const { token, agentSaw, reply } = await present()
+
+    await reply(`${token} 1`, { threadId: OTHER_GROUP })
+
+    expect(agentSaw).toEqual([])
+  })
+
+  test("refuses ambiguous prose and a bare token", async () => {
+    const { token, agentSaw, reply } = await present()
+
+    await reply("yes go ahead")
+    await reply(`${token}`)
+
+    expect(agentSaw).toEqual([])
+  })
+
+  test("delivers the selected option for a correlated, authenticated reply", async () => {
+    const { token, agentSaw, reply } = await present()
+
+    await reply(`${token} 1`)
+
+    expect(agentSaw).toHaveLength(1)
+    const answer = JSON.parse(agentSaw[0])
+    expect(answer.id).toBe(41)
+    expect(answer.result.outcome).toEqual({ outcome: "selected", optionId: "once" })
+  })
+
+  test("cannot be replayed once settled", async () => {
+    const { token, agentSaw, reply } = await present()
+
+    await reply(`${token} 1`)
+    await reply(`${token} 2`)
+
+    expect(agentSaw).toHaveLength(1)
+  })
+
+  test("denies a still-held request on shutdown instead of abandoning it", async () => {
+    const { client, agentSaw, emitRequest } = buildACPClient()
+
+    emitRequest(77, {
+      sessionId: "s",
+      permission: "bash",
+      toolCall: { title: "rm -rf /", kind: "bash", rawInput: {} },
+    })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(agentSaw).toEqual([])
+
+    client.rejectHeldPermissions()
+
+    expect(agentSaw).toHaveLength(1)
+    const answer = JSON.parse(agentSaw[0])
+    expect(answer.id).toBe(77)
+    expect(answer.result.outcome.optionId).toBe("reject")
+  })
+})
+
+describe("pinned workspace", () => {
+  test("resolves to the configured project", () => {
+    const workspace = resolveSessionWorkspace("whatsapp", GROUP, project)
+
+    expect(workspace.dir).toBe(project)
+    expect(workspace.pinned).toBe(true)
+  })
+
+  test("survives the session expiry sweep", () => {
+    const connector = new WhatsAppConnector()
+    ;(connector as any).acpConfig = { ...(connector as any).acpConfig, sessionCwd: project }
+
+    ;(connector as any).deleteSessionCacheDir(GROUP)
+
+    expect(fs.existsSync(path.join(project, "AGENTS.md"))).toBe(true)
+  })
+})
