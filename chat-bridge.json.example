@@ -6,7 +6,21 @@
     "mode": "events",
     "showArguments": false,
     "showOutputFor": ["bash"],
-    "maxTraceEntries": 20
+    "maxTraceEntries": 20,
+    "summaries": {
+      "allowedTools": [],
+      "allowedFields": [],
+      "maxFieldLength": 120,
+      "unlistedTools": "name"
+    }
+  },
+  "safeOutput": {
+    "redactSecrets": true,
+    "allowRawToolOutput": false
+  },
+  "permissions": {
+    "interactive": true,
+    "timeoutSeconds": 180
   },
   "sessionStorePath": "./.opencode/chat-sessions.json",
   "defaultAgent": null,
@@ -20,7 +34,8 @@
     "command": "opencode",
     "args": ["acp"],
     "backendId": "opencode",
-    "profileDir": ""
+    "profileDir": "",
+    "sessionCwd": ""
   },
   "matrix": {
     "enabled": false,
@@ -38,6 +53,7 @@
     "ignoreRooms": [],
     "ignoreUsers": [],
     "allowedUsers": [],
+    "allowedRooms": [],
     "formatHtml": false,
     "threadIsolation": true,
     "respondToThreadReplies": true
@@ -58,13 +74,19 @@
     "enabled": false,
     "authFolder": "./.whatsapp-auth",
     "allowedUsers": [],
-    "respondToOthers": true
+    "allowedGroups": [],
+    "respondToOthers": true,
+    "autoUploadFiles": false,
+    "logInboundMessages": false
   },
   "slack": {
     "enabled": false,
     "allowedUsers": [],
+    "allowedChannels": [],
     "threadIsolation": true,
-    "respondToThreadReplies": true
+    "respondToThreadReplies": true,
+    "autoUploadFiles": false,
+    "logInboundMessages": false
   },
   "discord": {
     "enabled": false,

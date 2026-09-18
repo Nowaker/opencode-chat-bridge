@@ -23,6 +23,9 @@ export interface MatrixConfig {
   ignoreRooms: string[]
   ignoreUsers: string[]
   allowedUsers: string[]
+  /** Fail-closed room allowlist. Stable room IDs only ("!room:server").
+   *  Empty denies every room. */
+  allowedRooms: string[]
   formatHtml: boolean
   threadIsolation: boolean  // true: per-thread sessions + thread replies, false: per-room
   respondToThreadReplies: boolean // Forward plain replies in active threads
@@ -45,14 +48,28 @@ export interface WhatsAppConfig {
   enabled: boolean
   authFolder: string
   allowedUsers: string[]
+  /** Fail-closed group allowlist. Stable group JIDs only ("...@g.us").
+   *  Empty denies every chat. */
+  allowedGroups: string[]
   respondToOthers: boolean
+  /** Upload files whose paths appear in tool results or model text. */
+  autoUploadFiles: boolean
+  /** Write inbound message bodies to stdout. */
+  logInboundMessages: boolean
 }
 
 export interface SlackConfig {
   enabled: boolean
   allowedUsers: string[]
+  /** Fail-closed channel allowlist. Stable channel IDs only ("C...").
+   *  Empty denies every channel. */
+  allowedChannels: string[]
   threadIsolation: boolean  // true: per-thread sessions + thread replies, false: per-channel
   respondToThreadReplies: boolean // Forward plain replies in active threads
+  /** Upload files whose paths appear in tool results or model text. */
+  autoUploadFiles: boolean
+  /** Write inbound message bodies to stdout. */
+  logInboundMessages: boolean
 }
 
 export interface DiscordConfig {
@@ -118,6 +135,11 @@ export interface ACPConfig {
   args: string[]
   backendId: string
   profileDir: string
+  /** Pin every bridge-started session to this working directory so it inherits
+   *  that project's AGENTS.md. Empty keeps the upstream behaviour of one
+   *  generated workspace per thread. See docs/FORK_DEVIATIONS.md for the
+   *  project-hash collision this trades away. */
+  sessionCwd: string
 }
 
 export interface SessionPickerConfig {
@@ -127,6 +149,36 @@ export interface SessionPickerConfig {
 }
 
 export type ToolMessageMode = "off" | "events" | "status" | "trace"
+
+export type UnlistedToolPresentation = "name" | "hide"
+
+export interface ToolSummariesConfig {
+  /** Fail-closed tool-name allowlist. Entries match exactly or as "prefix*".
+   *  Only these tools may contribute argument fields to a chat summary. */
+  allowedTools: string[]
+  /** Argument field names that may appear in a summary. Every other field is
+   *  dropped, so an unanticipated argument can never reach chat. */
+  allowedFields: string[]
+  maxFieldLength: number
+  unlistedTools: UnlistedToolPresentation
+}
+
+export interface SafeOutputConfig {
+  /** Mask credential-shaped substrings in everything the bridge sends. */
+  redactSecrets: boolean
+  /** Forward raw tool results for tools listed in toolMessages.showOutputFor.
+   *  Upstream always forwards them; this fork requires opting back in. */
+  allowRawToolOutput: boolean
+}
+
+export interface PermissionsConfig {
+  /** Render permission requests into chat and wait for an authenticated reply.
+   *  When false the bridge keeps upstream's immediate auto-reject. */
+  interactive: boolean
+  /** Seconds a pending request is held before it is answered with its reject
+   *  option. The agent blocks for this long, so keep it short. */
+  timeoutSeconds: number
+}
 
 export interface ToolMessagesConfig {
   /** Tool-call presentation. Defaults to one immutable message per call. */
@@ -139,6 +191,7 @@ export interface ToolMessagesConfig {
   showOutputFor: string[]
   /** Maximum tool calls retained in an editable trace message. */
   maxTraceEntries?: number
+  summaries?: ToolSummariesConfig
 }
 
 export interface ChatBridgeConfig {
@@ -148,6 +201,8 @@ export interface ChatBridgeConfig {
   sessionStorePath: string
   defaultAgent: string | null
   toolMessages: ToolMessagesConfig
+  safeOutput: SafeOutputConfig
+  permissions: PermissionsConfig
   verboseErrors: boolean  // Send detailed error messages to the user
   sessionPicker: SessionPickerConfig
   acp: ACPConfig
@@ -174,6 +229,20 @@ const defaultConfig: ChatBridgeConfig = {
     showArguments: false,
     showOutputFor: ["bash"],
     maxTraceEntries: 20,
+    summaries: {
+      allowedTools: [],
+      allowedFields: [],
+      maxFieldLength: 120,
+      unlistedTools: "name",
+    },
+  },
+  safeOutput: {
+    redactSecrets: true,
+    allowRawToolOutput: false,
+  },
+  permissions: {
+    interactive: true,
+    timeoutSeconds: 180,
   },
   sessionPicker: {
     enabled: false,
@@ -185,6 +254,7 @@ const defaultConfig: ChatBridgeConfig = {
     args: ["acp"],
     backendId: "",
     profileDir: "",
+    sessionCwd: "",
   },
   matrix: {
     enabled: false,
@@ -202,6 +272,7 @@ const defaultConfig: ChatBridgeConfig = {
     ignoreRooms: [],
     ignoreUsers: [],
     allowedUsers: [],
+    allowedRooms: [],
     formatHtml: false,
     threadIsolation: true,  // Per-thread sessions by default
     respondToThreadReplies: true,
@@ -222,13 +293,19 @@ const defaultConfig: ChatBridgeConfig = {
     enabled: false,
     authFolder: "./.whatsapp-auth",
     allowedUsers: [],
-    respondToOthers: true
+    allowedGroups: [],
+    respondToOthers: true,
+    autoUploadFiles: false,
+    logInboundMessages: false,
   },
   slack: {
     enabled: false,
     allowedUsers: [],
+    allowedChannels: [],
     threadIsolation: true,  // Per-thread sessions by default
     respondToThreadReplies: true,
+    autoUploadFiles: false,
+    logInboundMessages: false,
   },
   discord: {
     enabled: false,
@@ -326,6 +403,73 @@ function normalizeToolMessages(config: ChatBridgeConfig): void {
   }
 }
 
+function normalizeStringList(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return value
+    .filter((entry): entry is string => typeof entry === "string")
+    .map(entry => entry.trim())
+    .filter(Boolean)
+}
+
+function normalizeToolSummaries(config: ChatBridgeConfig): void {
+  const defaults = defaultConfig.toolMessages.summaries!
+  const summaries = config.toolMessages.summaries
+  if (!summaries || typeof summaries !== "object" || Array.isArray(summaries)) {
+    config.toolMessages.summaries = {
+      ...defaults,
+      allowedTools: [...defaults.allowedTools],
+      allowedFields: [...defaults.allowedFields],
+    }
+    return
+  }
+
+  summaries.allowedTools = normalizeStringList(summaries.allowedTools)
+  summaries.allowedFields = normalizeStringList(summaries.allowedFields)
+  if (!Number.isInteger(summaries.maxFieldLength) || summaries.maxFieldLength < 1) {
+    summaries.maxFieldLength = defaults.maxFieldLength
+  }
+  if (summaries.unlistedTools !== "name" && summaries.unlistedTools !== "hide") {
+    summaries.unlistedTools = defaults.unlistedTools
+  }
+}
+
+function normalizeSafeOutput(config: ChatBridgeConfig): void {
+  const defaults = defaultConfig.safeOutput
+  if (!config.safeOutput || typeof config.safeOutput !== "object" || Array.isArray(config.safeOutput)) {
+    config.safeOutput = { ...defaults }
+    return
+  }
+  // Both flags weaken the output boundary, so anything that is not an explicit
+  // boolean resolves to the safe default rather than being coerced.
+  if (typeof config.safeOutput.redactSecrets !== "boolean") {
+    config.safeOutput.redactSecrets = defaults.redactSecrets
+  }
+  if (typeof config.safeOutput.allowRawToolOutput !== "boolean") {
+    config.safeOutput.allowRawToolOutput = defaults.allowRawToolOutput
+  }
+}
+
+function normalizePermissions(config: ChatBridgeConfig): void {
+  const defaults = defaultConfig.permissions
+  if (!config.permissions || typeof config.permissions !== "object" || Array.isArray(config.permissions)) {
+    config.permissions = { ...defaults }
+    return
+  }
+  if (typeof config.permissions.interactive !== "boolean") {
+    config.permissions.interactive = defaults.interactive
+  }
+  const timeout = config.permissions.timeoutSeconds
+  if (!Number.isInteger(timeout) || timeout < 1) {
+    config.permissions.timeoutSeconds = defaults.timeoutSeconds
+  }
+}
+
+function normalizeAllowlists(config: ChatBridgeConfig): void {
+  config.slack.allowedChannels = normalizeStringList(config.slack.allowedChannels)
+  config.matrix.allowedRooms = normalizeStringList(config.matrix.allowedRooms)
+  config.whatsapp.allowedGroups = normalizeStringList(config.whatsapp.allowedGroups)
+}
+
 const WEB_IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"])
 
 function normalizeWebAttachments(config: ChatBridgeConfig): void {
@@ -371,6 +515,15 @@ function normalizeWebAttachments(config: ChatBridgeConfig): void {
   }
 }
 
+function normalizeConfig(config: ChatBridgeConfig): void {
+  normalizeToolMessages(config)
+  normalizeToolSummaries(config)
+  normalizeSafeOutput(config)
+  normalizePermissions(config)
+  normalizeAllowlists(config)
+  normalizeWebAttachments(config)
+}
+
 let cachedConfig: ChatBridgeConfig | null = null
 
 /**
@@ -402,8 +555,7 @@ export function loadConfig(configPath?: string): ChatBridgeConfig {
 
         const substituted = substituteEnvVars(parsed)
         cachedConfig = deepMerge(defaultConfig, substituted)
-        normalizeToolMessages(cachedConfig)
-        normalizeWebAttachments(cachedConfig)
+        normalizeConfig(cachedConfig)
         console.log(`[CONFIG] Loaded from ${filePath}`)
         return cachedConfig
       } catch (err) {
@@ -414,8 +566,7 @@ export function loadConfig(configPath?: string): ChatBridgeConfig {
   
   console.log("[CONFIG] No config file found, using defaults")
   cachedConfig = deepMerge(defaultConfig, {})
-  normalizeToolMessages(cachedConfig)
-  normalizeWebAttachments(cachedConfig)
+  normalizeConfig(cachedConfig)
   return cachedConfig
 }
 

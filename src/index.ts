@@ -8,7 +8,7 @@
  */
 
 export { ACPClient, type ACPClientOptions, type MCPServer, type SessionUpdate, type ActivityEvent, type ToolActivityRevision, type ImageContent, type PromptImage, type OpenCodeCommand } from "./acp-client"
-export { getConfig, loadConfig, clearConfigCache, type ChatBridgeConfig, type ACPConfig, type MatrixConfig, type MattermostConfig, type WhatsAppConfig, type SlackConfig, type DiscordConfig, type TelegramConfig, type TelegramAttachmentsConfig, type WebConfig, type WebAttachmentsConfig, type ToolMessageMode, type ToolMessagesConfig } from "./config"
+export { getConfig, loadConfig, clearConfigCache, type ChatBridgeConfig, type ACPConfig, type MatrixConfig, type MattermostConfig, type WhatsAppConfig, type SlackConfig, type DiscordConfig, type TelegramConfig, type TelegramAttachmentsConfig, type WebConfig, type WebAttachmentsConfig, type ToolMessageMode, type ToolMessagesConfig, type ToolSummariesConfig, type UnlistedToolPresentation, type SafeOutputConfig, type PermissionsConfig } from "./config"
 export { 
   getSessionDir, 
   ensureSessionDir, 

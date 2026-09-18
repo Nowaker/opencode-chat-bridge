@@ -49,6 +49,12 @@ describe("config", () => {
         showArguments: false,
         showOutputFor: ["bash"],
         maxTraceEntries: 20,
+        summaries: {
+          allowedTools: [],
+          allowedFields: [],
+          maxFieldLength: 120,
+          unlistedTools: "name",
+        },
       })
       expect(config.matrix.enabled).toBe(false)
       expect(config.matrix.respondToThreadReplies).toBe(true)
@@ -100,6 +106,12 @@ describe("config", () => {
         showArguments: false,
         showOutputFor: ["bash", "weather"],
         maxTraceEntries: 20,
+        summaries: {
+          allowedTools: [],
+          allowedFields: [],
+          maxFieldLength: 120,
+          unlistedTools: "name",
+        },
       })
       expect("streamTools" in config).toBe(false)
     })
@@ -327,6 +339,93 @@ describe("config", () => {
       // Should return defaults instead of throwing
       const config = loadConfig()
       expect(config.botName).toBe("oc")
+    })
+  })
+
+  describe("safety controls", () => {
+    const writeConfig = (content: unknown) => {
+      fs.writeFileSync(path.join(testDir, "chat-bridge.json"), JSON.stringify(content))
+      process.chdir(testDir)
+    }
+
+    test("defaults every channel allowlist to empty so nothing is allowed", () => {
+      process.chdir(testDir)
+      const config = loadConfig()
+
+      expect(config.slack.allowedChannels).toEqual([])
+      expect(config.matrix.allowedRooms).toEqual([])
+      expect(config.whatsapp.allowedGroups).toEqual([])
+    })
+
+    test("defaults file upload and inbound body logging to off", () => {
+      process.chdir(testDir)
+      const config = loadConfig()
+
+      expect(config.whatsapp.autoUploadFiles).toBe(false)
+      expect(config.whatsapp.logInboundMessages).toBe(false)
+      expect(config.slack.autoUploadFiles).toBe(false)
+      expect(config.slack.logInboundMessages).toBe(false)
+    })
+
+    test("defaults safeOutput to redacting secrets and withholding raw tool output", () => {
+      process.chdir(testDir)
+      const config = loadConfig()
+
+      expect(config.safeOutput).toEqual({ redactSecrets: true, allowRawToolOutput: false })
+    })
+
+    test("keeps configured allowlist entries and drops blank ones", () => {
+      writeConfig({
+        slack: { allowedChannels: ["C0C2U4Q51HP", "  ", "C1234567890"] },
+        matrix: { allowedRooms: ["!room:example.org"] },
+        whatsapp: { allowedGroups: ["1234567890@g.us"] },
+      })
+
+      const config = loadConfig()
+
+      expect(config.slack.allowedChannels).toEqual(["C0C2U4Q51HP", "C1234567890"])
+      expect(config.matrix.allowedRooms).toEqual(["!room:example.org"])
+      expect(config.whatsapp.allowedGroups).toEqual(["1234567890@g.us"])
+    })
+
+    test("resolves non-boolean safeOutput flags to the safe default", () => {
+      writeConfig({ safeOutput: { redactSecrets: "false", allowRawToolOutput: "true" } })
+
+      const config = loadConfig()
+
+      expect(config.safeOutput.redactSecrets).toBe(true)
+      expect(config.safeOutput.allowRawToolOutput).toBe(false)
+    })
+
+    test("rejects an invalid unlistedTools presentation", () => {
+      writeConfig({ toolMessages: { summaries: { unlistedTools: "everything" } } })
+
+      const config = loadConfig()
+
+      expect(config.toolMessages.summaries?.unlistedTools).toBe("name")
+    })
+
+    test("rejects a non-positive permission timeout", () => {
+      writeConfig({ permissions: { interactive: true, timeoutSeconds: 0 } })
+
+      const config = loadConfig()
+
+      expect(config.permissions.timeoutSeconds).toBe(180)
+    })
+
+    test("loads a pinned ACP session workspace", () => {
+      writeConfig({ acp: { sessionCwd: "/home/example/projects/ai-bridge" } })
+
+      const config = loadConfig()
+
+      expect(config.acp.sessionCwd).toBe("/home/example/projects/ai-bridge")
+    })
+
+    test("defaults the ACP session workspace to upstream per-thread behaviour", () => {
+      process.chdir(testDir)
+      const config = loadConfig()
+
+      expect(config.acp.sessionCwd).toBe("")
     })
   })
 })
