@@ -102,6 +102,38 @@ describe("WhatsApp send boundary", () => {
 
     expect(sent).toHaveLength(0)
   })
+
+  test("redacts a credential the model echoed into its answer", async () => {
+    await connector.sendMessage("123@g.us", "the token is xoxb-1111111111-AAAAAAAAAAAA")
+
+    const [text] = textsOf(sent)
+    expect(text.startsWith(AI_PREFIX)).toBe(true)
+    expect(text).not.toContain("xoxb-1111111111")
+    expect(text).toContain("[redacted]")
+  })
+
+  test("redacts a credential in an edited message", async () => {
+    await (connector as any).updateToolActivityMessage("123@g.us", "emitted-1", "AWS_SECRET_ACCESS_KEY=abcdefghij")
+
+    const [text] = textsOf(sent)
+    expect(text).not.toContain("abcdefghij")
+    expect(text).toContain("AWS_SECRET_ACCESS_KEY=")
+  })
+})
+
+describe("WhatsApp automatic file upload", () => {
+  test("does not upload paths found in tool results by default", async () => {
+    const connector = new WhatsAppConnector()
+    const sent = attachFakeSocket(connector)
+
+    await (connector as any).uploadDetectedFiles(
+      "123@g.us",
+      "[DOCLIBRARY_DOC]/etc/passwd[/DOCLIBRARY_DOC]",
+      "Path: /etc/hosts.png",
+    )
+
+    expect(sent).toHaveLength(0)
+  })
 })
 
 describe("WhatsApp own-message handling", () => {

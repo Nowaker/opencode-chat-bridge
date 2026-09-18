@@ -37,6 +37,8 @@ export {
   isAllowedId,
   formatToolCallMessage,
   resolveToolMessageMode,
+  resolveToolSummaries,
+  FAIL_CLOSED_TOOL_SUMMARIES,
   ToolActivityPresenter,
   ToolActivityController,
   shouldShowToolOutput,
@@ -53,6 +55,14 @@ export {
   buildAiMessageChunks,
   looksLikeBridgeEcho,
 } from "./whatsapp-format"
+
+export {
+  REDACTION_PLACEHOLDER,
+  redactSecrets,
+  matchesToolAllowlist,
+  summarizeToolCall,
+  type ToolSummaryOptions,
+} from "./safe-output"
 
 export { ACPSessionStore, type StoredACPSession } from "./session-store"
 

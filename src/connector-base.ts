@@ -10,7 +10,15 @@ import fs from "fs"
 import path from "path"
 import { createHash } from "crypto"
 import { ACPClient, type ACPSessionInfo, type ActivityEvent, type LoadedSessionHistoryItem, type OpenCodeCommand, type ToolActivityRevision } from "./acp-client"
-import { getConfig, type ACPConfig, type ToolMessageMode, type ToolMessagesConfig } from "./config"
+import {
+  getConfig,
+  type ACPConfig,
+  type SafeOutputConfig,
+  type ToolMessageMode,
+  type ToolMessagesConfig,
+  type ToolSummariesConfig,
+} from "./config"
+import { summarizeToolCall } from "./safe-output"
 import { ACPSessionStore } from "./session-store"
 import { 
   getSessionDir, 
@@ -31,7 +39,35 @@ export function resolveToolMessageMode(options: ToolMessagesConfig): ToolMessage
   return options.mode || "events"
 }
 
-/** Format a tool-start event for a chat channel according to presentation policy. */
+/**
+ * Summary policy applied when a configuration omits `toolMessages.summaries`.
+ * Both allowlists are empty, so an unconfigured deployment reveals tool names
+ * and never a single argument value.
+ */
+export const FAIL_CLOSED_TOOL_SUMMARIES: ToolSummariesConfig = {
+  allowedTools: [],
+  allowedFields: [],
+  maxFieldLength: 120,
+  unlistedTools: "name",
+}
+
+/**
+ * `showArguments: false` is honoured by emptying the field allowlist rather
+ * than by bypassing the summarizer, so there is exactly one path from a tool
+ * call to chat text.
+ */
+export function resolveToolSummaries(options: ToolMessagesConfig): ToolSummariesConfig {
+  const summaries = options.summaries || FAIL_CLOSED_TOOL_SUMMARIES
+  return options.showArguments ? summaries : { ...summaries, allowedFields: [] }
+}
+
+/**
+ * Format a tool-start event for a chat channel.
+ *
+ * The ACP-supplied `description` is deliberately ignored: it is built from raw
+ * tool arguments, so rendering it would publish values no allowlist approved.
+ * The summary is derived from the arguments themselves instead.
+ */
 export function formatToolCallMessage(
   activity: ActivityEvent,
   options: ToolMessagesConfig,
@@ -42,11 +78,7 @@ export function formatToolCallMessage(
   // Connectors without message-edit support safely fall back to event messages.
   if (supportsEditablePresentation && mode !== "events") return null
 
-  const toolName = activity.tool || "unknown"
-  if (options.showArguments && activity.description?.trim()) {
-    return `${activity.description.trim()} [${toolName}]`
-  }
-  return `[${toolName}]`
+  return summarizeToolCall(activity.tool || "unknown", activity.details, resolveToolSummaries(options))
 }
 
 export interface EditableToolMessageAdapter {
@@ -58,7 +90,7 @@ export interface EditableToolMessageAdapter {
 type ToolTraceEntry = {
   id: string
   tool: string
-  description: string
+  details: unknown
   status: ToolActivityRevision["status"]
 }
 
@@ -91,7 +123,7 @@ export class ToolActivityPresenter {
       tool: existing?.tool && existing.tool !== "unknown"
         ? existing.tool
         : revision.tool || "unknown",
-      description: revision.description?.trim() || existing?.description || "",
+      details: revision.details ?? existing?.details,
       status: revision.status,
     })
 
@@ -163,11 +195,9 @@ export class ToolActivityPresenter {
     }
   }
 
-  private formatEntry(entry: ToolTraceEntry): string {
-    const detail = this.options.showArguments && entry.description
-      ? `${entry.description} [${entry.tool}]`
-      : `[${entry.tool}]`
-    return `[${entry.status}] ${detail}`
+  private formatEntry(entry: ToolTraceEntry): string | null {
+    const summary = summarizeToolCall(entry.tool, entry.details, resolveToolSummaries(this.options))
+    return summary === null ? null : `[${entry.status}] ${summary}`
   }
 
   private maxEntries(): number {
@@ -186,9 +216,10 @@ export class ToolActivityPresenter {
 
     if (resolveToolMessageMode(this.options) === "status") {
       if (!active) return `Completed ${completed} tool${completed === 1 ? "" : "s"}.`
+      const current = this.formatEntry(active)
       return [
         "Working...",
-        `Current: ${this.formatEntry(active)}`,
+        ...(current ? [`Current: ${current}`] : []),
         `Completed: ${completed} tool${completed === 1 ? "" : "s"}`,
       ].join("\n")
     }
@@ -200,7 +231,10 @@ export class ToolActivityPresenter {
     const state = pageActive ? "working" : page === pageCount - 1 && !active ? "completed" : "continued"
     const part = pageCount > 1 ? `part ${page + 1}/${pageCount}, ` : ""
     const header = `Tool trace (${part}${state})`
-    return [header, "", ...pageEntries.map((entry) => this.formatEntry(entry))].join("\n")
+    const lines = pageEntries
+      .map((entry) => this.formatEntry(entry))
+      .filter((line): line is string => line !== null)
+    return [header, "", ...lines].join("\n")
   }
 }
 
@@ -241,11 +275,19 @@ export class ToolActivityController {
   }
 }
 
-/** Whether output from a tool should be forwarded to the chat channel. */
+/**
+ * Whether a tool's RAW output may be forwarded verbatim to chat.
+ *
+ * `showOutputFor` alone is not sufficient authority in this fork. Raw results
+ * are unbounded, unsummarized and unredactable by field, so they stay off
+ * until `safeOutput.allowRawToolOutput` opts back in to upstream behaviour.
+ */
 export function shouldShowToolOutput(
   toolName: string,
-  options: ToolMessagesConfig
+  options: ToolMessagesConfig,
+  safeOutput: Pick<SafeOutputConfig, "allowRawToolOutput"> = getConfig().safeOutput,
 ): boolean {
+  if (!safeOutput.allowRawToolOutput) return false
   return options.showOutputFor.some((name) => {
     const selector = name.trim()
     return selector === "*" || (selector.length > 0 && toolName.includes(selector))

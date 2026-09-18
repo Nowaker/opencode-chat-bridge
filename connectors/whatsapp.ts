@@ -42,6 +42,7 @@ import {
   applyAiPrefix,
   buildAiMessageChunks,
   looksLikeBridgeEcho,
+  redactSecrets,
 } from "../src"
 
 // =============================================================================
@@ -73,6 +74,9 @@ const SESSION_RETENTION_DAYS = parseInt(process.env.SESSION_RETENTION_DAYS || "7
 const RESPOND_TO_OTHERS = process.env.WHATSAPP_RESPOND_TO_OTHERS === undefined
   ? config.whatsapp.respondToOthers
   : !["0", "false", "no", "off"].includes(process.env.WHATSAPP_RESPOND_TO_OTHERS.toLowerCase())
+const AUTO_UPLOAD_FILES = config.whatsapp.autoUploadFiles
+const LOG_INBOUND_MESSAGES = config.whatsapp.logInboundMessages
+const REDACT_SECRETS = config.safeOutput.redactSecrets
 
 /** How many recently emitted message IDs are retained for echo rejection. */
 const SENT_MESSAGE_ID_LIMIT = 500
@@ -139,11 +143,15 @@ export class WhatsAppConnector extends BaseConnector<ChatSession> {
    * so a new call site cannot emit unmarked text. Sent IDs are recorded here
    * too, which is what lets inbound echo rejection stay identity-based.
    */
+  private safeText(text: string): string {
+    return REDACT_SECRETS ? redactSecrets(text) : text
+  }
+
   private async emitText(chatId: string, text: string): Promise<string | null> {
     if (!this.sock) return null
 
     let lastId: string | null = null
-    for (const chunk of buildAiMessageChunks(text)) {
+    for (const chunk of buildAiMessageChunks(this.safeText(text))) {
       const sent = await this.sock.sendMessage(chatId, { text: chunk })
       lastId = sent?.key.id || null
       if (lastId) this.rememberSentMessage(lastId)
@@ -156,7 +164,7 @@ export class WhatsAppConnector extends BaseConnector<ChatSession> {
 
     // An edit replaces one message, so it cannot span chunks; the first chunk
     // carries the marker and respects the length limit.
-    const [chunk] = buildAiMessageChunks(text)
+    const [chunk] = buildAiMessageChunks(this.safeText(text))
     if (!chunk) return
 
     const sent = await this.sock.sendMessage(chatId, {
@@ -338,7 +346,7 @@ export class WhatsAppConnector extends BaseConnector<ChatSession> {
     const dedupeId = msg.key.id || `${chatId}:${Date.now()}`
     if (this.isDuplicateEvent(dedupeId)) return
 
-    this.log(`[MSG] ${senderId}: ${text}`)
+    this.logInbound("MSG", senderId, text)
 
     // Check trigger. Bridge-local slash commands may be sent bare on WhatsApp
     // for quick mobile use, e.g. /h, /p, /s, /d. In the linked account's
@@ -373,8 +381,18 @@ export class WhatsAppConnector extends BaseConnector<ChatSession> {
     // Rate limiting
     if (!this.checkRateLimit(senderId)) return
 
-    this.log(`[QUERY] ${senderId}: ${query}`)
+    this.logInbound("QUERY", senderId, query)
     await this.processQuery(chatId, senderId, query)
+  }
+
+  /**
+   * Log an inbound message without writing its body to stdout by default.
+   * Bridge logs are not a private surface, and a personal chat carries the
+   * owner's own correspondence.
+   */
+  private logInbound(label: string, senderId: string, text: string): void {
+    const detail = LOG_INBOUND_MESSAGES ? text : `${text.length} chars`
+    this.log(`[${label}] ${senderId}: ${detail}`)
   }
 
   private extractWhatsAppUserId(jid: string): string {
@@ -540,47 +558,7 @@ export class WhatsAppConnector extends BaseConnector<ChatSession> {
     try {
       await Promise.race([client.prompt(query), timeoutPromise])
 
-      // Process images from tool results
-      const uploadedPaths = new Set<string>()
-      const toolPaths = extractImagePaths(toolResultsBuffer)
-      for (const imagePath of toolPaths) {
-        if (fs.existsSync(imagePath)) {
-          this.log(`Uploading image from tool result: ${imagePath}`)
-          await this.sendImageFromFile(chatId, imagePath)
-          uploadedPaths.add(imagePath)
-        }
-      }
-
-      // Process images from response (model might echo paths)
-      const responsePaths = extractImagePaths(responseBuffer)
-      for (const imagePath of responsePaths) {
-        if (uploadedPaths.has(imagePath)) continue
-        if (fs.existsSync(imagePath)) {
-          this.log(`Uploading image from response: ${imagePath}`)
-          await this.sendImageFromFile(chatId, imagePath)
-        }
-      }
-
-      // Process documents from tool results
-      const uploadedDocPaths = new Set<string>()
-      const toolDocPaths = extractDocPaths(toolResultsBuffer)
-      for (const docPath of toolDocPaths) {
-        if (fs.existsSync(docPath)) {
-          this.log(`Uploading document from tool result: ${docPath}`)
-          await this.sendDocumentFromFile(chatId, docPath)
-          uploadedDocPaths.add(docPath)
-        }
-      }
-
-      // Process documents from response (model might echo paths)
-      const responseDocPaths = extractDocPaths(responseBuffer)
-      for (const docPath of responseDocPaths) {
-        if (uploadedDocPaths.has(docPath)) continue
-        if (fs.existsSync(docPath)) {
-          this.log(`Uploading document from response: ${docPath}`)
-          await this.sendDocumentFromFile(chatId, docPath)
-        }
-      }
+      await this.uploadDetectedFiles(chatId, toolResultsBuffer, responseBuffer)
 
       // Clean response and send
       const cleanResponse = sanitizeServerPaths(removeDocMarkers(removeImageMarkers(responseBuffer)))
@@ -624,6 +602,41 @@ export class WhatsAppConnector extends BaseConnector<ChatSession> {
     }
   }
 
+  /**
+   * Upload files whose paths were scraped out of tool results or the model's
+   * own text.
+   *
+   * This is a file-exfiltration path independent of `toolMessages`: turning
+   * tool messages off does not disable it upstream, and any path the model can
+   * name is read from disk and sent to the chat. It is therefore opt-in here
+   * and off by default.
+   */
+  private async uploadDetectedFiles(
+    chatId: string,
+    toolResultsBuffer: string,
+    responseBuffer: string,
+  ): Promise<void> {
+    if (!AUTO_UPLOAD_FILES) return
+
+    const uploadedPaths = new Set<string>()
+    for (const imagePath of [...extractImagePaths(toolResultsBuffer), ...extractImagePaths(responseBuffer)]) {
+      if (uploadedPaths.has(imagePath)) continue
+      if (!fs.existsSync(imagePath)) continue
+      uploadedPaths.add(imagePath)
+      this.log(`Uploading image: ${imagePath}`)
+      await this.sendImageFromFile(chatId, imagePath)
+    }
+
+    const uploadedDocPaths = new Set<string>()
+    for (const docPath of [...extractDocPaths(toolResultsBuffer), ...extractDocPaths(responseBuffer)]) {
+      if (uploadedDocPaths.has(docPath)) continue
+      if (!fs.existsSync(docPath)) continue
+      uploadedDocPaths.add(docPath)
+      this.log(`Uploading document: ${docPath}`)
+      await this.sendDocumentFromFile(chatId, docPath)
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // WhatsApp-specific: Image sending
   // ---------------------------------------------------------------------------
@@ -635,7 +648,7 @@ export class WhatsAppConnector extends BaseConnector<ChatSession> {
       const buffer = Buffer.from(image.data, "base64")
       const sent = await this.sock.sendMessage(chatId, {
         image: buffer,
-        caption: applyAiPrefix(image.alt || "image"),
+        caption: applyAiPrefix(this.safeText(image.alt || "image")),
       })
       if (sent?.key.id) this.rememberSentMessage(sent.key.id)
       this.log(`Sent image to ${chatId}`)
@@ -654,7 +667,7 @@ export class WhatsAppConnector extends BaseConnector<ChatSession> {
 
       const sent = await this.sock.sendMessage(chatId, {
         image: buffer,
-        caption: applyAiPrefix(fileName),
+        caption: applyAiPrefix(this.safeText(fileName)),
       })
       if (sent?.key.id) this.rememberSentMessage(sent.key.id)
       this.log(`Sent image from file to ${chatId}: ${filePath}`)
@@ -690,7 +703,7 @@ export class WhatsAppConnector extends BaseConnector<ChatSession> {
         document: buffer,
         mimetype: mimeTypes[ext] || "application/octet-stream",
         fileName: fileName,
-        caption: applyAiPrefix(fileName),
+        caption: applyAiPrefix(this.safeText(fileName)),
       })
       if (sent?.key.id) this.rememberSentMessage(sent.key.id)
       this.log(`Sent document to ${chatId}: ${filePath}`)

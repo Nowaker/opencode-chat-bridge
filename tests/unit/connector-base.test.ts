@@ -27,6 +27,13 @@ import {
 // =============================================================================
 
 describe("tool message presentation", () => {
+  const summaries = {
+    allowedTools: ["mcp__time__*", "read", "grep", "bash"],
+    allowedFields: ["timezone", "filePath", "pattern"],
+    maxFieldLength: 80,
+    unlistedTools: "name" as const,
+  }
+
   const activity = {
     type: "tool_start" as const,
     tool: "mcp__time__get_current_time",
@@ -40,6 +47,7 @@ describe("tool message presentation", () => {
       showCalls: false,
       showArguments: false,
       showOutputFor: ["bash"],
+      summaries,
     })).toBeNull()
   })
 
@@ -48,15 +56,61 @@ describe("tool message presentation", () => {
       showCalls: true,
       showArguments: false,
       showOutputFor: ["bash"],
+      summaries,
     })).toBe("[mcp__time__get_current_time]")
   })
 
-  test("shows compact arguments when enabled", () => {
+  test("shows allowlisted arguments when enabled", () => {
     expect(formatToolCallMessage(activity, {
       showCalls: true,
       showArguments: true,
       showOutputFor: ["bash"],
+      summaries,
     })).toBe("timezone=Europe/Madrid [mcp__time__get_current_time]")
+  })
+
+  test("reduces a tool that is not allowlisted to its name", () => {
+    expect(formatToolCallMessage(activity, {
+      showCalls: true,
+      showArguments: true,
+      showOutputFor: [],
+    })).toBe("ran mcp__time__get_current_time")
+  })
+
+  test("drops an argument field that is not allowlisted", () => {
+    const privateValue = "SENSITIVE-VALUE-DO-NOT-PUBLISH"
+    const leaky = {
+      type: "tool_start" as const,
+      tool: "bash",
+      message: "irrelevant",
+      description: `command=deploy --header X-Private=${privateValue}`,
+      details: { command: `deploy --header X-Private=${privateValue}` },
+    }
+    const rendered = formatToolCallMessage(leaky, {
+      showCalls: true,
+      showArguments: true,
+      showOutputFor: [],
+      summaries,
+    })
+    expect(rendered).toBe("[bash]")
+    expect(rendered).not.toContain(privateValue)
+  })
+
+  test("never renders the ACP description, which is built from raw arguments", () => {
+    const rendered = formatToolCallMessage({
+      type: "tool_start" as const,
+      tool: "read",
+      message: "irrelevant",
+      description: "filePath=/etc/shadow",
+      details: {},
+    }, {
+      showCalls: true,
+      showArguments: true,
+      showOutputFor: [],
+      summaries,
+    })
+    expect(rendered).toBe("[read]")
+    expect(rendered).not.toContain("shadow")
   })
 
   test("resolves explicit and legacy presentation modes", () => {
@@ -83,6 +137,7 @@ describe("tool message presentation", () => {
       showArguments: true,
       showOutputFor: [],
       maxTraceEntries: 20,
+      summaries,
     }, {
       create: async (text) => {
         created.push(text)
@@ -98,17 +153,17 @@ describe("tool message presentation", () => {
       toolCallId: "call-1",
       tool: "read",
       status: "running",
-      description: "filePath=.../test_file.txt",
+      details: { filePath: "/tmp/test_file.txt" },
     })
     presenter.handle({ toolCallId: "call-1", tool: "read", status: "completed" })
-    presenter.handle({ toolCallId: "call-2", tool: "grep", status: "running", description: "pattern=test" })
+    presenter.handle({ toolCallId: "call-2", tool: "grep", status: "running", details: { pattern: "test" } })
     presenter.handle({ toolCallId: "call-2", tool: "Search test files", status: "completed" })
     await presenter.flush()
 
     expect(created).toHaveLength(1)
     expect(updated.length).toBeGreaterThan(0)
     const final = updated.at(-1) || created.at(-1) || ""
-    expect(final).toContain("[completed] filePath=.../test_file.txt [read]")
+    expect(final).toContain("[completed] filePath=/tmp/test_file.txt [read]")
     expect(final).toContain("[completed] pattern=test [grep]")
     expect(final).not.toContain("[Search test files]")
   })
@@ -151,6 +206,7 @@ describe("tool message presentation", () => {
       showArguments: false,
       showOutputFor: [],
       maxTraceEntries: 2,
+      summaries,
     }, {
       create: async (text) => {
         created.push(text)
@@ -218,6 +274,7 @@ describe("tool message presentation", () => {
       showCalls: true,
       showArguments: false,
       showOutputFor: [],
+      summaries,
     }, {
       create: async (text) => {
         rendered = text
@@ -243,6 +300,7 @@ describe("tool message presentation", () => {
       showCalls: true,
       showArguments: false,
       showOutputFor: [],
+      summaries,
     }, {
       create: async () => "activity-1",
       update: async () => {},
@@ -258,15 +316,27 @@ describe("tool message presentation", () => {
     expect(events).toEqual(["[read]"])
   })
 
+  const rawAllowed = { allowRawToolOutput: true }
+
+  test("withholds raw tool output until it is explicitly allowed", () => {
+    const options = {
+      showCalls: true,
+      showArguments: false,
+      showOutputFor: ["bash", "*"],
+    }
+    expect(shouldShowToolOutput("bash", options, { allowRawToolOutput: false })).toBe(false)
+    expect(shouldShowToolOutput("read", options, { allowRawToolOutput: false })).toBe(false)
+  })
+
   test("matches configured tool output by name substring", () => {
     const options = {
       showCalls: true,
       showArguments: false,
       showOutputFor: ["bash", "mcp__time"],
     }
-    expect(shouldShowToolOutput("bash", options)).toBe(true)
-    expect(shouldShowToolOutput("mcp__time__get_current_time", options)).toBe(true)
-    expect(shouldShowToolOutput("read", options)).toBe(false)
+    expect(shouldShowToolOutput("bash", options, rawAllowed)).toBe(true)
+    expect(shouldShowToolOutput("mcp__time__get_current_time", options, rawAllowed)).toBe(true)
+    expect(shouldShowToolOutput("read", options, rawAllowed)).toBe(false)
   })
 
   test("matches all tool output with the wildcard selector", () => {
@@ -275,9 +345,9 @@ describe("tool message presentation", () => {
       showArguments: false,
       showOutputFor: ["*"],
     }
-    expect(shouldShowToolOutput("bash", options)).toBe(true)
-    expect(shouldShowToolOutput("read", options)).toBe(true)
-    expect(shouldShowToolOutput("mcp__time__get_current_time", options)).toBe(true)
+    expect(shouldShowToolOutput("bash", options, rawAllowed)).toBe(true)
+    expect(shouldShowToolOutput("read", options, rawAllowed)).toBe(true)
+    expect(shouldShowToolOutput("mcp__time__get_current_time", options, rawAllowed)).toBe(true)
   })
 
   test("ignores empty tool output selectors", () => {
@@ -286,7 +356,7 @@ describe("tool message presentation", () => {
       showArguments: false,
       showOutputFor: ["", "   "],
     }
-    expect(shouldShowToolOutput("bash", options)).toBe(false)
+    expect(shouldShowToolOutput("bash", options, rawAllowed)).toBe(false)
   })
 })
 
