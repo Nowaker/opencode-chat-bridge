@@ -46,6 +46,14 @@ export {
   type ActiveQueryHandle,
 } from "./connector-base"
 
+export {
+  AI_PREFIX,
+  WHATSAPP_MAX_MESSAGE_LENGTH,
+  applyAiPrefix,
+  buildAiMessageChunks,
+  looksLikeBridgeEcho,
+} from "./whatsapp-format"
+
 export { ACPSessionStore, type StoredACPSession } from "./session-store"
 
 export { ImageHandler, type ImageUploadCallback, DocHandler, type DocUploadCallback } from "./image-handler"

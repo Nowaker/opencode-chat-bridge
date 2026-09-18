@@ -39,6 +39,9 @@ import {
   removeImageMarkers,
   removeDocMarkers,
   sanitizeServerPaths,
+  applyAiPrefix,
+  buildAiMessageChunks,
+  looksLikeBridgeEcho,
 } from "../src"
 
 // =============================================================================
@@ -71,6 +74,9 @@ const RESPOND_TO_OTHERS = process.env.WHATSAPP_RESPOND_TO_OTHERS === undefined
   ? config.whatsapp.respondToOthers
   : !["0", "false", "no", "off"].includes(process.env.WHATSAPP_RESPOND_TO_OTHERS.toLowerCase())
 
+/** How many recently emitted message IDs are retained for echo rejection. */
+const SENT_MESSAGE_ID_LIMIT = 500
+
 // =============================================================================
 // Session Type
 // =============================================================================
@@ -83,11 +89,12 @@ interface ChatSession extends BaseSession {
 // WhatsApp Connector
 // =============================================================================
 
-class WhatsAppConnector extends BaseConnector<ChatSession> {
+export class WhatsAppConnector extends BaseConnector<ChatSession> {
   private sock: ReturnType<typeof makeWASocket> | null = null
   private myNumber: string = ""
   private ownIds = new Set<string>()
   private composingTokens = new Map<string, symbol>()
+  private sentMessageIds = new Set<string>()
 
   constructor() {
     super({
@@ -124,56 +131,84 @@ class WhatsAppConnector extends BaseConnector<ChatSession> {
     this.log("Stopped.")
   }
 
-  async sendMessage(chatId: string, text: string): Promise<void> {
+  /**
+   * The single outbound text boundary.
+   *
+   * Every text this bridge puts into WhatsApp goes through here -- answers and
+   * each of their chunks, tool notices, errors, permission prompts, captions --
+   * so a new call site cannot emit unmarked text. Sent IDs are recorded here
+   * too, which is what lets inbound echo rejection stay identity-based.
+   */
+  private async emitText(chatId: string, text: string): Promise<string | null> {
+    if (!this.sock) return null
+
+    let lastId: string | null = null
+    for (const chunk of buildAiMessageChunks(text)) {
+      const sent = await this.sock.sendMessage(chatId, { text: chunk })
+      lastId = sent?.key.id || null
+      if (lastId) this.rememberSentMessage(lastId)
+    }
+    return lastId
+  }
+
+  private async editText(chatId: string, messageId: string, text: string): Promise<void> {
     if (!this.sock) return
 
-    try {
-      const MAX_LEN = 4000 // Conservative limit for WhatsApp messages
-      const prefixed = `${BOT_NAME}: ${text}`
+    // An edit replaces one message, so it cannot span chunks; the first chunk
+    // carries the marker and respects the length limit.
+    const [chunk] = buildAiMessageChunks(text)
+    if (!chunk) return
 
-      if (prefixed.length <= MAX_LEN) {
-        await this.sock.sendMessage(chatId, { text: prefixed })
-      } else {
-        // Split long messages — first chunk gets the bot name prefix
-        const chunks = this.splitMessage(text, MAX_LEN - BOT_NAME.length - 2)
-        for (let i = 0; i < chunks.length; i++) {
-          const msg = i === 0 ? `${BOT_NAME}: ${chunks[i]}` : chunks[i]
-          await this.sock.sendMessage(chatId, { text: msg })
-        }
-      }
+    const sent = await this.sock.sendMessage(chatId, {
+      text: chunk,
+      edit: { id: messageId, remoteJid: chatId, fromMe: true },
+    })
+    const id = sent?.key.id
+    if (id) this.rememberSentMessage(id)
+  }
+
+  /**
+   * Remember an emitted message ID, bounded so a long-lived process cannot
+   * grow this set without limit. Sets iterate in insertion order, so the first
+   * entry is the oldest.
+   */
+  private rememberSentMessage(id: string): void {
+    this.sentMessageIds.add(id)
+    if (this.sentMessageIds.size > SENT_MESSAGE_ID_LIMIT) {
+      const oldest = this.sentMessageIds.values().next().value
+      if (oldest) this.sentMessageIds.delete(oldest)
+    }
+  }
+
+  /**
+   * Whether an inbound message is this bridge's own output coming back.
+   *
+   * The bridge sends as the linked account, so `fromMe` alone cannot separate
+   * its output from the human's own messages -- which must keep working. IDs
+   * this process emitted are authoritative; the `[AI] ` marker is a fallback
+   * for echoes that predate a restart. Neither test consults a display name,
+   * which any participant can change at will.
+   */
+  private isOwnEmittedMessage(msg: any, text: string): boolean {
+    const id = msg.key?.id
+    if (id && this.sentMessageIds.has(id)) return true
+    return msg.key?.fromMe === true && looksLikeBridgeEcho(text)
+  }
+
+  async sendMessage(chatId: string, text: string): Promise<void> {
+    try {
+      await this.emitText(chatId, text)
     } catch (err) {
       this.logError(`Failed to send message to ${chatId}:`, err)
     }
   }
 
   private async createToolActivityMessage(chatId: string, text: string): Promise<string | null> {
-    if (!this.sock) return null
-    const sent = await this.sock.sendMessage(chatId, { text: `${BOT_NAME}: > ${text}` })
-    return sent?.key.id || null
+    return await this.emitText(chatId, `> ${text}`)
   }
 
   private async updateToolActivityMessage(chatId: string, messageId: string, text: string): Promise<void> {
-    if (!this.sock) return
-    await this.sock.sendMessage(chatId, {
-      text: `${BOT_NAME}: > ${text}`,
-      edit: { id: messageId, remoteJid: chatId, fromMe: true },
-    })
-  }
-
-  private splitMessage(text: string, maxLen: number): string[] {
-    const chunks: string[] = []
-    let remaining = text
-    while (remaining.length > 0) {
-      if (remaining.length <= maxLen) {
-        chunks.push(remaining)
-        break
-      }
-      let splitAt = remaining.lastIndexOf("\n", maxLen)
-      if (splitAt <= 0) splitAt = maxLen
-      chunks.push(remaining.slice(0, splitAt))
-      remaining = remaining.slice(splitAt).trimStart()
-    }
-    return chunks
+    await this.editText(chatId, messageId, `> ${text}`)
   }
 
   // ---------------------------------------------------------------------------
@@ -282,8 +317,7 @@ class WhatsAppConnector extends BaseConnector<ChatSession> {
 
     if (!text) return
 
-    // Skip messages that start with our bot name (our own responses)
-    if (text.startsWith(`${BOT_NAME}:`)) return
+    if (this.isOwnEmittedMessage(msg, text)) return
 
     // Extract sender ID from the sender JID. In recent WhatsApp/Baileys this may
     // be a LID (`...@lid`) rather than a phone-number JID. In groups,
@@ -599,10 +633,11 @@ class WhatsAppConnector extends BaseConnector<ChatSession> {
 
     try {
       const buffer = Buffer.from(image.data, "base64")
-      await this.sock.sendMessage(chatId, {
+      const sent = await this.sock.sendMessage(chatId, {
         image: buffer,
-        caption: image.alt || undefined,
+        caption: applyAiPrefix(image.alt || "image"),
       })
+      if (sent?.key.id) this.rememberSentMessage(sent.key.id)
       this.log(`Sent image to ${chatId}`)
     } catch (err) {
       this.logError(`Failed to send image to ${chatId}:`, err)
@@ -617,10 +652,11 @@ class WhatsAppConnector extends BaseConnector<ChatSession> {
       const buffer = fs.readFileSync(filePath)
       const fileName = path.basename(filePath)
 
-      await this.sock.sendMessage(chatId, {
+      const sent = await this.sock.sendMessage(chatId, {
         image: buffer,
-        caption: fileName,
+        caption: applyAiPrefix(fileName),
       })
+      if (sent?.key.id) this.rememberSentMessage(sent.key.id)
       this.log(`Sent image from file to ${chatId}: ${filePath}`)
     } catch (err) {
       this.logError(`Failed to send image from file to ${chatId}:`, err)
@@ -650,11 +686,13 @@ class WhatsAppConnector extends BaseConnector<ChatSession> {
         ".zip": "application/zip",
       }
 
-      await this.sock.sendMessage(chatId, {
+      const sent = await this.sock.sendMessage(chatId, {
         document: buffer,
         mimetype: mimeTypes[ext] || "application/octet-stream",
         fileName: fileName,
+        caption: applyAiPrefix(fileName),
       })
+      if (sent?.key.id) this.rememberSentMessage(sent.key.id)
       this.log(`Sent document to ${chatId}: ${filePath}`)
     } catch (err) {
       this.logError(`Failed to send document to ${chatId}:`, err)
@@ -682,7 +720,9 @@ async function main() {
   await connector.start()
 }
 
-main().catch((err) => {
-  console.error("Fatal error:", err)
-  process.exit(1)
-})
+if (import.meta.main) {
+  main().catch((err) => {
+    console.error("Fatal error:", err)
+    process.exit(1)
+  })
+}
