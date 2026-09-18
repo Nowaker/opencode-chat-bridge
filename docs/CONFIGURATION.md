@@ -30,6 +30,24 @@ Each connector/thread receives a deterministic working directory. The profile is
 
 `backendId` must change when the configured backend or its incompatible session format changes. ACP processes inherit the bridge environment; keep credentials outside profiles and the session store.
 
+#### Pinning the workspace
+
+`acp.sessionCwd` pins every bridge-started session to one existing directory instead of a generated per-thread workspace:
+
+```json
+{
+  "acp": {
+    "sessionCwd": "/home/you/projects/your-project"
+  }
+}
+```
+
+Default is `""`, which keeps upstream's generated workspaces.
+
+**Trade-off.** opencode derives a project identity by hashing the working directory. Generated workspaces keep bot sessions out of your own session lists and keep threads from colliding; pinned sessions share one project identity and appear in that project's session list. In exchange the agent runs inside a real project and inherits its `AGENTS.md`.
+
+A pinned directory is treated as yours, not as bridge state: the bridge never copies config or profile files into it, and session expiry never deletes it. A pinned directory that does not exist is an error rather than something to create.
+
 ### Ferrum backend notes
 
 [Ferrum](https://codeberg.org/ominiverdi/ferrum) is a small Rust-native Linux coding agent. It can be used directly as an ACP v1 stdio backend:
@@ -438,18 +456,52 @@ these settings affect presentation only.
   - `trace` maintains one editable cumulative tool-call ledger.
 - `showCalls` is a legacy compatibility switch and is no longer needed in new
   configurations. If present, `false` always resolves to `mode: "off"`.
-- `showArguments` adds up to three compact arguments to each call notice.
-  Long path-like values retain their filename/suffix; other values retain their
-  beginning. Arguments can contain local paths, queries, URLs, or other
-  sensitive input, so the default is `false`.
-- `showOutputFor` lists tool-name substrings whose output is returned to chat.
-  The default `["bash"]` provides progress from shell commands. Use `["*"]` to
-  return output from every tool, or an empty list to suppress all direct tool
-  output. Forwarding all output can expose sensitive tool results and create
-  substantial chat traffic. This setting is independent from `mode`;
+- `showArguments` allows argument values into call notices at all. Which values
+  is then decided by `summaries` below; `false` empties the field allowlist.
+  Arguments can contain local paths, queries, URLs, or other sensitive input,
+  so the default is `false`.
+- `showOutputFor` lists tool-name substrings whose raw output may be returned to
+  chat. In this fork it is necessary but **not sufficient**:
+  `safeOutput.allowRawToolOutput` must also be true, and defaults to false.
+  With both set, `["*"]` returns output from every tool and an empty list
+  suppresses all direct tool output. This setting is independent from `mode`;
   `mode: "off"` can still forward selected output.
 - `maxTraceEntries` bounds each `trace` message. Longer traces continue in
   additional editable messages without discarding earlier calls.
+- `summaries` decides what a tool call looks like in chat. Both allowlists
+  default to empty, which reveals tool names and no argument values at all.
+
+```json
+{
+  "toolMessages": {
+    "showArguments": true,
+    "summaries": {
+      "allowedTools": ["vibeterm_*", "session_*", "task", "todowrite", "read"],
+      "allowedFields": ["session", "title", "status", "description", "filePath"],
+      "maxFieldLength": 120,
+      "unlistedTools": "name"
+    }
+  }
+}
+```
+
+- `summaries.allowedTools` selects which tools may show arguments. An entry
+  matches exactly, or as a `prefix*` glob so a whole family such as
+  `vibeterm_*` can be named at once. A `*` anywhere but the final character is
+  not a wildcard.
+- `summaries.allowedFields` selects which argument names may be rendered. Every
+  other field is dropped, so an argument nobody anticipated cannot reach chat.
+  Arrays and objects collapse to `[n items]` / `{n fields}`: an allowlisted
+  field name says the field is safe to mention, not that everything nested
+  inside it is safe to publish.
+- `summaries.maxFieldLength` bounds each rendered value.
+- `summaries.unlistedTools` is `name` (emit `ran <tool>`) or `hide` (say
+  nothing) for tools outside `allowedTools`.
+
+The ACP-supplied tool description is deliberately unused, because it is built by
+joining raw argument values. Summaries are derived from the arguments
+themselves so the allowlists apply. See
+[Fork deviations](FORK_DEVIATIONS.md#4-tool-activity-is-summarized-against-allowlists).
 
 The mode is global across WhatsApp, Telegram, Slack, Discord, Mattermost,
 Matrix, and Web. Editable modes correlate progressive ACP updates by tool-call
@@ -695,7 +747,11 @@ DISCORD_TOKEN="..."
 
 ### User Allowlists
 
-Each chat connector can restrict access to a connector-specific list of user IDs. Empty list means all users are allowed. For WhatsApp, `allowedUsers` filters non-owner senders; the linked WhatsApp account itself is always allowed.
+Each chat connector restricts access to a connector-specific list of user IDs.
+
+**This fork fails closed: an empty or missing allowlist denies every sender.** Upstream treats an empty list as "no restriction"; that is inverted here, so a half-configured bridge stays silent instead of answering everyone who can reach it. Startup logging prints `(none -- every sender is denied)` so a silent bridge is distinguishable from a broken one. See [Fork deviations](FORK_DEVIATIONS.md#1-allowlists-fail-closed).
+
+For WhatsApp, `allowedUsers` filters non-owner senders; the linked WhatsApp account itself is always exempt from the *user* allowlist, but never from the *group* allowlist below.
 
 These IDs are platform-native identifiers, not always human-friendly usernames or phone numbers. For example, Slack uses member IDs like `U01ABC123`, while WhatsApp may use a sender ID shown in connector logs.
 
@@ -737,6 +793,88 @@ Environment variable overrides:
 | `MATTERMOST_ALLOWED_USERS` | Mattermost |
 
 Breaking change: WhatsApp now uses `allowedUsers` / `WHATSAPP_ALLOWED_USERS`. The older `allowedNumbers` / `WHATSAPP_ALLOWED_NUMBERS` names were removed.
+
+### Channel Allowlists
+
+Alongside the user allowlist, each connector restricts which chats it may read or write. **This is also fail-closed: an empty or missing list denies every chat.**
+
+```json
+{
+  "slack": { "allowedChannels": ["C0EXAMPLE01"] },
+  "matrix": { "allowedRooms": ["!example:matrix.example.net"] },
+  "whatsapp": { "allowedGroups": ["120363000000000000@g.us"] }
+}
+```
+
+Values are **stable platform IDs**, never display names, which any participant can change:
+
+| Platform | Setting | ID shape | Where to find it |
+|---|---|---|---|
+| Slack | `slack.allowedChannels` | `C...` | Channel details, or the last path segment of the channel URL |
+| Matrix | `matrix.allowedRooms` | `!room:server` | Room settings > Advanced > Internal room ID |
+| WhatsApp | `whatsapp.allowedGroups` | `...@g.us` | Connector logs on an inbound message from that group |
+
+Matching is exact -- never prefix or substring -- so a lookalike ID cannot slip through. The two gates are independent: passing the user check does not imply the channel check.
+
+Environment variable overrides:
+
+| Env var | Connector |
+|---------|-----------|
+| `SLACK_ALLOWED_CHANNELS` | Slack |
+| `MATRIX_ALLOWED_ROOMS` | Matrix |
+| `WHATSAPP_ALLOWED_GROUPS` | WhatsApp |
+
+Enforcement sits at each connector's inbound edge, before deduplication and before any session is created, so a message from a non-allowlisted chat allocates no ACP process.
+
+### Safe Output
+
+`safeOutput` governs what may leave the bridge regardless of presentation settings.
+
+```json
+{
+  "safeOutput": {
+    "redactSecrets": true,
+    "allowRawToolOutput": false
+  }
+}
+```
+
+- `redactSecrets` (default `true`) masks credential shapes -- provider tokens, JWTs, private key blocks, `Bearer` headers, URL userinfo, and `NAME=value` where the name announces a secret -- in everything the bridge sends. It is a backstop behind the allowlists, not a replacement for them.
+- `allowRawToolOutput` (default `false`) is a second gate in front of `toolMessages.showOutputFor`. Both must be true before a whole raw tool result is forwarded verbatim. Raw results are unbounded and cannot be filtered per field, so upstream's behaviour requires opting back in.
+
+### Permissions
+
+```json
+{
+  "permissions": {
+    "interactive": true,
+    "timeoutSeconds": 180
+  }
+}
+```
+
+- `interactive` (default `true`) holds an incoming `session/request_permission` open and posts it to the originating thread for a decision. When `false` the bridge keeps upstream's behaviour of rejecting immediately.
+- `timeoutSeconds` (default `180`) bounds how long a request is held. **The agent is blocked for this entire window**, so keep it short. On expiry the request is answered with its reject option and the channel is told.
+
+A reply is accepted only when it names the request's correlation token, comes from an allowlisted stable sender ID, arrives in the same thread the request was posted to, and lands inside the window. The decision must be an option's 1-based number or its exact ID or name; ambiguous text such as "yes" or "sure, go ahead" is refused explicitly. See [Fork deviations](FORK_DEVIATIONS.md#8-permissions-round-trip-to-chat).
+
+Interactive **questions** (opencode's `question` tool and Vibeterm's `vibeterm_async_question`) are **not reachable over ACP at all** and no setting enables them. See [Fork deviations](FORK_DEVIATIONS.md#interactive-questions-over-acp).
+
+### WhatsApp output boundary
+
+```json
+{
+  "whatsapp": {
+    "autoUploadFiles": false,
+    "logInboundMessages": false
+  }
+}
+```
+
+- `autoUploadFiles` (default `false`) controls whether file paths found in tool results *or in the model's own prose* are read from disk and uploaded to the chat. Upstream does this unconditionally, independently of `toolMessages`, so turning tool messages off does not disable it there.
+- `logInboundMessages` (default `false`) controls whether inbound message bodies are written to stdout. With it off, the connector logs the sender and a character count only.
+
+Every outbound WhatsApp text is prefixed with exactly `[AI] `, including every chunk of a split message, at a single send boundary. This is not configurable: the bridge sends as the owner's own account, so the marker is the only thing separating its messages from theirs.
 
 ## Example Configurations
 

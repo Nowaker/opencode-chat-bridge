@@ -254,9 +254,13 @@ The proxy handles login. The web connector serves the widget. Users must authent
 
 ## Chat-Level Security
 
+Two independent gates decide whether a message is processed at all: **who** sent it and **which chat** it arrived in. Both fail closed, so an unconfigured bridge answers nobody anywhere.
+
+Both are enforced at each connector's inbound edge, before deduplication and before any session exists, so a denied message never starts an ACP process.
+
 ### User Filtering
 
-Use connector allowlists to restrict who can talk to the bot:
+Connector allowlists restrict who can talk to the bot:
 
 ```json
 {
@@ -266,31 +270,53 @@ Use connector allowlists to restrict who can talk to the bot:
 }
 ```
 
+**An empty or missing list denies every sender.** This differs from upstream, where an empty list means "no restriction". A bridge that is silent because it is misconfigured is recoverable; a bridge that serves strangers because it is misconfigured is not.
+
 You can also override each list with env vars such as `SLACK_ALLOWED_USERS` or `WHATSAPP_ALLOWED_USERS`.
 
-For custom filtering logic beyond simple allowlists, wrap the connector and drop messages before processing:
+### Channel and Room Filtering
 
-```typescript
-const BLOCKED_USERS = ["@spammer:matrix.org"]
+The bot only reads and writes in explicitly listed chats:
 
-function handleMessage(userId: string, text: string) {
-  if (BLOCKED_USERS.includes(userId)) return
-  // Process message
+```json
+{
+  "slack": { "allowedChannels": ["C0EXAMPLE01"] },
+  "matrix": { "allowedRooms": ["!example:matrix.example.net"] },
+  "whatsapp": { "allowedGroups": ["120363000000000000@g.us"] }
 }
 ```
 
-### Room Filtering
+Rules that matter for security:
 
-Only respond in specific rooms:
+- **Empty denies everything.** Same failure direction as the user allowlist.
+- **Stable platform IDs only** (`C...`, `!room:server`, `...@g.us`). Display names are never matched: on all three platforms any participant can change them, so authorizing on a name is authorizing on attacker-controlled input.
+- **Exact matching**, never prefix or substring, so a lookalike ID cannot slip through.
+- **The two gates are independent.** Passing the user check does not imply the channel check. On WhatsApp the chat gate binds the owner too: `fromMe` exempts a sender from the *user* allowlist so self-chat keeps working, but never from the set of chats the bridge may touch.
 
-```typescript
-const ALLOWED_ROOMS = ["!room1:matrix.org", "!room2:matrix.org"]
+Being invited to a room is not authorization. Creating a room the bot can see does not let it execute anything there.
 
-function handleMessage(roomId: string, text: string) {
-  if (!ALLOWED_ROOMS.includes(roomId)) return
-  // Process message
-}
-```
+### Output Boundary
+
+Denying tools is not the whole boundary; what the bridge *says* is the other half.
+
+- Tool calls reach chat as structured summaries built from `toolMessages.summaries` allowlists, never as raw arguments or raw results. Both allowlists default to empty.
+- Whole raw tool results need `toolMessages.showOutputFor` **and** `safeOutput.allowRawToolOutput`, the latter defaulting to false.
+- `safeOutput.redactSecrets` (default true) masks credential shapes in everything sent, as a backstop behind those allowlists.
+- `whatsapp.autoUploadFiles` (default false) disables reading file paths out of tool results or model prose and uploading them. Upstream does this unconditionally, independently of tool-message settings, so suppressing tool messages there is not an output boundary.
+- `whatsapp.logInboundMessages` (default false) keeps the owner's correspondence out of the bridge log.
+
+### Approving Permissions From Chat
+
+When `permissions.interactive` is on, a permission request is held and posted to the thread rather than auto-rejected. It is settled only by a reply that:
+
+1. names the request's short correlation token,
+2. comes from an allowlisted stable sender ID,
+3. arrives in the same thread the request was posted to, and
+4. lands inside `permissions.timeoutSeconds`.
+
+Ambiguous text is never an approval -- the decision must be an option's 1-based number or its exact ID or name. A reply in another thread is never an approval. On expiry the request is answered with its reject option, because the agent is blocked on it and must be answered rather than abandoned.
+
+The rendered prompt carries no raw tool arguments. Interactive **questions** are unavailable over ACP entirely; see [Fork deviations](FORK_DEVIATIONS.md#interactive-questions-over-acp).
 
 ### Rate Limiting
 
@@ -397,6 +423,16 @@ Before deploying:
 - [ ] `opencode.json` uses `chat-bridge` agent with restrictive permissions
 - [ ] `default_agent` is set to `chat-bridge`
 - [ ] All dangerous tools (`read`, `write`, `edit`, `bash`) are denied
+- [ ] Every enabled connector has a **non-empty** `allowedUsers`
+- [ ] Every enabled connector has a **non-empty** channel allowlist (`allowedChannels` / `allowedRooms` / `allowedGroups`)
+- [ ] Those allowlists hold stable platform IDs, not display names
+- [ ] Startup log does not print `(none -- every channel is denied)` for a connector you expect to work
+- [ ] `safeOutput.redactSecrets` is true
+- [ ] `safeOutput.allowRawToolOutput` is false unless raw tool results are genuinely wanted in chat
+- [ ] `toolMessages.summaries.allowedFields` lists only fields safe to publish
+- [ ] `whatsapp.autoUploadFiles` and `whatsapp.logInboundMessages` are false unless deliberately wanted
+- [ ] `permissions.timeoutSeconds` is short enough that a blocked agent is not stuck for long
+- [ ] `acp.sessionCwd`, if set, points at a directory you accept sharing a project identity with
 - [ ] Access tokens are in environment variables
 - [ ] Config files have restricted permissions
 - [ ] Rate limiting is implemented

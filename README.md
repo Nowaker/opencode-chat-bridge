@@ -2,6 +2,8 @@
 
 Bridge ACP-compatible agents such as [OpenCode](https://opencode.ai) and [Ferrum](https://codeberg.org/ominiverdi/ferrum) to chat platforms with permission-based security.
 
+> **This is a fork.** It targets a personal bridge running against private accounts, so several upstream defaults are deliberately inverted -- most importantly, **allowlists fail closed**: an unconfigured connector answers nobody, where upstream answers everyone. Every divergence and its rationale is recorded in [Fork deviations](docs/FORK_DEVIATIONS.md). Start from [`chat-bridge.personal.json.example`](chat-bridge.personal.json.example) rather than `chat-bridge.json.example`.
+
 ## Recent Changes
 
 - Global tool presentation modes: `off`, `events`, `status`, and `trace`. Editable status and cumulative audit messages work across every chat connector, with progressive ACP argument updates, pagination, and edit-failure recovery.
@@ -89,8 +91,10 @@ git clone https://github.com/ominiverdi/opencode-chat-bridge
 cd opencode-chat-bridge
 bun install  # Install project dependencies
 cp .env.example .env  # Edit with your credentials
-test -e chat-bridge.json || cp chat-bridge.json.example chat-bridge.json
+test -e chat-bridge.json || cp chat-bridge.personal.json.example chat-bridge.json
 ```
+
+Then replace every `REPLACE`/placeholder ID in `chat-bridge.json` with real, stable platform IDs. Until you do, the bridge denies every sender in every chat by design -- see [Fork deviations](docs/FORK_DEVIATIONS.md#1-allowlists-fail-closed).
 
 Run a connector:
 
@@ -300,7 +304,13 @@ Permissions are enforced by OpenCode at the execution level, not via prompts. Ev
 
 This is fundamentally different from prompt-based restrictions which can be bypassed via injection.
 
-See [docs/SECURITY.md](docs/SECURITY.md) for details.
+This fork adds three further boundaries, all enforced in code rather than requested of the model:
+
+- **Who and where.** Fail-closed user *and* channel allowlists, matched on stable platform IDs, checked before any session is created.
+- **What comes out.** Tool calls reach chat as summaries built from field allowlists, never raw arguments or raw results; credential shapes are masked; automatic file upload is off by default.
+- **What gets approved.** Permission requests are held and settled only by a correlated reply from an allowlisted sender in the originating thread, inside an expiry window. Ambiguous text is never an approval.
+
+See [docs/SECURITY.md](docs/SECURITY.md) for details and [docs/FORK_DEVIATIONS.md](docs/FORK_DEVIATIONS.md) for how each differs from upstream.
 
 ## Project Structure
 
@@ -359,6 +369,7 @@ Setup guides:
 - [Web](docs/WEB_SETUP.md)
 
 Reference:
+- [Fork deviations](docs/FORK_DEVIATIONS.md) -- what this fork changes from upstream, and why
 - [Configuration](docs/CONFIGURATION.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Security](docs/SECURITY.md)

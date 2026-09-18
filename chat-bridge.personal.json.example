@@ -1,0 +1,104 @@
+{
+  "botName": "opencode",
+  "trigger": "!oc",
+  "rateLimitSeconds": 5,
+  "sessionStorePath": "./state/chat-sessions.json",
+  "defaultAgent": null,
+  "verboseErrors": false,
+
+  "toolMessages": {
+    "mode": "events",
+    "showArguments": true,
+    "showOutputFor": [],
+    "maxTraceEntries": 20,
+    "summaries": {
+      "allowedTools": [
+        "vibeterm_*",
+        "session_*",
+        "task",
+        "todowrite",
+        "todoread"
+      ],
+      "allowedFields": [
+        "session",
+        "title",
+        "status",
+        "subject",
+        "description",
+        "subagent_type",
+        "category"
+      ],
+      "maxFieldLength": 120,
+      "unlistedTools": "name"
+    }
+  },
+
+  "safeOutput": {
+    "redactSecrets": true,
+    "allowRawToolOutput": false
+  },
+
+  "permissions": {
+    "interactive": true,
+    "timeoutSeconds": 180
+  },
+
+  "sessionPicker": {
+    "enabled": false,
+    "connectors": [],
+    "mirrorIntervalSeconds": 60
+  },
+
+  "acp": {
+    "command": "opencode",
+    "args": ["acp"],
+    "backendId": "opencode",
+    "profileDir": "",
+    "sessionCwd": "/REPLACE/WITH/ABSOLUTE/PATH/TO/YOUR/PROJECT"
+  },
+
+  "slack": {
+    "enabled": true,
+    "allowedUsers": ["UREPLACEWITHYOURMEMBERID"],
+    "allowedChannels": ["CREPLACEWITHCHANNELID"],
+    "threadIsolation": true,
+    "respondToThreadReplies": true
+  },
+
+  "whatsapp": {
+    "enabled": false,
+    "authFolder": "./state/whatsapp-auth",
+    "allowedUsers": ["REPLACEWITHSENDERID"],
+    "allowedGroups": ["000000000000000000@g.us"],
+    "respondToOthers": true,
+    "autoUploadFiles": false,
+    "logInboundMessages": false
+  },
+
+  "matrix": {
+    "enabled": false,
+    "homeserver": "https://matrix.example.net",
+    "userId": "@bridge:matrix.example.net",
+    "accessToken": "{env:MATRIX_ACCESS_TOKEN}",
+    "password": "{env:MATRIX_PASSWORD}",
+    "deviceId": "OPENCODE_BRIDGE",
+    "encryption": {
+      "enabled": false,
+      "storePath": "./state/matrix-store/"
+    },
+    "autoJoin": false,
+    "triggerPatterns": ["!oc "],
+    "ignoreRooms": [],
+    "ignoreUsers": [],
+    "allowedUsers": ["@you:matrix.example.net"],
+    "allowedRooms": ["!replacewithinternalroomid:matrix.example.net"],
+    "formatHtml": false,
+    "threadIsolation": true,
+    "respondToThreadReplies": true
+  },
+
+  "mattermost": { "enabled": false },
+  "discord": { "enabled": false },
+  "telegram": { "enabled": false },
+  "web": { "enabled": false }
+}
