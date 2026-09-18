@@ -674,6 +674,14 @@ const PERMISSION_SWEEP_INTERVAL_MS = 5_000
 const PERMISSION_TITLE_MAX_LENGTH = 160
 
 /**
+ * Extra time the ACP client waits past the broker's own window before denying
+ * a held request itself. The broker owns the user-facing expiry message, so it
+ * must get a full sweep or two to fire first; the client's timeout is only for
+ * requests no connector ever presented.
+ */
+const PERMISSION_HOLD_GRACE_MS = PERMISSION_SWEEP_INTERVAL_MS * 3
+
+/**
  * Parse SESSION_RETENTION_MINS from environment.
  * Returns undefined if not set or invalid (connector uses no runtime expiry).
  */
@@ -1054,6 +1062,7 @@ export abstract class BaseConnector<TSession extends BaseSession> {
       command: this.acpConfig.command,
       args: this.acpConfig.args,
       interactivePermissions: this.permissionsConfig.interactive,
+      permissionTimeoutMs: this.permissionsConfig.timeoutSeconds * 1000 + PERMISSION_HOLD_GRACE_MS,
     })
   }
 

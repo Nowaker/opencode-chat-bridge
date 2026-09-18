@@ -56,6 +56,14 @@ export interface ACPClientOptions {
    * does not answer permissions cannot leave the agent blocked forever.
    */
   interactivePermissions?: boolean
+  /**
+   * Deny a held permission request that nobody answered within this many
+   * milliseconds. The client owns the JSON-RPC id, so it is the last line of
+   * defence: if no connector ever presented the request -- no listener was
+   * attached, or posting it to chat failed -- the agent would otherwise stay
+   * blocked on a reply that can never arrive. 0 disables it.
+   */
+  permissionTimeoutMs?: number
 }
 
 export interface PermissionOption {
@@ -171,7 +179,12 @@ export class ACPClient extends EventEmitter {
   private command: string
   private args: string[]
   private interactivePermissions: boolean
-  private heldPermissions = new Map<string | number, { title: string; options: PermissionOption[] }>()
+  private permissionTimeoutMs: number
+  private heldPermissions = new Map<string | number, {
+    title: string
+    options: PermissionOption[]
+    timer?: ReturnType<typeof setTimeout>
+  }>()
   private _availableCommands: OpenCodeCommand[] = []
   // Track cumulative output per tool call to compute actual deltas
   private toolOutputSeen = new Map<string, number>()
@@ -193,6 +206,9 @@ export class ACPClient extends EventEmitter {
       : options.command
     this.args = options.args || ["acp"]
     this.interactivePermissions = options.interactivePermissions === true
+    this.permissionTimeoutMs = Number.isFinite(options.permissionTimeoutMs)
+      ? Math.max(0, options.permissionTimeoutMs as number)
+      : 0
   }
   
   /**
@@ -609,6 +625,10 @@ export class ACPClient extends EventEmitter {
                  params.path || params.directory ||
                  null
 
+    // Every request is recorded before it is answered, so an id is held exactly
+    // until a response is written for it and answering twice is impossible.
+    this.heldPermissions.set(msg.id, { title, options })
+
     if (!this.interactivePermissions) {
       console.error(`[ACP] Permission requested: ${title} - auto-rejecting`)
       const showPath = path && path !== title
@@ -622,7 +642,7 @@ export class ACPClient extends EventEmitter {
     }
 
     console.error(`[ACP] Permission requested: ${title} - awaiting an authenticated reply`)
-    this.heldPermissions.set(msg.id, { title, options })
+    this.scheduleHeldPermissionTimeout(msg.id, title, path)
     this.emit("permission_requested", {
       requestId: msg.id,
       permission: title,
@@ -634,17 +654,52 @@ export class ACPClient extends EventEmitter {
   }
 
   /**
+   * Deny a request nobody answered in time.
+   *
+   * A connector that presented the request normally settles it first, so this
+   * fires only when the request never reached a human: the timeout is armed
+   * with enough slack for the presenting connector's own expiry to win.
+   */
+  private scheduleHeldPermissionTimeout(
+    requestId: string | number,
+    title: string,
+    path: string | null,
+  ): void {
+    if (this.permissionTimeoutMs <= 0) return
+
+    const timer = setTimeout(() => {
+      const held = this.heldPermissions.get(requestId)
+      if (!held) return
+      console.error(`[ACP] Permission never answered: ${title} - denying so the turn can end`)
+      this.respondToPermission(requestId, resolveRejectOptionId(held.options))
+      this.emit("permission_rejected", {
+        permission: title,
+        path,
+        message: `Permission denied: ${title} (expired without a reply)`,
+      })
+    }, this.permissionTimeoutMs)
+
+    timer.unref?.()
+    const held = this.heldPermissions.get(requestId)
+    if (held) held.timer = timer
+  }
+
+  /**
    * Answer a held permission request. Returns false when the request is no
-   * longer outstanding, which happens when the agent gave up or the process
-   * was replaced while a human was deciding.
+   * longer outstanding, which happens when the agent gave up, the request
+   * already expired, or the process was replaced while a human was deciding.
    */
   respondToPermission(requestId: string | number, optionId: string): boolean {
-    if (!this.acp?.stdin || this.acp.stdin.destroyed) {
-      this.heldPermissions.delete(requestId)
-      return false
-    }
+    const held = this.heldPermissions.get(requestId)
+    // Answering an id that is no longer held would put a second JSON-RPC
+    // response for one request on the wire.
+    if (!held) return false
 
+    if (held.timer) clearTimeout(held.timer)
     this.heldPermissions.delete(requestId)
+
+    if (!this.acp?.stdin || this.acp.stdin.destroyed) return false
+
     const response = {
       jsonrpc: "2.0",
       id: requestId,
