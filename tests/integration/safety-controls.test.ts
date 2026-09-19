@@ -1071,3 +1071,104 @@ describe("inbound message bodies in the process log", () => {
     expect(run.output).toContain(INBOUND_MARKER)
   })
 })
+
+// =============================================================================
+// Scraped file paths are not uploaded unless asked for
+// =============================================================================
+
+/**
+ * Slack scrapes image paths out of tool results and out of the model's own
+ * prose, then reads them from disk and posts them. That is a file-exfiltration
+ * path independent of `toolMessages`, so it is gated on `autoUploadFiles`.
+ *
+ * The drive runs the connector's real processQuery against a seeded session,
+ * so the gate is exercised where a turn actually reaches it rather than by
+ * calling the upload helper directly.
+ */
+function driveSlackUpload(autoUploadFiles: boolean): { uploads: string[]; answered: boolean } {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-upload-slack-"))
+  const secretFile = path.join(dir, "private-chart.png")
+  fs.writeFileSync(secretFile, "not really a png")
+
+  fs.writeFileSync(path.join(dir, "chat-bridge.json"), JSON.stringify({
+    trigger: "!oc",
+    rateLimitSeconds: 0,
+    sessionStorePath: path.join(dir, "sessions.json"),
+    slack: { autoUploadFiles },
+  }))
+
+  const script = path.join(dir, "drive.ts")
+  fs.writeFileSync(script, `
+    const REPO = ${JSON.stringify(REPO_ROOT)}
+    const FILE = ${JSON.stringify(secretFile)}
+    const { EventEmitter } = await import("events")
+    const { SlackConnector } = await import(REPO + "/connectors/slack.ts")
+
+    const connector = new SlackConnector()
+    connector.allowedUsers = new Set([${JSON.stringify(SLACK_OWNER)}])
+    connector.allowedChannels = new Set([${JSON.stringify(SLACK_CHANNEL)}])
+
+    const uploads = []
+    connector.uploadImage = async (_channel, filePath) => { uploads.push(filePath) }
+
+    // The model names a local path in its own answer -- the exfiltration shape.
+    const client = new EventEmitter()
+    client.prompt = async () => { client.emit("chunk", "Here it is. Path: " + FILE); return "done" }
+    client.availableCommands = []
+
+    const threadId = ${JSON.stringify(SLACK_CHANNEL)} + ":" + ${JSON.stringify(SLACK_ROOT_TS)}
+    connector.sessionManager.set(threadId, {
+      client, createdAt: new Date(), lastActivity: new Date(),
+      messageCount: 0, inputChars: 0, outputChars: 0,
+    })
+
+    const posted = []
+    const slackClient = {
+      chat: {
+        postMessage: async (payload) => { posted.push(payload.text); return { ts: "ts-1" } },
+        update: async () => {},
+      },
+    }
+
+    const handlers = {}
+    connector.registerHandlers({
+      event: () => {},
+      message: (first, second) => { if (typeof first !== "function") handlers.trigger = second },
+    })
+
+    await handlers.trigger({
+      message: {
+        text: "!oc make me a chart",
+        user: ${JSON.stringify(SLACK_OWNER)},
+        channel: ${JSON.stringify(SLACK_CHANNEL)},
+        ts: "1700000000.000301",
+        thread_ts: ${JSON.stringify(SLACK_ROOT_TS)},
+      },
+      body: { team_id: "T04FXV713" },
+      client: slackClient,
+    })
+
+    console.log("RESULT:" + JSON.stringify({ uploads, answered: posted.some((t) => String(t).includes("Here it is")) }))
+  `)
+
+  const result = spawnSync("bun", [script], { cwd: dir, encoding: "utf-8", timeout: 60_000 })
+  const payload = (result.stdout || "").split("RESULT:")[1]
+  if (!payload) {
+    throw new Error(`driver produced no result\nstdout: ${result.stdout}\nstderr: ${result.stderr}`)
+  }
+  return JSON.parse(payload.trim())
+}
+
+describe("slack scraped-path uploads", () => {
+  test("the turn completes, so the assertions below are not vacuous", () => {
+    expect(driveSlackUpload(true).answered).toBe(true)
+  })
+
+  test("withholds a file the model named by path, by default", () => {
+    expect(driveSlackUpload(false).uploads).toEqual([])
+  })
+
+  test("uploads it when the flag asks for it", () => {
+    expect(driveSlackUpload(true).uploads).toHaveLength(1)
+  })
+})

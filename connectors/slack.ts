@@ -54,6 +54,7 @@ const ALLOWED_USERS = ENV_ALLOWED_USERS.length > 0 ? ENV_ALLOWED_USERS : config.
 const ENV_ALLOWED_CHANNELS = parseCsvList(process.env.SLACK_ALLOWED_CHANNELS)
 const ALLOWED_CHANNELS = ENV_ALLOWED_CHANNELS.length > 0 ? ENV_ALLOWED_CHANNELS : config.slack.allowedChannels
 const LOG_INBOUND_MESSAGES = config.slack.logInboundMessages
+const AUTO_UPLOAD_FILES = config.slack.autoUploadFiles
 
 function parseSessionRetentionMins(env: NodeJS.ProcessEnv): number {
   const raw = env.SESSION_RETENTION_MINS
@@ -605,24 +606,7 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
 
       await client.prompt(query)
 
-      // Process images from tool results
-      const toolPaths = extractImagePaths(toolResultsBuffer)
-      for (const imagePath of toolPaths) {
-        if (fs.existsSync(imagePath)) {
-          this.log(`Uploading image from tool result: ${imagePath}`)
-          await this.uploadImage(context.channelId, imagePath, this.threadIsolation ? context.replyThreadTs : undefined)
-        }
-      }
-
-      // Process images from response
-      const responsePaths = extractImagePaths(responseBuffer)
-      for (const imagePath of responsePaths) {
-        if (toolPaths.includes(imagePath)) continue
-        if (fs.existsSync(imagePath)) {
-          this.log(`Uploading image from response: ${imagePath}`)
-          await this.uploadImage(context.channelId, imagePath, this.threadIsolation ? context.replyThreadTs : undefined)
-        }
-      }
+      await this.uploadDetectedFiles(context, toolResultsBuffer, responseBuffer)
 
       // Clean response and send
       const cleanResponse = sanitizeServerPaths(removeImageMarkers(responseBuffer))
@@ -649,6 +633,32 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
       // Reset inactivity clock from moment of delivery
       if (session) session.lastActivity = new Date()
       this.markQueryDone(sessionId)
+    }
+  }
+
+  /**
+   * Upload files whose paths were scraped out of tool results or the model's
+   * own text.
+   *
+   * This is a file-exfiltration path independent of `toolMessages`: turning
+   * tool messages off does not disable it, and any path the model can name is
+   * read from disk and sent to the channel. It is therefore opt-in and off by
+   * default.
+   */
+  private async uploadDetectedFiles(
+    context: SlackEventContext,
+    toolResultsBuffer: string,
+    responseBuffer: string,
+  ): Promise<void> {
+    if (!AUTO_UPLOAD_FILES) return
+
+    const uploaded = new Set<string>()
+    for (const imagePath of [...extractImagePaths(toolResultsBuffer), ...extractImagePaths(responseBuffer)]) {
+      if (uploaded.has(imagePath)) continue
+      if (!fs.existsSync(imagePath)) continue
+      uploaded.add(imagePath)
+      this.log(`Uploading image: ${imagePath}`)
+      await this.uploadImage(context.channelId, imagePath, this.threadIsolation ? context.replyThreadTs : undefined)
     }
   }
 

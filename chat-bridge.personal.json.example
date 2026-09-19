@@ -63,6 +63,7 @@
     "allowedChannels": ["CREPLACEWITHCHANNELID"],
     "threadIsolation": true,
     "respondToThreadReplies": true,
+    "autoUploadFiles": false,
     "logInboundMessages": false
   },
 
