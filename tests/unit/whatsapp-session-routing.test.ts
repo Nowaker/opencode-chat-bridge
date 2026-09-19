@@ -195,3 +195,75 @@ describe("a denied group names itself", () => {
     expect(lines.some((line) => line.includes(OTHER_GROUP))).toBe(true)
   })
 })
+
+describe("an allowlist matching nothing names the groups it can see", () => {
+  type Roster = Record<string, { subject?: string }>
+
+  function withRoster(groups: Roster | (() => Promise<Roster>), extra: Record<string, unknown> = {}) {
+    const built = buildConnector()
+    const lines: string[] = []
+    ;(built.connector as any).log = (message: string) => void lines.push(message)
+    ;(built.connector as any).logError = (message: string) => void lines.push(message)
+    ;(built.connector as any).sock = {
+      sendMessage: async () => ({ key: { id: "x" } }),
+      groupFetchAllParticipating: typeof groups === "function" ? groups : async () => groups,
+      ...extra,
+    }
+    return { ...built, lines }
+  }
+
+  const survey = (connector: WhatsAppConnector) => (connector as any).surveyGroups()
+
+  test("prints every jid with its subject when none of them is allowlisted", async () => {
+    const { connector, lines } = withRoster({
+      [OTHER_GROUP]: { subject: "Vibeterm AI" },
+      "120363111111111111@g.us": { subject: "Weekend plans" },
+    })
+
+    await survey(connector)
+
+    expect(lines.some((line) => line.includes(OTHER_GROUP) && line.includes("Vibeterm AI"))).toBe(true)
+    expect(lines.some((line) => line.includes("Weekend plans"))).toBe(true)
+  })
+
+  test("stays silent once one of them is allowlisted", async () => {
+    const { connector, lines } = withRoster({
+      [GROUP]: { subject: "Vibeterm AI" },
+      [OTHER_GROUP]: { subject: "Weekend plans" },
+    })
+
+    await survey(connector)
+
+    expect(lines.some((line) => line.includes(OTHER_GROUP))).toBe(false)
+  })
+
+  test("seeds the subject cache so a later denial needs no second query", async () => {
+    let metadataCalls = 0
+    const { connector, lines } = withRoster(
+      { [OTHER_GROUP]: { subject: "Vibeterm AI" } },
+      {
+        groupMetadata: async () => {
+          metadataCalls += 1
+          return { subject: "Vibeterm AI" }
+        },
+      },
+    )
+
+    await survey(connector)
+    lines.length = 0
+    await (connector as any).handleMessage(inbound({ id: "d1", remoteJid: OTHER_GROUP }))
+
+    expect(metadataCalls).toBe(0)
+    expect(lines.some((line) => line.includes(`${OTHER_GROUP} ("Vibeterm AI")`))).toBe(true)
+  })
+
+  test("survives a socket that cannot list groups", async () => {
+    const { connector, lines } = withRoster(async () => {
+      throw new Error("not authorized")
+    })
+
+    await survey(connector)
+
+    expect(lines.some((line) => line.includes("not authorized"))).toBe(true)
+  })
+})

@@ -861,8 +861,21 @@ export abstract class BaseConnector<TSession extends BaseSession> {
     return channelId
   }
 
+  /**
+   * Allowlist membership, without narrating a refusal.
+   *
+   * `isChannelAllowed` logs because it answers "may I act on this message?",
+   * and a message that goes nowhere has to say so. A caller that is surveying
+   * instead - asking which of the channels it can see are configured - is not
+   * holding a message, so the same log would describe traffic that never
+   * arrived, once per channel.
+   */
+  protected isChannelAllowedQuietly(channelId: string): boolean {
+    return isAllowedId(channelId, this.allowedChannels)
+  }
+
   protected isChannelAllowed(channelId: string): boolean {
-    const allowed = isAllowedId(channelId, this.allowedChannels)
+    const allowed = this.isChannelAllowedQuietly(channelId)
     if (!allowed) {
       this.log(`[IGNORED] Message from non-allowed channel: ${this.describeChannel(channelId)}`)
     }

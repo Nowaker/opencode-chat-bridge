@@ -281,6 +281,7 @@ export class WhatsAppConnector extends BaseConnector<ChatSession> {
         console.log(`  My number: ${this.myNumber}`)
         console.log(`  Own IDs: ${Array.from(this.ownIds).join(", ") || "pending"}`)
         console.log(`  Respond to others: ${RESPOND_TO_OTHERS ? "yes" : "no"}`)
+        await this.surveyGroups()
         this.log("Listening for messages...")
       }
 
@@ -353,6 +354,47 @@ export class WhatsAppConnector extends BaseConnector<ChatSession> {
         .catch(failed)
     } catch (err) {
       failed(err)
+    }
+  }
+
+  /**
+   * List the groups this account is in, once per connection.
+   *
+   * The roster is printed only when the allowlist matches NONE of them, which
+   * is the one state an operator cannot get out of unaided: the bridge is
+   * connected, can enumerate groups, and will act on none of them. Testing the
+   * allowlist against the live roster rather than asking whether it is empty
+   * also catches a placeholder value, and speaks up again if the configured
+   * group is later left or deleted. Once a real group matches, this is silent.
+   *
+   * A jid is not discoverable from WhatsApp itself, so the alternative is to
+   * provoke a denial and read the jid out of the refusal - which needs someone
+   * to send a message into a group the bridge is ignoring.
+   *
+   * NOTHING HERE MAY THROW: it is awaited inside the `connection.update`
+   * handler, so a rejection surfaces as an unhandled rejection on an otherwise
+   * working bridge.
+   */
+  private async surveyGroups(): Promise<void> {
+    const sock = this.sock
+    if (!sock) return
+    try {
+      const entries = Object.entries(await sock.groupFetchAllParticipating())
+      for (const [jid, meta] of entries) {
+        if (meta.subject) this.groupSubjects.set(jid, meta.subject)
+      }
+      if (entries.length === 0) {
+        this.log("This account is in no groups.")
+        return
+      }
+      if (entries.some(([jid]) => this.isChannelAllowedQuietly(jid))) return
+      this.log(`This account is in ${entries.length} group(s), none of them allowlisted:`)
+      for (const [jid, meta] of entries) {
+        this.log(`  ${jid} ${meta.subject ? `"${meta.subject}"` : "(unnamed)"}`)
+      }
+      this.log("Set WHATSAPP_ALLOWED_GROUPS to the jid this bridge should read.")
+    } catch (err) {
+      this.logError(`Could not list this account's groups: ${err instanceof Error ? err.message : String(err)}`)
     }
   }
 
