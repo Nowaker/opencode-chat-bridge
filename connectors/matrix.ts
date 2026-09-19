@@ -71,6 +71,7 @@ const ENV_ALLOWED_USERS = parseCsvList(process.env.MATRIX_ALLOWED_USERS)
 const ALLOWED_USERS = ENV_ALLOWED_USERS.length > 0 ? ENV_ALLOWED_USERS : config.matrix.allowedUsers
 const ENV_ALLOWED_ROOMS = parseCsvList(process.env.MATRIX_ALLOWED_ROOMS)
 const ALLOWED_ROOMS = ENV_ALLOWED_ROOMS.length > 0 ? ENV_ALLOWED_ROOMS : config.matrix.allowedRooms
+const LOG_INBOUND_MESSAGES = config.matrix.logInboundMessages
 const IGNORE_ROOMS = new Set(config.matrix.ignoreRooms)
 
 // Storage paths
@@ -377,6 +378,17 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
   // Event handling
   // ---------------------------------------------------------------------------
 
+  /**
+   * Log an inbound message without writing its body to stdout by default.
+   * This connector decrypts an E2EE room to work, so printing the body would
+   * put in the process log exactly what the room's encryption keeps off the
+   * wire. Every inbound handler routes through here.
+   */
+  private logInbound(label: string, sender: string, sessionId: string, text: string): void {
+    const detail = LOG_INBOUND_MESSAGES ? text : `${text.length} chars`
+    this.log(`[${label}] ${sender} in ${sessionId}: ${detail}`)
+  }
+
   private async handleRoomMessage(roomId: string, event: any): Promise<void> {
     const message = new MessageEvent(event)
 
@@ -438,7 +450,7 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
     }) && this.sessionManager.has(context.sessionId)) {
       // Implicit thread follow-up
       query = body
-      this.log(`[THREAD] ${message.sender} in ${context.sessionId}: ${body}`)
+      this.logInbound("THREAD", message.sender, context.sessionId, body)
     } else {
       return
     }
@@ -451,7 +463,7 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
     const permissionReply = async (text: string) => { await this.sendReply(context, text) }
     if (await this.handlePermissionReply(context.sessionId, message.sender, query, permissionReply)) return
 
-    this.log(`[MSG] ${message.sender} in ${context.sessionId}: ${body}`)
+    this.logInbound("MSG", message.sender, context.sessionId, body)
 
     await this.stopMirrorForUserActivity(context.sessionId, query, async (text) => {
       await this.sendNoticeReply(context, text)
@@ -469,7 +481,7 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
         return
       }
 
-      this.log(`[CMD] Forwarding to OpenCode: ${query}`)
+      this.logInbound("CMD", message.sender, context.sessionId, query)
       if (!this.checkRateLimit(message.sender)) return
       await this.processQuery(context, query)
       return

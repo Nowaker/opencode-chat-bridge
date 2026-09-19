@@ -56,7 +56,8 @@
     "allowedRooms": [],
     "formatHtml": false,
     "threadIsolation": true,
-    "respondToThreadReplies": true
+    "respondToThreadReplies": true,
+    "logInboundMessages": false
   },
   "mattermost": {
     "enabled": false,

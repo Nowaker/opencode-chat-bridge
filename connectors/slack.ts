@@ -53,6 +53,7 @@ const ENV_ALLOWED_USERS = parseCsvList(process.env.SLACK_ALLOWED_USERS)
 const ALLOWED_USERS = ENV_ALLOWED_USERS.length > 0 ? ENV_ALLOWED_USERS : config.slack.allowedUsers
 const ENV_ALLOWED_CHANNELS = parseCsvList(process.env.SLACK_ALLOWED_CHANNELS)
 const ALLOWED_CHANNELS = ENV_ALLOWED_CHANNELS.length > 0 ? ENV_ALLOWED_CHANNELS : config.slack.allowedChannels
+const LOG_INBOUND_MESSAGES = config.slack.logInboundMessages
 
 function parseSessionRetentionMins(env: NodeJS.ProcessEnv): number {
   const raw = env.SESSION_RETENTION_MINS
@@ -299,7 +300,7 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
       if (!this.isUserAllowed(context.userId)) return
       const sessionId = resolveSessionId(context.channelId, context.replyThreadTs, this.threadIsolation)
       this.touchSessionActivity(sessionId)
-      this.log(`[MENTION] ${context.userId} in ${sessionId}: ${context.text}`)
+      this.logInbound("MENTION", context.userId, sessionId, context.text)
 
       const query = context.text.replace(/<@[A-Z0-9]+>/g, "").trim()
       if (!query) return
@@ -338,7 +339,7 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
       if (!this.isUserAllowed(context.userId)) return
       const sessionId = resolveSessionId(context.channelId, context.replyThreadTs, this.threadIsolation)
       this.touchSessionActivity(sessionId)
-      this.log(`[MSG] ${context.userId} in ${sessionId}: ${context.text}`)
+      this.logInbound("MSG", context.userId, sessionId, context.text)
 
       const match = context.text.match(new RegExp(`^${TRIGGER}\\s+(.+)`, "i"))
       if (!match) return
@@ -408,7 +409,7 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
         return
       }
 
-      this.log(`[THREAD] ${context.userId} in ${sessionId}: ${context.text}`)
+      this.logInbound("THREAD", context.userId, sessionId, context.text)
       this.touchSessionActivity(sessionId)
       if (await this.interceptPermissionReply(context, sessionId, context.text.trim(), client)) return
       await this.stopMirrorForUserActivity(sessionId, context.text.trim(), async (text) => {
@@ -470,6 +471,16 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
       text,
       (reply) => this.sendReply(slackClient, context, reply),
     )
+  }
+
+  /**
+   * Log an inbound message without writing its body to stdout by default.
+   * Bridge logs are not a private surface, and every inbound handler routes
+   * through here so a new one cannot quietly start printing message text.
+   */
+  private logInbound(label: string, userId: string, sessionId: string, text: string): void {
+    const detail = LOG_INBOUND_MESSAGES ? text : `${text.length} chars`
+    this.log(`[${label}] ${userId} in ${sessionId}: ${detail}`)
   }
 
   /**

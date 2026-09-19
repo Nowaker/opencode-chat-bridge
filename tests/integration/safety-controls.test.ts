@@ -890,3 +890,184 @@ for (const [name, drive] of ANSWER_DRIVERS) {
     })
   })
 }
+
+// =============================================================================
+// Inbound message bodies stay out of the process log
+// =============================================================================
+
+/**
+ * `logInboundMessages` is read once at module scope, exactly as it is under
+ * `bun connectors/slack.ts`. An in-process test cannot tell a connector that
+ * consults the flag from one that ignores it, so these run the real connector
+ * in a process whose chat-bridge.json sets it, drive its real inbound
+ * handlers, and assert on everything the process printed -- not on the logging
+ * helper. A log site that bypasses the gate fails them wherever it lives.
+ */
+
+const INBOUND_MARKER = ["DEPLOY", "TOKEN"].join("_") + "=zzz-synthetic-inbound-marker"
+
+interface InboundLogRun {
+  output: string
+  labels: string[]
+}
+
+function driveInboundLogging(
+  connector: "slack" | "matrix",
+  logInboundMessages: boolean,
+): InboundLogRun {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `bridge-inbound-${connector}-`))
+  fs.writeFileSync(path.join(dir, "chat-bridge.json"), JSON.stringify({
+    trigger: "!oc",
+    rateLimitSeconds: 0,
+    sessionStorePath: path.join(dir, "sessions.json"),
+    [connector]: { logInboundMessages },
+  }))
+
+  const preamble = connector === "slack"
+    ? `
+    const { SlackConnector } = await import(REPO + "/connectors/slack.ts")
+    const connector = new SlackConnector()
+    connector.allowedUsers = new Set([${JSON.stringify(SLACK_OWNER)}])
+    connector.allowedChannels = new Set([${JSON.stringify(SLACK_CHANNEL)}])
+    connector.processQuery = async () => {}
+
+    const handlers = {}
+    connector.registerHandlers({
+      event: (_name, fn) => { handlers.mention = fn },
+      message: (first, second) => {
+        if (typeof first === "function") handlers.thread = first
+        else handlers.trigger = second
+      },
+    })
+
+    const slackClient = {
+      chat: { postMessage: async () => ({ ts: "ts-1" }), update: async () => {} },
+    }
+    connector.sessionManager.set(${JSON.stringify(SLACK_CHANNEL)} + ":" + ${JSON.stringify(SLACK_ROOT_TS)}, {
+      client: {}, createdAt: new Date(), lastActivity: new Date(),
+      messageCount: 0, inputChars: 0, outputChars: 0,
+    })
+
+    const envelope = (text, ts, threadTs) => ({
+      message: { text, user: ${JSON.stringify(SLACK_OWNER)}, channel: ${JSON.stringify(SLACK_CHANNEL)}, ts, ...(threadTs ? { thread_ts: threadTs } : {}) },
+      body: { team_id: "T04FXV713" },
+      client: slackClient,
+    })
+
+    await handlers.mention({
+      event: { channel: ${JSON.stringify(SLACK_CHANNEL)}, user: ${JSON.stringify(SLACK_OWNER)}, text: "<@U0BOT> " + MARKER, ts: "1700000000.000201" },
+      body: { team_id: "T04FXV713" },
+      client: slackClient,
+    })
+    await handlers.trigger(envelope("!oc " + MARKER, "1700000000.000202"))
+    await handlers.thread(envelope("plain follow-up " + MARKER, "1700000000.000203", ${JSON.stringify(SLACK_ROOT_TS)}))
+  `
+    : `
+    const { MatrixConnector } = await import(REPO + "/connectors/matrix.ts")
+    const connector = new MatrixConnector()
+    connector.matrix = {
+      getUserId: async () => ${JSON.stringify(MATRIX_BOT)},
+      getJoinedRoomMembers: async () => [${JSON.stringify(MATRIX_BOT)}, ${JSON.stringify(MATRIX_OWNER)}, ${JSON.stringify(MATRIX_STRANGER)}],
+      sendMessage: async () => "$sent",
+      sendNotice: async () => {},
+      sendText: async () => {},
+    }
+    connector.allowedUsers = new Set([${JSON.stringify(MATRIX_OWNER)}])
+    connector.allowedChannels = new Set([${JSON.stringify(MATRIX_ROOM)}])
+    connector.processQuery = async () => {}
+    connector.sessionManager.set(${JSON.stringify(MATRIX_ROOM)} + ":" + ${JSON.stringify(MATRIX_ROOT)}, {
+      client: {}, createdAt: new Date(), lastActivity: new Date(),
+      messageCount: 0, inputChars: 0, outputChars: 0, lastEventIds: new Map(),
+    })
+
+    let seq = 0
+    const deliver = (body, root) => connector.handleRoomMessage(${JSON.stringify(MATRIX_ROOM)}, {
+      type: "m.room.message",
+      event_id: "$in-" + ++seq,
+      sender: ${JSON.stringify(MATRIX_OWNER)},
+      content: {
+        msgtype: "m.text",
+        body,
+        ...(root ? { "m.relates_to": { rel_type: "m.thread", event_id: root } } : {}),
+      },
+    })
+
+    await deliver("!oc " + MARKER)
+    await deliver("!oc /init " + MARKER)
+    await deliver("plain follow-up " + MARKER, ${JSON.stringify(MATRIX_ROOT)})
+  `
+
+  const script = path.join(dir, "drive.ts")
+  fs.writeFileSync(script, `
+    const REPO = ${JSON.stringify(REPO_ROOT)}
+    const MARKER = ${JSON.stringify(INBOUND_MARKER)}
+
+    const seen = []
+    for (const stream of ["log", "error"]) {
+      const original = console[stream].bind(console)
+      console[stream] = (...args) => {
+        seen.push(args.map(String).join(" "))
+        original(...args)
+      }
+    }
+
+    ${preamble}
+
+    const labels = [...new Set(
+      seen.flatMap((line) => line.match(/\\[(MENTION|MSG|THREAD|CMD)\\]/g) || [])
+        .map((tag) => tag.slice(1, -1)),
+    )]
+    console.log("RESULT:" + JSON.stringify({ labels }))
+  `)
+
+  const result = spawnSync("bun", [script], { cwd: dir, encoding: "utf-8", timeout: 60_000 })
+  const payload = (result.stdout || "").split("RESULT:")[1]
+  if (!payload) {
+    throw new Error(`driver produced no result\nstdout: ${result.stdout}\nstderr: ${result.stderr}`)
+  }
+
+  return {
+    output: `${result.stdout || ""}\n${result.stderr || ""}`,
+    labels: JSON.parse(payload.trim()).labels,
+  }
+}
+
+describe("inbound message bodies in the process log", () => {
+  test("slack logs every inbound path, so the assertions below are not vacuous", () => {
+    const run = driveInboundLogging("slack", false)
+
+    expect(run.labels.sort()).toEqual(["MENTION", "MSG", "THREAD"])
+  })
+
+  test("slack withholds the body by default", () => {
+    const run = driveInboundLogging("slack", false)
+
+    expect(run.output).not.toContain(INBOUND_MARKER)
+    expect(run.output).toMatch(/\[MSG\][^\n]*\d+ chars/)
+  })
+
+  test("slack writes the body when the flag asks for it", () => {
+    const run = driveInboundLogging("slack", true)
+
+    expect(run.output).toContain(INBOUND_MARKER)
+  })
+
+  test("matrix logs every inbound path, so the assertions below are not vacuous", () => {
+    const run = driveInboundLogging("matrix", false)
+
+    expect(run.labels.sort()).toEqual(["CMD", "MSG", "THREAD"])
+  })
+
+  test("matrix withholds the decrypted body by default", () => {
+    const run = driveInboundLogging("matrix", false)
+
+    expect(run.output).not.toContain(INBOUND_MARKER)
+    expect(run.output).toMatch(/\[MSG\][^\n]*\d+ chars/)
+  })
+
+  test("matrix writes the decrypted body when the flag asks for it", () => {
+    const run = driveInboundLogging("matrix", true)
+
+    expect(run.output).toContain(INBOUND_MARKER)
+  })
+})

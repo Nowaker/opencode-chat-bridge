@@ -29,6 +29,10 @@ export interface MatrixConfig {
   formatHtml: boolean
   threadIsolation: boolean  // true: per-thread sessions + thread replies, false: per-room
   respondToThreadReplies: boolean // Forward plain replies in active threads
+  /** Write inbound message bodies to stdout. The connector must decrypt an
+   *  E2EE room to work at all, so without this the plaintext lands in the
+   *  process log that encryption exists to avoid. */
+  logInboundMessages: boolean
 }
 
 export interface MattermostConfig {
@@ -276,6 +280,7 @@ const defaultConfig: ChatBridgeConfig = {
     formatHtml: false,
     threadIsolation: true,  // Per-thread sessions by default
     respondToThreadReplies: true,
+    logInboundMessages: false,
   },
   mattermost: {
     enabled: false,

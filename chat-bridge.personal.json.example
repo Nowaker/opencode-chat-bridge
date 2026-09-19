@@ -62,7 +62,8 @@
     "allowedUsers": ["UREPLACEWITHYOURMEMBERID"],
     "allowedChannels": ["CREPLACEWITHCHANNELID"],
     "threadIsolation": true,
-    "respondToThreadReplies": true
+    "respondToThreadReplies": true,
+    "logInboundMessages": false
   },
 
   "whatsapp": {
@@ -94,7 +95,8 @@
     "allowedRooms": ["!replacewithinternalroomid:matrix.example.net"],
     "formatHtml": false,
     "threadIsolation": true,
-    "respondToThreadReplies": true
+    "respondToThreadReplies": true,
+    "logInboundMessages": false
   },
 
   "mattermost": { "enabled": false },
