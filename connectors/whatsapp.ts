@@ -99,6 +99,14 @@ export class WhatsAppConnector extends BaseConnector<ChatSession> {
   private ownIds = new Set<string>()
   private composingTokens = new Map<string, symbol>()
   private sentMessageIds = new Set<string>()
+  /**
+   * Group subjects, keyed by jid. An empty value means a lookup is in flight,
+   * so a busy group is asked about once rather than once per message. Filled
+   * from the ONE live socket: a second Baileys connection on this identity is
+   * evicted by the server with `conflict: replaced`, so there is no separate
+   * place to ask.
+   */
+  private groupSubjects = new Map<string, string>()
 
   constructor() {
     super({
@@ -309,6 +317,44 @@ export class WhatsAppConnector extends BaseConnector<ChatSession> {
   // ---------------------------------------------------------------------------
   // WhatsApp-specific: Message handling
   // ---------------------------------------------------------------------------
+
+  protected describeChannel(channelId: string): string {
+    if (!channelId.endsWith("@g.us")) return channelId
+    const subject = this.groupSubjects.get(channelId)
+    if (subject) return `${channelId} ("${subject}")`
+    if (subject === undefined) this.lookupGroupSubject(channelId)
+    return channelId
+  }
+
+  /**
+   * Ask the socket for a group's name, once, in the background.
+   *
+   * NOTHING HERE MAY THROW, hence the `try` around a call that already has a
+   * `.catch`. It runs inside the denial path, which runs inside `handleMessage`,
+   * which is awaited in a loop over the whole `messages.upsert` batch - so an
+   * exception raised while merely composing a log line aborts that loop and
+   * silently drops the ALLOWED messages queued behind the denied one. Measured:
+   * removing the `try` fails two tests in `whatsapp-session-routing.test.ts`.
+   */
+  private lookupGroupSubject(channelId: string): void {
+    const sock = this.sock
+    if (!sock) return
+    this.groupSubjects.set(channelId, "")
+    const failed = (err: unknown): void => {
+      this.groupSubjects.delete(channelId)
+      this.logError(`Could not read the name of group ${channelId}: ${err instanceof Error ? err.message : String(err)}`)
+    }
+    try {
+      void Promise.resolve(sock.groupMetadata(channelId))
+        .then(meta => {
+          this.groupSubjects.set(channelId, meta.subject)
+          this.log(`Group ${channelId} is named "${meta.subject}"`)
+        })
+        .catch(failed)
+    } catch (err) {
+      failed(err)
+    }
+  }
 
   private async handleMessage(msg: any): Promise<void> {
     const chatId = msg.key.remoteJid

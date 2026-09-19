@@ -122,3 +122,76 @@ describe("WhatsApp session routing", () => {
     expect(routed).toHaveLength(1)
   })
 })
+
+describe("a denied group names itself", () => {
+  function withSocket(groupMetadata?: () => Promise<{ subject: string }>) {
+    const built = buildConnector()
+    const lines: string[] = []
+    ;(built.connector as any).log = (message: string) => void lines.push(message)
+    ;(built.connector as any).logError = (message: string) => void lines.push(message)
+    ;(built.connector as any).sock = {
+      sendMessage: async () => ({ key: { id: "x" } }),
+      ...(groupMetadata ? { groupMetadata } : {}),
+    }
+    return { ...built, lines }
+  }
+
+  const settle = async () => {
+    await Promise.resolve()
+    await Promise.resolve()
+  }
+
+  async function deny(connector: WhatsAppConnector, id: string) {
+    await (connector as any).handleMessage(inbound({ id, remoteJid: OTHER_GROUP }))
+  }
+
+  test("asks the socket once however many messages the group sends", async () => {
+    let calls = 0
+    const { connector, lines } = withSocket(async () => {
+      calls += 1
+      return { subject: "Vibeterm AI" }
+    })
+
+    await deny(connector, "d1")
+    await deny(connector, "d2")
+    await settle()
+
+    expect(calls).toBe(1)
+    expect(lines.some((line) => line.includes('is named "Vibeterm AI"'))).toBe(true)
+  })
+
+  test("carries the name inline once it is known", async () => {
+    const { connector, lines } = withSocket(async () => ({ subject: "Vibeterm AI" }))
+
+    await deny(connector, "d1")
+    await settle()
+    lines.length = 0
+    await deny(connector, "d2")
+
+    expect(lines.some((line) => line.includes(`${OTHER_GROUP} ("Vibeterm AI")`))).toBe(true)
+  })
+
+  test("asks again after a failed lookup rather than staying silent forever", async () => {
+    let calls = 0
+    const { connector } = withSocket(async () => {
+      calls += 1
+      throw new Error("not a participant")
+    })
+
+    await deny(connector, "d1")
+    await settle()
+    await deny(connector, "d2")
+    await settle()
+
+    expect(calls).toBe(2)
+  })
+
+  test("still refuses the message when the socket cannot name the group", async () => {
+    const { connector, routed, lines } = withSocket()
+
+    await deny(connector, "d1")
+
+    expect(routed).toHaveLength(0)
+    expect(lines.some((line) => line.includes(OTHER_GROUP))).toBe(true)
+  })
+})

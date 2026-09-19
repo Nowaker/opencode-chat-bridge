@@ -849,10 +849,22 @@ export abstract class BaseConnector<TSession extends BaseSession> {
     return allowed
   }
 
+  /**
+   * The channel id plus whatever human-readable name the connector can supply.
+   *
+   * A denial is the one message that asks an operator to make a decision - does
+   * this channel belong in the allowlist? - and an opaque id answers nothing.
+   * A WhatsApp group is a jid like `120363000000000000@g.us`, which appears
+   * nowhere in the app, so the log names a channel nobody can identify.
+   */
+  protected describeChannel(channelId: string): string {
+    return channelId
+  }
+
   protected isChannelAllowed(channelId: string): boolean {
     const allowed = isAllowedId(channelId, this.allowedChannels)
     if (!allowed) {
-      this.log(`[IGNORED] Message from non-allowed channel: ${channelId}`)
+      this.log(`[IGNORED] Message from non-allowed channel: ${this.describeChannel(channelId)}`)
     }
     return allowed
   }
