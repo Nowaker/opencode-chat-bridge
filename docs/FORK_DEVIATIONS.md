@@ -137,19 +137,38 @@ its own pass.
 - Inbound text is never redacted. The model needs what the human actually
   typed, and the flag governs what leaves the bridge, not what enters it.
 
-## 7. WhatsApp file upload and message logging are opt-in
+## 7. File upload and message logging are opt-in
 
 **Upstream:** scrapes file paths out of tool results *and* out of the model's
 own prose, reads them from disk and uploads them. Writes inbound message bodies
 to stdout. Neither is affected by `toolMessages`.
 
-**This fork:** `whatsapp.autoUploadFiles` and `whatsapp.logInboundMessages`,
-both default false.
+**This fork:** `autoUploadFiles` and `logInboundMessages` on WhatsApp and
+Slack, and `logInboundMessages` on Matrix. All default false.
 
 **Why:** the upload path means any path the model can name is sufficient to
 exfiltrate a file, and turning tool messages off does not disable it, so
 suppressing tool messages alone is not an output boundary. The log path puts
-the owner's own correspondence in the bridge log.
+the owner's own correspondence in the bridge log. On Matrix the connector must
+decrypt an E2EE room to work at all, so logging the body puts into the process
+log exactly what the room's encryption keeps off the wire.
+
+**Notes:**
+
+- With logging off, each connector still records the sender, the session and a
+  character count, which is what routing bugs are actually diagnosed from.
+- Each connector funnels every inbound handler through one `logInbound()`
+  helper rather than gating each call site, so a handler added later cannot
+  quietly start printing bodies.
+- Coverage by connector, so the absences read as known rather than accidental:
+
+  | Connector | `logInboundMessages` | `autoUploadFiles` |
+  |---|---|---|
+  | WhatsApp | honoured | honoured |
+  | Slack | honoured | honoured |
+  | Matrix | honoured | not declared -- uploads unconditionally |
+  | Discord, Mattermost, Telegram | not declared -- logs bodies | not declared -- uploads unconditionally |
+  | Web | not declared -- does not log bodies | not declared -- uploads unconditionally |
 
 ## 8. Permissions round-trip to chat
 

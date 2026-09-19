@@ -866,19 +866,20 @@ Answer in the thread that asked. Each connector treats its own session key as th
 
 Interactive **questions** (opencode's `question` tool and Vibeterm's `vibeterm_async_question`) are **not reachable over ACP at all** and no setting enables them. See [Fork deviations](FORK_DEVIATIONS.md#interactive-questions-over-acp).
 
-### WhatsApp output boundary
+### Per-connector output boundary
 
 ```json
 {
-  "whatsapp": {
-    "autoUploadFiles": false,
-    "logInboundMessages": false
-  }
+  "whatsapp": { "autoUploadFiles": false, "logInboundMessages": false },
+  "slack":    { "autoUploadFiles": false, "logInboundMessages": false },
+  "matrix":   { "logInboundMessages": false }
 }
 ```
 
 - `autoUploadFiles` (default `false`) controls whether file paths found in tool results *or in the model's own prose* are read from disk and uploaded to the chat. Upstream does this unconditionally, independently of `toolMessages`, so turning tool messages off does not disable it there.
-- `logInboundMessages` (default `false`) controls whether inbound message bodies are written to stdout. With it off, the connector logs the sender and a character count only.
+- `logInboundMessages` (default `false`) controls whether inbound message bodies are written to stdout. With it off, the connector logs the sender, the session and a character count only -- enough to diagnose routing without putting correspondence in `docker logs`. On Matrix this matters most: the connector decrypts an E2EE room to work, so logging the body puts into the process log exactly what the room's encryption keeps off the wire.
+
+These keys exist only where the connector reads them, and setting one on a connector that does not read it does nothing. **Matrix does not declare `autoUploadFiles` and uploads scraped paths unconditionally; Discord, Mattermost, Telegram and Web declare neither key.** See [Fork deviations](FORK_DEVIATIONS.md#7-file-upload-and-message-logging-are-opt-in) for the per-connector table.
 
 Every outbound WhatsApp text is prefixed with exactly `[AI] `, including every chunk of a split message, at a single send boundary. This is not configurable: the bridge sends as the owner's own account, so the marker is the only thing separating its messages from theirs.
 

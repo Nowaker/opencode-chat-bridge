@@ -302,8 +302,9 @@ Denying tools is not the whole boundary; what the bridge *says* is the other hal
 - Tool calls reach chat as structured summaries built from `toolMessages.summaries` allowlists, never as raw arguments or raw results. Both allowlists default to empty.
 - Whole raw tool results need `toolMessages.showOutputFor` **and** `safeOutput.allowRawToolOutput`, the latter defaulting to false.
 - `safeOutput.redactSecrets` (default true) masks credential shapes in everything sent, as a backstop behind those allowlists.
-- `whatsapp.autoUploadFiles` (default false) disables reading file paths out of tool results or model prose and uploading them. Upstream does this unconditionally, independently of tool-message settings, so suppressing tool messages there is not an output boundary.
-- `whatsapp.logInboundMessages` (default false) keeps the owner's correspondence out of the bridge log.
+- `autoUploadFiles` (default false, on WhatsApp and Slack) disables reading file paths out of tool results or model prose and uploading them. Upstream does this unconditionally, independently of tool-message settings, so suppressing tool messages there is not an output boundary. **Matrix does not have this key and uploads unconditionally.**
+- `logInboundMessages` (default false, on WhatsApp, Slack and Matrix) keeps the owner's correspondence out of the bridge log. It matters most on Matrix, where the connector decrypts an E2EE room to work and would otherwise print the plaintext to stdout.
+- Neither key exists on Discord, Mattermost, Telegram or Web. All four upload scraped paths unconditionally; Discord, Mattermost and Telegram also log inbound bodies. Matrix uploads unconditionally too.
 
 ### Approving Permissions From Chat
 
@@ -430,7 +431,8 @@ Before deploying:
 - [ ] `safeOutput.redactSecrets` is true
 - [ ] `safeOutput.allowRawToolOutput` is false unless raw tool results are genuinely wanted in chat
 - [ ] `toolMessages.summaries.allowedFields` lists only fields safe to publish
-- [ ] `whatsapp.autoUploadFiles` and `whatsapp.logInboundMessages` are false unless deliberately wanted
+- [ ] `autoUploadFiles` and `logInboundMessages` are false on every connector that declares them, unless deliberately wanted
+- [ ] You accept that a connector without those keys logs inbound bodies and uploads scraped paths regardless
 - [ ] `permissions.timeoutSeconds` is short enough that a blocked agent is not stuck for long
 - [ ] `acp.sessionCwd`, if set, points at a directory you accept sharing a project identity with
 - [ ] Access tokens are in environment variables
