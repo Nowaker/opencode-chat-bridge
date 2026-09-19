@@ -33,6 +33,10 @@ export interface MatrixConfig {
    *  E2EE room to work at all, so without this the plaintext lands in the
    *  process log that encryption exists to avoid. */
   logInboundMessages: boolean
+  /** Send files to the room: paths named in tool results or model text, and
+   *  image bytes the agent emits inline. Broader than the WhatsApp and Slack
+   *  key of the same name, which covers named paths only. */
+  autoUploadFiles: boolean
 }
 
 export interface MattermostConfig {
@@ -281,6 +285,7 @@ const defaultConfig: ChatBridgeConfig = {
     threadIsolation: true,  // Per-thread sessions by default
     respondToThreadReplies: true,
     logInboundMessages: false,
+    autoUploadFiles: false,
   },
   mattermost: {
     enabled: false,

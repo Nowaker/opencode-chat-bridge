@@ -1172,3 +1172,121 @@ describe("slack scraped-path uploads", () => {
     expect(driveSlackUpload(true).uploads).toHaveLength(1)
   })
 })
+
+// =============================================================================
+// Matrix file uploads
+// =============================================================================
+
+/**
+ * Matrix can put a file from this machine into a room three ways: a path named
+ * in the model's own answer, a path named in a tool result, and image bytes
+ * the agent emits inline. The first two are read from disk by the BRIDGE, so
+ * the agent's tool permissions never see the read, and `allowRawToolOutput`
+ * does not stop them -- it suppresses printing, while the buffers those paths
+ * are scraped from fill first.
+ *
+ * Each case drives the real handleRoomMessage with the deployed policy's
+ * output settings, so a site that reaches uploadContent without consulting the
+ * gate fails these wherever it lives.
+ */
+interface MatrixUploadRun {
+  uploaded: string[]
+  answered: boolean
+}
+
+type MatrixUploadCase = "modelNamesPath" | "toolResultCarriesPath" | "agentEmitsBase64"
+
+function driveMatrixUpload(which: MatrixUploadCase, autoUploadFiles: boolean): MatrixUploadRun {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-matrix-upload-"))
+  const secretFile = path.join(dir, "private-chart.png")
+  fs.writeFileSync(secretFile, "PRIVATE-DESKTOP-FILE-CONTENTS")
+
+  fs.writeFileSync(path.join(dir, "chat-bridge.json"), JSON.stringify({
+    trigger: "!oc",
+    rateLimitSeconds: 0,
+    sessionStorePath: path.join(dir, "sessions.json"),
+    // The deployed policy: tool messages off, raw tool output withheld.
+    toolMessages: { mode: "off", showOutputFor: [] },
+    safeOutput: { redactSecrets: true, allowRawToolOutput: false },
+    matrix: { autoUploadFiles },
+  }))
+
+  const emit = {
+    modelNamesPath: `client.emit("chunk", "Here you go. Path: " + FILE)`,
+    toolResultCarriesPath: `
+      client.emit("update", { type: "tool_result", toolName: "read", toolResult: "[DOCLIBRARY_IMAGE]" + FILE + "[/DOCLIBRARY_IMAGE]" })
+      client.emit("chunk", "done")`,
+    agentEmitsBase64: `
+      client.emit("image", { type: "image", mimeType: "image/png", data: Buffer.from("INLINE-AGENT-BYTES").toString("base64"), alt: "chart" })
+      client.emit("chunk", "done")`,
+  }[which]
+
+  const script = path.join(dir, "drive.ts")
+  fs.writeFileSync(script, `
+    const REPO = ${JSON.stringify(REPO_ROOT)}
+    const FILE = ${JSON.stringify(secretFile)}
+    const { EventEmitter } = await import("events")
+    const { MatrixConnector } = await import(REPO + "/connectors/matrix.ts")
+
+    const connector = new MatrixConnector()
+    const uploaded = []
+    const said = []
+    connector.matrix = {
+      getUserId: async () => ${JSON.stringify(MATRIX_BOT)},
+      getJoinedRoomMembers: async () => [${JSON.stringify(MATRIX_BOT)}, ${JSON.stringify(MATRIX_OWNER)}, ${JSON.stringify(MATRIX_STRANGER)}],
+      uploadContent: async (buffer, _mime, name) => { uploaded.push(buffer.toString()); return "mxc://example/" + name },
+      sendMessage: async (_room, content) => { if (content && content.body) said.push(String(content.body)); return "$sent" },
+      sendNotice: async () => {},
+      sendText: async (_room, text) => { said.push(String(text)) },
+    }
+    connector.allowedUsers = new Set([${JSON.stringify(MATRIX_OWNER)}])
+    connector.allowedChannels = new Set([${JSON.stringify(MATRIX_ROOM)}])
+
+    const client = new EventEmitter()
+    client.availableCommands = []
+    client.prompt = async () => { ${emit}; return "done" }
+
+    connector.sessionManager.set(${JSON.stringify(MATRIX_ROOM)} + ":" + ${JSON.stringify(MATRIX_ROOT)}, {
+      client, createdAt: new Date(), lastActivity: new Date(),
+      messageCount: 0, inputChars: 0, outputChars: 0, lastEventIds: new Map(),
+    })
+
+    await connector.handleRoomMessage(${JSON.stringify(MATRIX_ROOM)}, {
+      type: "m.room.message",
+      event_id: ${JSON.stringify(MATRIX_ROOT)},
+      sender: ${JSON.stringify(MATRIX_OWNER)},
+      content: { msgtype: "m.text", body: "!oc show me the chart" },
+    })
+
+    console.log("RESULT:" + JSON.stringify({ uploaded, answered: said.length > 0 }))
+  `)
+
+  const result = spawnSync("bun", [script], { cwd: dir, encoding: "utf-8", timeout: 60_000 })
+  const payload = (result.stdout || "").split("RESULT:")[1]
+  if (!payload) {
+    throw new Error(`driver produced no result\nstdout: ${result.stdout}\nstderr: ${result.stderr}`)
+  }
+  return JSON.parse(payload.trim())
+}
+
+const MATRIX_UPLOAD_CASES: Array<[MatrixUploadCase, string, string]> = [
+  ["modelNamesPath", "a path the model merely named in its answer", "PRIVATE-DESKTOP-FILE-CONTENTS"],
+  ["toolResultCarriesPath", "a path carried in a withheld tool result", "PRIVATE-DESKTOP-FILE-CONTENTS"],
+  ["agentEmitsBase64", "image bytes the agent emitted inline", "INLINE-AGENT-BYTES"],
+]
+
+describe("matrix file uploads", () => {
+  for (const [which, description, contents] of MATRIX_UPLOAD_CASES) {
+    test(`the turn completes for ${description}, so the assertions below are not vacuous`, () => {
+      expect(driveMatrixUpload(which, true).answered).toBe(true)
+    })
+
+    test(`withholds ${description} by default`, () => {
+      expect(driveMatrixUpload(which, false).uploaded).toEqual([])
+    })
+
+    test(`sends ${description} when the flag asks for it`, () => {
+      expect(driveMatrixUpload(which, true).uploaded).toEqual([contents])
+    })
+  }
+})

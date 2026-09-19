@@ -57,6 +57,7 @@
     "formatHtml": false,
     "threadIsolation": true,
     "respondToThreadReplies": true,
+    "autoUploadFiles": false,
     "logInboundMessages": false
   },
   "mattermost": {

@@ -73,6 +73,9 @@ function fakeConnector(firstResponse: string, retryResponse: string, firstEmitsC
       updateToolActivityMessage: async () => {},
       sendImageFromBase64: async () => {},
       sendImageFromFile: async () => {},
+      // The real method, so its upload gate stays exercised here rather than
+      // being stubbed away along with the senders it calls.
+      uploadDetectedFiles: (MatrixConnector.prototype as any).uploadDetectedFiles,
       log: (message: string) => logs.push(message),
       logError: (message: string) => logs.push(message),
     },

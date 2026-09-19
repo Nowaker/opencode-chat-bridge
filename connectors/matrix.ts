@@ -72,6 +72,7 @@ const ALLOWED_USERS = ENV_ALLOWED_USERS.length > 0 ? ENV_ALLOWED_USERS : config.
 const ENV_ALLOWED_ROOMS = parseCsvList(process.env.MATRIX_ALLOWED_ROOMS)
 const ALLOWED_ROOMS = ENV_ALLOWED_ROOMS.length > 0 ? ENV_ALLOWED_ROOMS : config.matrix.allowedRooms
 const LOG_INBOUND_MESSAGES = config.matrix.logInboundMessages
+const AUTO_UPLOAD_FILES = config.matrix.autoUploadFiles
 const IGNORE_ROOMS = new Set(config.matrix.ignoreRooms)
 
 // Storage paths
@@ -728,24 +729,7 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
         return
       }
 
-      const uploadedPaths = new Set<string>()
-      const toolPaths = extractImagePaths(attempt.toolResultsBuffer)
-      for (const imagePath of toolPaths) {
-        if (fs.existsSync(imagePath)) {
-          this.log(`Uploading image from tool result: ${imagePath}`)
-          await this.sendImageFromFile(context, imagePath)
-          uploadedPaths.add(imagePath)
-        }
-      }
-
-      const responsePaths = extractImagePaths(attempt.responseBuffer)
-      for (const imagePath of responsePaths) {
-        if (uploadedPaths.has(imagePath)) continue
-        if (fs.existsSync(imagePath)) {
-          this.log(`Uploading image from response: ${imagePath}`)
-          await this.sendImageFromFile(context, imagePath)
-        }
-      }
+      await this.uploadDetectedFiles(context, attempt.toolResultsBuffer, attempt.responseBuffer)
 
       session.outputChars += cleanResponse.length
       await this.sendReply(context, cleanResponse)
@@ -781,7 +765,35 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
   // Image sending (thread-aware)
   // ---------------------------------------------------------------------------
 
+  /**
+   * Upload files whose paths were named in tool results or in the model's own
+   * text.
+   *
+   * The bridge itself opens these paths, so the agent's tool permissions never
+   * see the read: naming a path that happens to exist is enough to move the
+   * file. `toolMessages` does not constrain it either -- the buffers are
+   * filled before the show/hide decision, which only suppresses printing.
+   */
+  private async uploadDetectedFiles(
+    context: MatrixEventContext,
+    toolResultsBuffer: string,
+    responseBuffer: string,
+  ): Promise<void> {
+    if (!AUTO_UPLOAD_FILES) return
+
+    const uploaded = new Set<string>()
+    for (const imagePath of [...extractImagePaths(toolResultsBuffer), ...extractImagePaths(responseBuffer)]) {
+      if (uploaded.has(imagePath)) continue
+      if (!fs.existsSync(imagePath)) continue
+      uploaded.add(imagePath)
+      this.log(`Uploading image: ${imagePath}`)
+      await this.sendImageFromFile(context, imagePath)
+    }
+  }
+
   private async sendImageFromBase64(context: MatrixEventContext, image: ImageContent): Promise<void> {
+    if (!AUTO_UPLOAD_FILES) return
+
     try {
       const buffer = Buffer.from(image.data, "base64")
       const mxcUrl = await this.matrix!.uploadContent(buffer, image.mimeType, image.alt || "image.png")
@@ -815,6 +827,10 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
   }
 
   private async sendImageFromFile(context: MatrixEventContext, filePath: string): Promise<void> {
+    // Both senders check the flag themselves, so every path to uploadContent
+    // is covered no matter which call site reaches it.
+    if (!AUTO_UPLOAD_FILES) return
+
     try {
       if (!fs.existsSync(filePath)) {
         this.logError(`Image file not found: ${filePath}`)
