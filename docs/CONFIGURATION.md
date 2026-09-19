@@ -872,14 +872,16 @@ Interactive **questions** (opencode's `question` tool and Vibeterm's `vibeterm_a
 {
   "whatsapp": { "autoUploadFiles": false, "logInboundMessages": false },
   "slack":    { "autoUploadFiles": false, "logInboundMessages": false },
-  "matrix":   { "logInboundMessages": false }
+  "matrix":   { "autoUploadFiles": false, "logInboundMessages": false }
 }
 ```
 
-- `autoUploadFiles` (default `false`) controls whether file paths found in tool results *or in the model's own prose* are read from disk and uploaded to the chat. Upstream does this unconditionally, independently of `toolMessages`, so turning tool messages off does not disable it there.
+- `autoUploadFiles` (default `false`) controls whether file paths found in tool results *or in the model's own prose* are read from disk and uploaded to the chat. Upstream does this unconditionally, independently of `toolMessages`, so turning tool messages off does not disable it there. On Matrix the key is wider: it also covers image bytes the agent emits inline.
+
+  **Nothing else stops an upload.** Denying tools in `opencode.json` does not, because when the model merely names a path the *bridge* opens the file and no tool call happens. `safeOutput.allowRawToolOutput: false` does not, because the buffers those paths are scraped from are filled before the show/hide decision, which only suppresses printing. Measured, not assumed -- see [Fork deviations](FORK_DEVIATIONS.md#7-file-upload-and-message-logging-are-opt-in).
 - `logInboundMessages` (default `false`) controls whether inbound message bodies are written to stdout. With it off, the connector logs the sender, the session and a character count only -- enough to diagnose routing without putting correspondence in `docker logs`. On Matrix this matters most: the connector decrypts an E2EE room to work, so logging the body puts into the process log exactly what the room's encryption keeps off the wire.
 
-These keys exist only where the connector reads them, and setting one on a connector that does not read it does nothing. **Matrix does not declare `autoUploadFiles` and uploads scraped paths unconditionally; Discord, Mattermost, Telegram and Web declare neither key.** See [Fork deviations](FORK_DEVIATIONS.md#7-file-upload-and-message-logging-are-opt-in) for the per-connector table.
+These keys exist only where the connector reads them, and setting one on a connector that does not read it does nothing. **Discord, Mattermost, Telegram and Web declare neither key: they upload scraped paths unconditionally, and all but Web also log inbound bodies.** See [Fork deviations](FORK_DEVIATIONS.md#7-file-upload-and-message-logging-are-opt-in) for the per-connector table.
 
 Every outbound WhatsApp text is prefixed with exactly `[AI] `, including every chunk of a split message, at a single send boundary. This is not configurable: the bridge sends as the owner's own account, so the marker is the only thing separating its messages from theirs.
 

@@ -143,8 +143,8 @@ its own pass.
 own prose, reads them from disk and uploads them. Writes inbound message bodies
 to stdout. Neither is affected by `toolMessages`.
 
-**This fork:** `autoUploadFiles` and `logInboundMessages` on WhatsApp and
-Slack, and `logInboundMessages` on Matrix. All default false.
+**This fork:** `autoUploadFiles` and `logInboundMessages` on WhatsApp, Slack
+and Matrix. All default false.
 
 **Why:** the upload path means any path the model can name is sufficient to
 exfiltrate a file, and turning tool messages off does not disable it, so
@@ -153,6 +153,27 @@ the owner's own correspondence in the bridge log. On Matrix the connector must
 decrypt an E2EE room to work at all, so logging the body puts into the process
 log exactly what the room's encryption keeps off the wire.
 
+**Why the upload path is not constrained by tool permissions.** This is the
+part most likely to be misjudged, so it is stated explicitly rather than left
+to inference. Measured on Matrix under `toolMessages.mode: "off"`,
+`showOutputFor: []` and `safeOutput.allowRawToolOutput: false`, with an agent
+policy denying `edit`, `write`, `bash`, `task`, `webfetch` and `websearch`,
+all three upload routes still fired:
+
+1. The model **names a path in its own answer**. No tool call occurs, so the
+   agent's permission system is never consulted -- the *bridge* opens the file
+   with `fs.readFileSync`. Denying every tool does not close this.
+2. A path arrives **inside a tool result**. `allowRawToolOutput: false` does
+   not close this either: the buffer the path is scraped from is appended to
+   *before* the show/hide branch, and that branch only suppresses printing.
+   The connector logs `[RESULT] Skipping read result` and then uploads the
+   file named in the result it just declined to show.
+3. The agent **emits image bytes inline**, which are relayed as-is.
+
+So `autoUploadFiles` is the only thing that stops an upload. Nothing in the
+agent policy, and nothing in `toolMessages` or `safeOutput`, substitutes for
+it.
+
 **Notes:**
 
 - With logging off, each connector still records the sender, the session and a
@@ -160,15 +181,34 @@ log exactly what the room's encryption keeps off the wire.
 - Each connector funnels every inbound handler through one `logInbound()`
   helper rather than gating each call site, so a handler added later cannot
   quietly start printing bodies.
-- Coverage by connector, so the absences read as known rather than accidental:
+- `autoUploadFiles` covers a **wider** set on Matrix than elsewhere: scraped
+  paths *and* inline agent image bytes. On WhatsApp and Slack it covers
+  scraped paths only, and WhatsApp's inline relay is ungated. Slack has no
+  inline relay at all. This divergence is deliberate -- Matrix is the deployed
+  connector and the one where a room is expected to be private -- and is
+  recorded at the key's declaration too. Aligning WhatsApp is an open
+  decision, not an oversight.
+- On Matrix the guard sits inside both functions that call `uploadContent`,
+  not at their call sites, so every route is covered by construction and a
+  call site added later is covered too.
+- Coverage by connector, so the absences read as known rather than accidental.
+  Every connector scrapes paths and uploads them; the column says whether
+  anything can stop it:
 
   | Connector | `logInboundMessages` | `autoUploadFiles` |
   |---|---|---|
-  | WhatsApp | honoured | honoured |
-  | Slack | honoured | honoured |
-  | Matrix | honoured | not declared -- uploads unconditionally |
-  | Discord, Mattermost, Telegram | not declared -- logs bodies | not declared -- uploads unconditionally |
+  | WhatsApp | honoured | honoured (scraped paths; inline relay ungated) |
+  | Slack | honoured | honoured (scraped paths; no inline relay) |
+  | Matrix | honoured | honoured (scraped paths **and** inline relay) |
+  | Discord | not declared -- logs bodies | not declared -- uploads unconditionally |
+  | Mattermost | not declared -- logs bodies | not declared -- uploads unconditionally |
+  | Telegram | not declared -- logs bodies | not declared -- uploads unconditionally |
   | Web | not declared -- does not log bodies | not declared -- uploads unconditionally |
+
+  Discord, Mattermost, Telegram and Web are disabled in this deployment, which
+  is why they are documented rather than fixed. Enabling any of them means
+  accepting unconditional uploads and, for the first three, inbound bodies in
+  the log. Telegram and Web additionally upload *documents*, not only images.
 
 ## 8. Permissions round-trip to chat
 

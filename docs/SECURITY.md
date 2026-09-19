@@ -302,9 +302,11 @@ Denying tools is not the whole boundary; what the bridge *says* is the other hal
 - Tool calls reach chat as structured summaries built from `toolMessages.summaries` allowlists, never as raw arguments or raw results. Both allowlists default to empty.
 - Whole raw tool results need `toolMessages.showOutputFor` **and** `safeOutput.allowRawToolOutput`, the latter defaulting to false.
 - `safeOutput.redactSecrets` (default true) masks credential shapes in everything sent, as a backstop behind those allowlists.
-- `autoUploadFiles` (default false, on WhatsApp and Slack) disables reading file paths out of tool results or model prose and uploading them. Upstream does this unconditionally, independently of tool-message settings, so suppressing tool messages there is not an output boundary. **Matrix does not have this key and uploads unconditionally.**
+- `autoUploadFiles` (default false, on WhatsApp, Slack and Matrix) disables reading file paths out of tool results or model prose and uploading them. On Matrix it also covers image bytes the agent emits inline.
 - `logInboundMessages` (default false, on WhatsApp, Slack and Matrix) keeps the owner's correspondence out of the bridge log. It matters most on Matrix, where the connector decrypts an E2EE room to work and would otherwise print the plaintext to stdout.
-- Neither key exists on Discord, Mattermost, Telegram or Web. All four upload scraped paths unconditionally; Discord, Mattermost and Telegram also log inbound bodies. Matrix uploads unconditionally too.
+- Neither key exists on Discord, Mattermost, Telegram or Web. All four upload scraped paths unconditionally; Discord, Mattermost and Telegram also log inbound bodies.
+
+**Denying tools does not stop an upload.** This is the least intuitive property here, so treat it as load-bearing: when the model simply *names* a local path in its answer, no tool call occurs and the **bridge** reads the file itself. An agent policy denying `read`, `bash`, `edit` and everything else leaves that path wide open. `safeOutput.allowRawToolOutput: false` does not close it either -- the buffer a path is scraped from is filled *before* the show/hide branch, which only suppresses printing, so a connector can log that it is withholding a tool result and then upload the file named inside it. `autoUploadFiles` is the only control that stops an upload.
 
 ### Approving Permissions From Chat
 
