@@ -739,6 +739,10 @@ export class WhatsAppConnector extends BaseConnector<ChatSession> {
   // ---------------------------------------------------------------------------
 
   private async sendImageFromBase64(chatId: string, image: ImageContent): Promise<void> {
+    // Not redundant with uploadDetectedFiles: the agent's own `image` event
+    // reaches this sender directly, so only a check here can stop bytes an
+    // approved read returned inline rather than as a path.
+    if (!AUTO_UPLOAD_FILES) return
     if (!this.sock) return
 
     try {
@@ -756,6 +760,7 @@ export class WhatsAppConnector extends BaseConnector<ChatSession> {
   }
 
   private async sendImageFromFile(chatId: string, filePath: string): Promise<void> {
+    if (!AUTO_UPLOAD_FILES) return
     if (!this.sock) return
 
     try {
@@ -778,6 +783,7 @@ export class WhatsAppConnector extends BaseConnector<ChatSession> {
   // ---------------------------------------------------------------------------
 
   private async sendDocumentFromFile(chatId: string, filePath: string): Promise<void> {
+    if (!AUTO_UPLOAD_FILES) return
     if (!this.sock) return
 
     try {

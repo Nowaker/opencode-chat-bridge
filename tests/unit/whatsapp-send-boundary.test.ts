@@ -86,7 +86,7 @@ describe("WhatsApp send boundary", () => {
     expect(sent[0].content.edit).toBeDefined()
   })
 
-  test("marks image captions", async () => {
+  test("withholds an inline image while uploads are off", async () => {
     await (connector as any).sendImageFromBase64("123@g.us", {
       type: "image",
       mimeType: "image/png",
@@ -94,7 +94,7 @@ describe("WhatsApp send boundary", () => {
       alt: "chart",
     })
 
-    expect(sent[0].content.caption).toBe("[AI] chart")
+    expect(sent).toHaveLength(0)
   })
 
   test("sends nothing for blank text rather than a bare marker", async () => {

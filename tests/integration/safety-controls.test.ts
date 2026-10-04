@@ -1290,3 +1290,131 @@ describe("matrix file uploads", () => {
     })
   }
 })
+
+/**
+ * WhatsApp can put a file from this machine into a group the same three ways,
+ * and until this commit only the first two were stoppable: `uploadDetectedFiles`
+ * held the flag, while the agent's own `image` event reached
+ * `sendImageFromBase64` directly. So a file an approved `read` returned as
+ * BYTES was uploaded under `autoUploadFiles:false` -- the one case the deployed
+ * policy was relying on that flag to cover.
+ *
+ * Each case drives the real handleMessage with the deployed output settings, so
+ * a sender that reaches sock.sendMessage with a buffer without consulting the
+ * gate fails these wherever it lives.
+ */
+interface WhatsAppUploadRun {
+  uploaded: string[]
+  captions: string[]
+  answered: boolean
+}
+
+type WhatsAppUploadCase = "modelNamesPath" | "toolResultCarriesPath" | "agentEmitsBase64"
+
+function driveWhatsAppUpload(which: WhatsAppUploadCase, autoUploadFiles: boolean): WhatsAppUploadRun {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-whatsapp-upload-"))
+  const secretFile = path.join(dir, "private-chart.png")
+  fs.writeFileSync(secretFile, "PRIVATE-DESKTOP-FILE-CONTENTS")
+
+  fs.writeFileSync(path.join(dir, "chat-bridge.json"), JSON.stringify({
+    trigger: "!oc",
+    rateLimitSeconds: 0,
+    sessionStorePath: path.join(dir, "sessions.json"),
+    // The deployed policy: tool messages off, raw tool output withheld.
+    toolMessages: { mode: "off", showOutputFor: [] },
+    safeOutput: { redactSecrets: true, allowRawToolOutput: false },
+    whatsapp: {
+      authFolder: path.join(dir, "wa-auth"),
+      allowedUsers: [OWNER],
+      allowedGroups: [GROUP],
+      respondToOthers: true,
+      autoUploadFiles,
+    },
+  }))
+
+  const emit = {
+    modelNamesPath: `client.emit("chunk", "Here you go. Path: " + FILE)`,
+    toolResultCarriesPath: `
+      client.emit("update", { type: "tool_result", toolName: "read", toolResult: "[DOCLIBRARY_IMAGE]" + FILE + "[/DOCLIBRARY_IMAGE]" })
+      client.emit("chunk", "done")`,
+    agentEmitsBase64: `
+      client.emit("image", { type: "image", mimeType: "image/png", data: Buffer.from("INLINE-AGENT-BYTES").toString("base64"), alt: "chart" })
+      client.emit("chunk", "done")`,
+  }[which]
+
+  const script = path.join(dir, "drive.ts")
+  fs.writeFileSync(script, `
+    const REPO = ${JSON.stringify(REPO_ROOT)}
+    const FILE = ${JSON.stringify(secretFile)}
+    const GROUP = ${JSON.stringify(GROUP)}
+    const OWNER = ${JSON.stringify(OWNER)}
+    const { EventEmitter } = await import("events")
+    const { WhatsAppConnector } = await import(REPO + "/connectors/whatsapp.ts")
+
+    const connector = new WhatsAppConnector()
+    const uploaded = []
+    const captions = []
+    const said = []
+    let counter = 0
+    connector.sock = {
+      sendMessage: async (_chatId, content) => {
+        const payload = content.image || content.document
+        if (payload) {
+          uploaded.push(Buffer.from(payload).toString())
+          if (typeof content.caption === "string") captions.push(content.caption)
+        } else if (typeof content.text === "string") said.push(content.text)
+        return { key: { id: "emitted-" + ++counter, fromMe: true } }
+      },
+      sendPresenceUpdate: async () => {},
+    }
+
+    const client = new EventEmitter()
+    client.availableCommands = []
+    client.prompt = async () => { ${emit}; return "done" }
+
+    connector.sessionManager.set(GROUP, {
+      client, createdAt: new Date(), lastActivity: new Date(),
+      messageCount: 0, inputChars: 0, outputChars: 0,
+    })
+
+    await connector.handleMessage({
+      key: { id: "inbound-1", remoteJid: GROUP, participant: OWNER + "@s.whatsapp.net", fromMe: false },
+      message: { conversation: "!oc show me the chart" },
+    })
+
+    console.log("RESULT:" + JSON.stringify({ uploaded, captions, answered: said.length > 0 }))
+  `)
+
+  const result = spawnSync("bun", [script], { cwd: dir, encoding: "utf-8", timeout: 60_000 })
+  const payload = (result.stdout || "").split("RESULT:")[1]
+  if (!payload) {
+    throw new Error(`driver produced no result\nstdout: ${result.stdout}\nstderr: ${result.stderr}`)
+  }
+  return JSON.parse(payload.trim())
+}
+
+const WHATSAPP_UPLOAD_CASES: Array<[WhatsAppUploadCase, string, string]> = [
+  ["modelNamesPath", "a path the model merely named in its answer", "PRIVATE-DESKTOP-FILE-CONTENTS"],
+  ["toolResultCarriesPath", "a path carried in a withheld tool result", "PRIVATE-DESKTOP-FILE-CONTENTS"],
+  ["agentEmitsBase64", "image bytes the agent emitted inline", "INLINE-AGENT-BYTES"],
+]
+
+describe("whatsapp file uploads", () => {
+  for (const [which, description, contents] of WHATSAPP_UPLOAD_CASES) {
+    test(`the turn completes for ${description}, so the assertions below are not vacuous`, () => {
+      expect(driveWhatsAppUpload(which, true).answered).toBe(true)
+    })
+
+    test(`withholds ${description} by default`, () => {
+      expect(driveWhatsAppUpload(which, false).uploaded).toEqual([])
+    })
+
+    test(`sends ${description} when the flag asks for it`, () => {
+      expect(driveWhatsAppUpload(which, true).uploaded).toEqual([contents])
+    })
+  }
+
+  test("an upload the flag allows still carries the marker", () => {
+    expect(driveWhatsAppUpload("agentEmitsBase64", true).captions).toEqual(["[AI] chart"])
+  })
+})
