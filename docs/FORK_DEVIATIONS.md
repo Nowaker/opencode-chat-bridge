@@ -190,9 +190,17 @@ all three upload routes still fired:
    file named in the result it just declined to show.
 3. The agent **emits image bytes inline**, which are relayed as-is.
 
-So `autoUploadFiles` is the only thing that stops an upload. Nothing in the
-agent policy, and nothing in `toolMessages` or `safeOutput`, substitutes for
-it.
+So on Matrix, which is where this was measured, `autoUploadFiles` is the only
+thing that stops any of the three. Nothing in the agent policy, and nothing in
+`toolMessages` or `safeOutput`, substitutes for it.
+
+**That sentence does not generalise to route 3, and the limit matters.** The
+key covers routes 1 and 2 everywhere it is declared, but route 3 only on
+Matrix: WhatsApp's inline relay consults no flag at all, and Slack has no
+inline relay to consult one. So on WhatsApp the only control on route 3 is the
+`read` permission that produced the bytes - a real gate while `read` is `ask`,
+and none at all if `read` is ever granted silently or for a whole directory.
+The table below is the per-connector version of this.
 
 **Notes:**
 
@@ -203,11 +211,21 @@ it.
   quietly start printing bodies.
 - `autoUploadFiles` covers a **wider** set on Matrix than elsewhere: scraped
   paths *and* inline agent image bytes. On WhatsApp and Slack it covers
-  scraped paths only, and WhatsApp's inline relay is ungated. Slack has no
-  inline relay at all. This divergence is deliberate -- Matrix is the deployed
-  connector and the one where a room is expected to be private -- and is
-  recorded at the key's declaration too. Aligning WhatsApp is an open
-  decision, not an oversight.
+    scraped paths only, and WhatsApp's inline relay is ungated. Slack has no
+    inline relay at all. This divergence is deliberate -- Matrix is the deployed
+    connector and the one where a room is expected to be private -- and is
+    recorded at the key's declaration too.
+  - **Aligning WhatsApp was decided, and the answer is no.** It is settled
+    rather than open: bytes an approved `read` puts in the model's context can
+    leave in any shape the model chooses -- described, transcribed, re-encoded,
+    or invented outright -- so guarding the one emitter that sends them *as a
+    file* changes their form on the way out rather than whether they go. The
+    approval of the read is the real boundary, and it is the operator's to give.
+    An implementation that closes WhatsApp's inline relay exists and is
+    deliberately unmerged on `feat/whatsapp-upload-gate`, with its tests, so the
+    measurement survives the decision. Do not align the connectors in either
+    direction without reopening this: adding the guard to WhatsApp closes
+    nothing, and removing Matrix's guard is a loosening.
 - On Matrix the guard sits inside both functions that call `uploadContent`,
   not at their call sites, so every route is covered by construction and a
   call site added later is covered too.
