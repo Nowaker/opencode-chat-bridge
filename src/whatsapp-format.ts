@@ -2,16 +2,28 @@
  * WhatsApp outbound text formatting.
  *
  * Every byte of text this bridge puts into WhatsApp passes through here so the
- * `[AI] ` marker cannot be forgotten at a new call site.
+ * marker cannot be forgotten at a new call site.
  */
 
-export const AI_PREFIX = "[AI] "
+import { getConfig } from "./config"
+
+export const DEFAULT_AI_PREFIX = "[AI] "
+
+/**
+ * The configured marker, read per call rather than captured at import, so a
+ * test that reloads the config sees the new value.
+ *
+ * `normalizeWhatsApp` guarantees it is non-blank; see the reason there.
+ */
+export function aiPrefix(): string {
+  return getConfig().whatsapp.aiPrefix
+}
 
 /** Conservative ceiling for a single WhatsApp text message. */
 export const WHATSAPP_MAX_MESSAGE_LENGTH = 4000
 
 export function applyAiPrefix(text: string): string {
-  return `${AI_PREFIX}${text}`
+  return `${aiPrefix()}${text}`
 }
 
 /**
@@ -29,7 +41,7 @@ export function buildAiMessageChunks(
   const body = text.trim()
   if (!body) return []
 
-  const budget = Math.max(1, maxLen - AI_PREFIX.length)
+  const budget = Math.max(1, maxLen - aiPrefix().length)
   const chunks: string[] = []
   let remaining = body
 
@@ -57,5 +69,5 @@ export function buildAiMessageChunks(
  * not carry the marker are still processed normally.
  */
 export function looksLikeBridgeEcho(text: string): boolean {
-  return text.startsWith(AI_PREFIX)
+  return text.startsWith(aiPrefix())
 }

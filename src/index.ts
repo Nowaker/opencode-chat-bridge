@@ -61,7 +61,8 @@ export {
 } from "./connector-base"
 
 export {
-  AI_PREFIX,
+  DEFAULT_AI_PREFIX,
+  aiPrefix,
   WHATSAPP_MAX_MESSAGE_LENGTH,
   applyAiPrefix,
   buildAiMessageChunks,

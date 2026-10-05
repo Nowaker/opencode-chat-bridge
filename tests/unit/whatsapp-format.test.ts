@@ -2,18 +2,24 @@
  * Unit tests for whatsapp-format.ts
  */
 
-import { describe, test, expect } from "bun:test"
+import { describe, test, expect, afterEach } from "bun:test"
+import * as fs from "fs"
+import * as os from "os"
+import * as path from "path"
+import { clearConfigCache, loadConfig } from "../../src/config"
 import {
-  AI_PREFIX,
+  DEFAULT_AI_PREFIX,
+  aiPrefix,
   WHATSAPP_MAX_MESSAGE_LENGTH,
   applyAiPrefix,
   buildAiMessageChunks,
   looksLikeBridgeEcho,
 } from "../../src/whatsapp-format"
 
-describe("AI_PREFIX", () => {
-  test("is exactly the required marker", () => {
-    expect(AI_PREFIX).toBe("[AI] ")
+describe("aiPrefix", () => {
+  test("defaults to the required marker", () => {
+    expect(DEFAULT_AI_PREFIX).toBe("[AI] ")
+    expect(aiPrefix()).toBe("[AI] ")
   })
 })
 
@@ -39,7 +45,7 @@ describe("buildAiMessageChunks", () => {
 
     expect(chunks.length).toBeGreaterThan(1)
     for (const chunk of chunks) {
-      expect(chunk.startsWith(AI_PREFIX)).toBe(true)
+      expect(chunk.startsWith(aiPrefix())).toBe(true)
     }
   })
 
@@ -59,7 +65,7 @@ describe("buildAiMessageChunks", () => {
 
     expect(chunks.length).toBeGreaterThan(1)
     for (const chunk of chunks) {
-      expect(chunk.startsWith(AI_PREFIX)).toBe(true)
+      expect(chunk.startsWith(aiPrefix())).toBe(true)
       expect(chunk.length).toBeLessThanOrEqual(200)
     }
   })
@@ -67,7 +73,7 @@ describe("buildAiMessageChunks", () => {
   test("preserves the full message body across chunks", () => {
     const body = Array.from({ length: 40 }, (_, i) => `line-${i}`).join("\n")
     const chunks = buildAiMessageChunks(body, 60)
-    const rejoined = chunks.map((chunk) => chunk.slice(AI_PREFIX.length)).join("\n")
+    const rejoined = chunks.map((chunk) => chunk.slice(aiPrefix().length)).join("\n")
 
     expect(rejoined).toBe(body)
   })
@@ -77,7 +83,7 @@ describe("buildAiMessageChunks", () => {
 
     expect(chunks.length).toBeGreaterThan(1)
     for (const chunk of chunks) {
-      expect(chunk.startsWith(AI_PREFIX)).toBe(true)
+      expect(chunk.startsWith(aiPrefix())).toBe(true)
       expect(chunk.length).toBeLessThanOrEqual(100)
     }
   })
@@ -95,5 +101,61 @@ describe("looksLikeBridgeEcho", () => {
 
   test("does not treat a mention of the marker mid-text as an echo", () => {
     expect(looksLikeBridgeEcho("why does it print [AI] twice?")).toBe(false)
+  })
+})
+
+describe("a configured marker", () => {
+  const tempDirs: string[] = []
+
+  afterEach(() => {
+    clearConfigCache()
+    while (tempDirs.length > 0) {
+      fs.rmSync(tempDirs.pop()!, { recursive: true, force: true })
+    }
+  })
+
+  function loadWhatsAppConfig(whatsapp: Record<string, unknown>): void {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-prefix-"))
+    tempDirs.push(dir)
+    const configPath = path.join(dir, "chat-bridge.json")
+    fs.writeFileSync(configPath, JSON.stringify({ whatsapp }))
+    clearConfigCache()
+    loadConfig(configPath)
+  }
+
+  test("replaces the default at every call site", () => {
+    loadWhatsAppConfig({ aiPrefix: ">> " })
+
+    expect(aiPrefix()).toBe(">> ")
+    expect(applyAiPrefix("hello")).toBe(">> hello")
+    expect(buildAiMessageChunks("hello")).toEqual([">> hello"])
+    expect(looksLikeBridgeEcho(">> done")).toBe(true)
+    expect(looksLikeBridgeEcho("[AI] done")).toBe(false)
+  })
+
+  test("is refused when blank, which would match every inbound message", () => {
+    loadWhatsAppConfig({ aiPrefix: "   " })
+
+    expect(aiPrefix()).toBe(DEFAULT_AI_PREFIX)
+    expect(looksLikeBridgeEcho("what is the status?")).toBe(false)
+  })
+
+  test("is refused when not a string", () => {
+    loadWhatsAppConfig({ aiPrefix: 42 })
+
+    expect(aiPrefix()).toBe(DEFAULT_AI_PREFIX)
+  })
+
+  test("keeps chunks inside the platform limit even when longer", () => {
+    const marker = "[assistant-via-bridge] "
+    loadWhatsAppConfig({ aiPrefix: marker })
+
+    const chunks = buildAiMessageChunks("q".repeat(WHATSAPP_MAX_MESSAGE_LENGTH * 2))
+
+    expect(chunks.length).toBeGreaterThan(1)
+    for (const chunk of chunks) {
+      expect(chunk.startsWith(marker)).toBe(true)
+      expect(chunk.length).toBeLessThanOrEqual(WHATSAPP_MAX_MESSAGE_LENGTH)
+    }
   })
 })

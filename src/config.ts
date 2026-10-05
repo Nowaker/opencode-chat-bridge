@@ -64,6 +64,9 @@ export interface WhatsAppConfig {
   autoUploadFiles: boolean
   /** Write inbound message bodies to stdout. */
   logInboundMessages: boolean
+  /** Marker prepended to every outbound message. Also the fallback echo test,
+   *  so it is never empty. */
+  aiPrefix: string
 }
 
 export interface SlackConfig {
@@ -307,6 +310,7 @@ const defaultConfig: ChatBridgeConfig = {
     respondToOthers: true,
     autoUploadFiles: false,
     logInboundMessages: false,
+    aiPrefix: "[AI] ",
   },
   slack: {
     enabled: false,
@@ -474,6 +478,18 @@ function normalizePermissions(config: ChatBridgeConfig): void {
   }
 }
 
+function normalizeWhatsApp(config: ChatBridgeConfig): void {
+  // The marker doubles as looksLikeBridgeEcho's test, and every string starts
+  // with "", so an empty one would classify every inbound message as the
+  // bridge's own echo and the connector would answer nothing at all.
+  const fallback = defaultConfig.whatsapp.aiPrefix
+  const prefix = config.whatsapp.aiPrefix
+  if (typeof prefix !== "string" || prefix.trim() === "") {
+    console.warn(`[CONFIG] Invalid whatsapp.aiPrefix; using ${JSON.stringify(fallback)}`)
+    config.whatsapp.aiPrefix = fallback
+  }
+}
+
 function normalizeAllowlists(config: ChatBridgeConfig): void {
   config.slack.allowedChannels = normalizeStringList(config.slack.allowedChannels)
   config.matrix.allowedRooms = normalizeStringList(config.matrix.allowedRooms)
@@ -530,6 +546,7 @@ function normalizeConfig(config: ChatBridgeConfig): void {
   normalizeToolSummaries(config)
   normalizeSafeOutput(config)
   normalizePermissions(config)
+  normalizeWhatsApp(config)
   normalizeAllowlists(config)
   normalizeWebAttachments(config)
 }

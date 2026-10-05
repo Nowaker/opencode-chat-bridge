@@ -7,7 +7,7 @@
 
 import { describe, test, expect, beforeEach } from "bun:test"
 import { WhatsAppConnector } from "../../connectors/whatsapp"
-import { AI_PREFIX, WHATSAPP_MAX_MESSAGE_LENGTH } from "../../src/whatsapp-format"
+import { aiPrefix, WHATSAPP_MAX_MESSAGE_LENGTH } from "../../src/whatsapp-format"
 
 interface SentPayload {
   chatId: string
@@ -54,7 +54,7 @@ describe("WhatsApp send boundary", () => {
     const texts = textsOf(sent)
     expect(texts.length).toBeGreaterThan(1)
     for (const text of texts) {
-      expect(text.startsWith(AI_PREFIX)).toBe(true)
+      expect(text.startsWith(aiPrefix())).toBe(true)
       expect(text.length).toBeLessThanOrEqual(WHATSAPP_MAX_MESSAGE_LENGTH)
     }
   })
@@ -67,7 +67,7 @@ describe("WhatsApp send boundary", () => {
     const texts = textsOf(sent)
     expect(texts.length).toBeGreaterThan(1)
     for (const text of texts) {
-      expect(text.startsWith(AI_PREFIX)).toBe(true)
+      expect(text.startsWith(aiPrefix())).toBe(true)
     }
   })
 
@@ -82,7 +82,7 @@ describe("WhatsApp send boundary", () => {
 
     const texts = textsOf(sent)
     expect(texts).toHaveLength(1)
-    expect(texts[0].startsWith(AI_PREFIX)).toBe(true)
+    expect(texts[0].startsWith(aiPrefix())).toBe(true)
     expect(sent[0].content.edit).toBeDefined()
   })
 
@@ -107,7 +107,7 @@ describe("WhatsApp send boundary", () => {
     await connector.sendMessage("123@g.us", "the token is xoxb-1111111111-AAAAAAAAAAAA")
 
     const [text] = textsOf(sent)
-    expect(text.startsWith(AI_PREFIX)).toBe(true)
+    expect(text.startsWith(aiPrefix())).toBe(true)
     expect(text).not.toContain("xoxb-1111111111")
     expect(text).toContain("[redacted]")
   })
