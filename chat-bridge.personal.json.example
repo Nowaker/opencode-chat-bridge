@@ -74,7 +74,8 @@
     "allowedGroups": ["000000000000000000@g.us"],
     "respondToOthers": true,
     "autoUploadFiles": false,
-    "logInboundMessages": false
+    "logInboundMessages": false,
+    "aiPrefix": "[AI] "
   },
 
   "matrix": {

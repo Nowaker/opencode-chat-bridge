@@ -39,15 +39,15 @@ platform IDs (`C...`, `!room:server`, `...@g.us`). Display names are never
 matched: they are attacker-settable on all three platforms. The two gates are
 independent, so passing the user check does not imply the channel check.
 
-## 2. WhatsApp marks every outbound text `[AI] `
+## 2. WhatsApp marks every outbound text, with a configurable marker
 
 **Upstream:** prefixes `<botName>: `, and when a reply is long enough to split,
 only the first chunk is prefixed. Tool notices use a different `<botName>: > `
 shape. Each send site formats its own text.
 
 **This fork:** every outbound text passes through one send boundary that
-applies exactly `[AI] ` -- answers and each of their chunks, tool notices,
-errors, permission prompts, captions.
+applies `whatsapp.aiPrefix` -- answers and each of their chunks, tool notices,
+errors, permission prompts, captions. The default is `[AI] `.
 
 **Why:** the bridge sends as the owner's own WhatsApp account. In a group, a
 message from the bridge and a message from the human are the same sender, so
@@ -56,7 +56,27 @@ first chunk of a long answer and not the rest does not do that job.
 
 **Notes:** this is enforced at a choke point rather than requested of the
 model. An instruction to an LLM is not an enforcement mechanism. Chunking
-accounts for the prefix so a marked chunk still fits WhatsApp's limit.
+subtracts the prefix from the per-chunk budget rather than adding it
+afterwards, so prefixing can never push a chunk over WhatsApp's limit --
+including a marker longer than the default.
+
+**It is standardisation, not a security control.** The bridge runs as the same
+uid as everything else that can reach the account, so anything inside it could
+send unmarked. The marker's job is to tell a human reading the chat which lines
+the bridge wrote, and it does that job.
+
+**A blank marker is refused, and the reason is not tidiness.** The same string
+is `looksLikeBridgeEcho`'s test, and every string starts with `""`, so an empty
+marker classifies every inbound message as the bridge's own echo -- the
+connector would then answer nothing at all, silently, with no error and no log
+line explaining it. `normalizeWhatsApp` in `src/config.ts` warns and falls back
+to the default for a value that is absent, non-string or whitespace-only.
+
+**The marker is read per call, not captured at import.** A module-level
+constant cannot be exercised by a test that reloads the config, which is this
+suite's own pattern (`clearConfigCache()` then `loadConfig(path)`). Consumers
+call `aiPrefix()`; `DEFAULT_AI_PREFIX` is exported for callers that want the
+shipped value rather than the configured one.
 
 ## 3. WhatsApp echo rejection is identity-based
 

@@ -79,7 +79,8 @@
     "allowedGroups": [],
     "respondToOthers": true,
     "autoUploadFiles": false,
-    "logInboundMessages": false
+    "logInboundMessages": false,
+    "aiPrefix": "[AI] "
   },
   "slack": {
     "enabled": false,

@@ -870,20 +870,26 @@ Interactive **questions** (opencode's `question` tool and Vibeterm's `vibeterm_a
 
 ```json
 {
-  "whatsapp": { "autoUploadFiles": false, "logInboundMessages": false },
+  "whatsapp": { "autoUploadFiles": false, "logInboundMessages": false, "aiPrefix": "[AI] " },
   "slack":    { "autoUploadFiles": false, "logInboundMessages": false },
   "matrix":   { "autoUploadFiles": false, "logInboundMessages": false }
 }
 ```
 
-- `autoUploadFiles` (default `false`) controls whether file paths found in tool results *or in the model's own prose* are read from disk and uploaded to the chat. Upstream does this unconditionally, independently of `toolMessages`, so turning tool messages off does not disable it there. On Matrix the key is wider: it also covers image bytes the agent emits inline.
+- `autoUploadFiles` (default `false`) controls whether file paths found in tool results *or in the model's own prose* are read from disk and uploaded to the chat. Upstream does this unconditionally, independently of `toolMessages`, so turning tool messages off does not disable it there.
+
+  **On Matrix the key is wider, deliberately and asymmetrically:** it also covers image bytes the agent emits inline, which on WhatsApp it does not. So an image an approved `read` returned reaches a WhatsApp chat and not a Matrix room, with the same setting. That is a decision rather than a gap -- bytes an approved read puts in the model's context can leave in any shape the model picks, so guarding the one emitter that sends them as a *file* changes their form rather than whether they go, and the approval of the read is the real gate. Do not "align" the connectors in either direction without asking: widening WhatsApp closes nothing, and narrowing Matrix is a loosening.
 
   **Nothing else stops an upload.** Denying tools in `opencode.json` does not, because when the model merely names a path the *bridge* opens the file and no tool call happens. `safeOutput.allowRawToolOutput: false` does not, because the buffers those paths are scraped from are filled before the show/hide decision, which only suppresses printing. Measured, not assumed -- see [Fork deviations](FORK_DEVIATIONS.md#7-file-upload-and-message-logging-are-opt-in).
 - `logInboundMessages` (default `false`) controls whether inbound message bodies are written to stdout. With it off, the connector logs the sender, the session and a character count only -- enough to diagnose routing without putting correspondence in `docker logs`. On Matrix this matters most: the connector decrypts an E2EE room to work, so logging the body puts into the process log exactly what the room's encryption keeps off the wire.
 
 These keys exist only where the connector reads them, and setting one on a connector that does not read it does nothing. **Discord, Mattermost, Telegram and Web declare neither key: they upload scraped paths unconditionally, and all but Web also log inbound bodies.** See [Fork deviations](FORK_DEVIATIONS.md#7-file-upload-and-message-logging-are-opt-in) for the per-connector table.
 
-Every outbound WhatsApp text is prefixed with exactly `[AI] `, including every chunk of a split message, at a single send boundary. This is not configurable: the bridge sends as the owner's own account, so the marker is the only thing separating its messages from theirs.
+- `aiPrefix` (WhatsApp only, default `"[AI] "`) is the marker prepended to every outbound text, including every chunk of a split message, at a single send boundary. The bridge sends as the owner's own account, so the marker is the only thing separating its messages from theirs. Chunking subtracts the prefix from the per-chunk budget, so a longer marker still cannot push a chunk over WhatsApp's limit.
+
+  **A blank value is refused** and falls back to the default with a `[CONFIG]` warning. The same string is the fallback echo test, and every string starts with `""`, so an empty marker would classify every inbound message as the bridge's own echo and the connector would answer nothing at all -- silently, with nothing in the log to explain it.
+
+  It is standardisation rather than a security control: the bridge runs as the same uid as everything else that can reach the account. Its job is to tell a human reading the chat which lines the bridge wrote.
 
 ## Example Configurations
 
