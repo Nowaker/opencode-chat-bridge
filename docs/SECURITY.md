@@ -302,11 +302,27 @@ Denying tools is not the whole boundary; what the bridge *says* is the other hal
 - Tool calls reach chat as structured summaries built from `toolMessages.summaries` allowlists, never as raw arguments or raw results. Both allowlists default to empty.
 - Whole raw tool results need `toolMessages.showOutputFor` **and** `safeOutput.allowRawToolOutput`, the latter defaulting to false.
 - `safeOutput.redactSecrets` (default true) masks credential shapes in everything sent, as a backstop behind those allowlists.
-- `autoUploadFiles` (default false, on WhatsApp, Slack and Matrix) disables reading file paths out of tool results or model prose and uploading them. On Matrix it also covers image bytes the agent emits inline.
+- `autoUploadFiles` (default false, on WhatsApp, Slack and Matrix) disables reading file paths out of tool results or model prose and uploading them. **On Matrix it also covers image bytes the agent emits inline; on WhatsApp it does not.** See "Two upload routes" below -- the asymmetry is deliberate, and assuming symmetry is the mistake this section exists to prevent.
 - `logInboundMessages` (default false, on WhatsApp, Slack and Matrix) keeps the owner's correspondence out of the bridge log. It matters most on Matrix, where the connector decrypts an E2EE room to work and would otherwise print the plaintext to stdout.
 - Neither key exists on Discord, Mattermost, Telegram or Web. All four upload scraped paths unconditionally; Discord, Mattermost and Telegram also log inbound bodies.
 
-**Denying tools does not stop an upload.** This is the least intuitive property here, so treat it as load-bearing: when the model simply *names* a local path in its answer, no tool call occurs and the **bridge** reads the file itself. An agent policy denying `read`, `bash`, `edit` and everything else leaves that path wide open. `safeOutput.allowRawToolOutput: false` does not close it either -- the buffer a path is scraped from is filled *before* the show/hide branch, which only suppresses printing, so a connector can log that it is withholding a tool result and then upload the file named inside it. `autoUploadFiles` is the only control that stops an upload.
+**Denying tools does not stop an upload.** This is the least intuitive property here, so treat it as load-bearing: when the model simply *names* a local path in its answer, no tool call occurs and the **bridge** reads the file itself. An agent policy denying `read`, `bash`, `edit` and everything else leaves that path wide open. `safeOutput.allowRawToolOutput: false` does not close it either -- the buffer a path is scraped from is filled *before* the show/hide branch, which only suppresses printing, so a connector can log that it is withholding a tool result and then upload the file named inside it. `autoUploadFiles` is the only control that stops *that* upload.
+
+#### Two upload routes, and `autoUploadFiles` gates one of them
+
+**ROUTE 1, SCRAPED.** A path appears in text; the connector extracts it, stats it and reads it off disk. `autoUploadFiles: false` is the first line of that function on all three connectors that declare the key, so with the default nothing on this route happens. This is the route the paragraph above is about.
+
+**ROUTE 2, RETURNED.** A file arrives as tool-result *content* rather than as a path in text -- `read` on a `jpeg`/`png`/`gif`/`webp` returns the bytes, ACP carries them as image content, and the connector emits them. **On WhatsApp no output flag is consulted on this path at all.** Matrix guards it; Slack registers no image handler, so the route does not exist there.
+
+| Connector | Route 1 | Route 2 |
+|---|---|---|
+| whatsapp | gated by `autoUploadFiles` | **not gated** |
+| matrix | gated by `autoUploadFiles` | gated by `autoUploadFiles` |
+| slack | gated by `autoUploadFiles` | route does not exist |
+
+**So on WhatsApp the control on route 2 is the `read` permission, not an output flag.** With `read: ask` every such upload costs an explicit in-thread approval, which is a real gate -- just not the one the flag's name suggests. **Grant `read` standing approval for a directory and route 2 becomes ungated end to end:** every image under it can reach the chat with nothing further to answer. Decide `read` knowing that.
+
+**The asymmetry is a decision, not a gap.** Bytes an approved read puts in the model's context can leave in any shape the model chooses -- described, transcribed, re-encoded, or invented -- so guarding the one emitter that sends them *as a file* changes their form on the way out rather than whether they go. The approval of the read is the real boundary. Do not "align" the connectors in either direction without deciding this deliberately: adding the guard to WhatsApp closes nothing, and removing Matrix's guard is a loosening.
 
 ### Approving Permissions From Chat
 
