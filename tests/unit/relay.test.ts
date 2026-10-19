@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test"
-import { existsSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "fs"
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "fs"
 import { tmpdir } from "os"
 import { join } from "path"
 import { RelayClient } from "../../src/relay/client"
@@ -496,6 +496,27 @@ describe("restart", () => {
     const outbox = await second.takeOutbox("matrix", 0)
     expect(outbox.items.map((i) => i.text)).toEqual(["the answer"])
     expect(api.messageReads).toBe(reads + 1)
+  })
+})
+
+describe("the requeue command", () => {
+  test("writes the text exactly as piped in, with the config named by flag or environment", () => {
+    const dir = scratch()
+    const config = join(dir, "relay.json")
+    writeFileSync(config, JSON.stringify({
+      socketPath: join(dir, "relay.sock"),
+      stateDir: join(dir, "state"),
+      vibetermApi: { secretsModule: "/nonexistent/index.ts" },
+      routes: {},
+    }))
+    const script = join(import.meta.dir, "../../src/relay/requeue.ts")
+    const request = (relayId: string) => JSON.parse(readFileSync(join(dir, "state", "requeue", `${relayId}.json`), "utf8"))
+    expect(Bun.spawnSync(["bun", script, "--config", config, "rly_abc"], { stdin: Buffer.from("hello") }).exitCode).toBe(0)
+    expect(request("rly_abc")).toEqual({ text: "hello" })
+    const fromEnv = Bun.spawnSync(["bun", script, "rly_def"], { stdin: Buffer.from("again"), env: { ...process.env, AI_BRIDGE_RELAY_CONFIG: config } })
+    expect(fromEnv.exitCode).toBe(0)
+    expect(request("rly_def")).toEqual({ text: "again" })
+    expect(Bun.spawnSync(["bun", script, "--config", config, "nope"]).exitCode).toBe(2)
   })
 })
 

@@ -17,7 +17,7 @@ const USAGE = `usage: printf '%s' "<text>" | bun src/relay/requeue.ts --config <
 const args = process.argv.slice(2)
 const configAt = args.indexOf("--config")
 const configPath = configAt === -1 ? process.env.AI_BRIDGE_RELAY_CONFIG : args[configAt + 1]
-const relayId = args.find((_, index) => index !== configAt && index !== configAt + 1)
+const relayId = args.find((_, index) => configAt === -1 || (index !== configAt && index !== configAt + 1))
 if (!configPath || !relayId || !/^rly_[a-z0-9]+$/.test(relayId)) {
   console.error(USAGE)
   process.exit(2)
