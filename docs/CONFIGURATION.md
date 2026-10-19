@@ -218,6 +218,131 @@ Across stdout and stderr there must be exactly one non-empty trimmed line, match
 
 With a verifier, prompt hold notices wait for the outcome: each `notifySessions` session receives one keyed, automated path-only notice with the gate verdict, safe verification result and action (`released`, `discarded`, `still held`). Only a still-held result includes both manual release and discard commands. `wakeCoordinatorOnHold` wakes the coordinator only for `unavailable` or `inconclusive`, never ahead of a verified prompt. Without a verifier, existing hold notices and operator release behavior are unchanged. Health adds `verifier: { configured, lastOutcome, lastAt }`, with no message ids.
 
+## OTP broker
+
+`ai-bridge-otp` (fork deviation 11) receives login codes from the SMS Forward app and hands each one to the session that asked for it. It is a host process of its own, separate from the relay:
+
+```bash
+bun src/otp/main.ts --state-dir ~/ai-bridge-runtime/bridge/otp --listen 127.0.0.1:4791
+```
+
+| Flag | Meaning |
+|---|---|
+| `--state-dir` | Required, a 0700 directory. Holds `otp.sqlite` and, by default, the files below. |
+| `--listen` | Required. The webhook's address, loopback only (`127.0.0.1` or `::1`). |
+| `--key-file` | The shared HMAC key, a 0600 file. Default `<state-dir>/webhook-signing-key`. Read at startup: to rotate it, replace the file, provision the phone and restart. |
+| `--profiles` | Service profiles, a 0600 file. Default `<state-dir>/profiles.json`. Read on every `request`. |
+| `--socket` | The CLI's Unix socket, made 0600. Default `<state-dir>/broker.sock`. |
+
+The database is opened with an exclusive lock, so a second broker on the same state directory refuses to start.
+
+### The webhook
+
+`POST /v1/events` is the only route; anything else answers 404. The SMS Forward app signs the raw body:
+
+- Header `X-SmsForward-Signature: t=<ts_ms>,v1=<hex>`, where `<hex>` is the lowercase HMAC-SHA256 of the body bytes keyed with the key file's text.
+- Header `Idempotency-Key: <delivery_id>`.
+- The body is at most 16 KiB.
+
+| Body field | Meaning |
+|---|---|
+| `version` | `1` |
+| `ts_ms` | The send attempt's time on the phone, equal to the header's `t` and within 300 s of the desktop clock |
+| `delivery_id` | A UUID, the same on every retry: the dedup key |
+| `captured_at_ms` | The source's own time: an SMS's service-centre (PDU) time, or a notification's message time |
+| `age_ms` | Optional. The phone's measure of the event's age at this attempt |
+| `source.kind` | `sms` or `notification` |
+| `source.number`, `source.name` | Sender address and display name |
+| `source.package` | Required for a notification |
+| `source.time_basis` | Optional. Which clock `captured_at_ms` came from; shown in receipts, never used for matching |
+| `body`, `label` | The text, and the forwarding rule's label |
+| `redirect_id`, `event_id` | The app's rule id and its legacy local event id |
+| `test` | Optional. `true` marks a synthetic event, which can only match a `--test` request |
+
+Answers, which never echo the source, body, label or a code:
+
+| Status | Body | Meaning |
+|---|---|---|
+| 200 | `{"status":"stored","receipt_id":"rct_..."}` | Committed before the answer |
+| 200 | `{"status":"duplicate","receipt_id":"rct_..."}` | Already stored with the same immutable fields. Nothing changes but a counter |
+| 409 | `{"status":"conflict"}` | The same `delivery_id` with different immutable fields |
+| 400, 413 | `{"status":"invalid","error":"<field>"}` | A field, the JSON, or the size is wrong |
+| 401 | `{"status":"bad_signature"}`, `{"status":"stale_signature"}` | Wrong MAC, or `t` not the body's `ts_ms`; or more than 300 s away |
+| 500 | `{"status":"error"}` | Not stored. The phone retries |
+
+The immutable fields hashed for a duplicate are `version`, `redirect_id`, `event_id`, `delivery_id`, `captured_at_ms`, `source.kind`, `source.number`, `source.name`, `source.package`, `body`, `label` and `test`. `ts_ms` and `age_ms` change on every attempt, and `age_ms` disappears after a phone reboot.
+
+### Service profiles
+
+A request for a service inherits that service's hints from `profiles.json`. A flag on `request` replaces the profile's value for the same hint.
+
+```json
+{ "spruce": { "senders": ["<private>"], "bodyPattern": "Spruce" } }
+```
+
+| Key | Meaning |
+|---|---|
+| `senders` | Sender addresses. Compared without whitespace, dashes, dots or brackets, and lowercased |
+| `bodyPattern` | A JavaScript regular expression, matched case-insensitively |
+| `packages` | Android packages, for notifications |
+| `codePattern` | A JavaScript regular expression, default `\b\d{4,8}\b`. Its first capture group is the code when it has one. A body with two different matches has no code |
+
+A profile names the sender a provider's codes come from, so write it without printing that sender:
+
+```bash
+bun src/otp/profiles.ts --profiles <state-dir>/profiles.json --service spruce \
+  --senders-from <private.json> --pointer /candidates/0/sender --body-pattern Spruce
+```
+
+It reads the sender at the JSON pointer inside the process, refuses a source file that is not private, and prints only counts.
+
+### The CLI
+
+`src/otp/cli.ts`, installed on PATH as `ai-bridge-otp`. It finds the broker through `--socket` or `AI_BRIDGE_OTP_SOCKET`. Its session is `--session`, or `VIBETERM_SESSION_ID` by default.
+
+| Command | Result | Exit |
+|---|---|---|
+| `request --service S --account A [--challenge C] [--window 10m] [--sender X]... [--body-pattern RE] [--package P]... [--code-pattern RE] [--test] [--supersede]` | `request_id=...` and `expires_at=...` | 0; 5 `busy`, with the holder's request id, session and expiry; 1 without hints |
+| `resend ID` | `not_before=...` | 0 |
+| `wait ID [--timeout 10m] [--out PATH]` | `matched PATH`, writing `OTP_CODE=<code>` to PATH (0600; default `$XDG_RUNTIME_DIR/ai-bridge-otp/ID.env`) | 0 matched, 2 expired or timed out, 3 ambiguous, 4 cancelled |
+| `claim ID [--out PATH]` | The same, without waiting | As `wait`, plus 6 `pending` |
+| `cancel ID` | `cancelled ID`; after a claim, `rejected ID` | 0 |
+| `status [ID] [--json]` | States, ids, times and counts | 0 |
+| `receipts [--since 1h] [--json]` | Per delivery: `delivery_id`, receipt id, stored time, `ts_ms`, `captured_at_ms`, `capture_desktop_ms`, computed age, duplicates, state and the requests it was tested against | 0 |
+
+Any other failure exits 1. A request is open for its window: 10 minutes by default, 30 at most. `--supersede` cancels a conflicting request only when it belongs to the same session.
+
+To use it:
+- Register before triggering the provider's challenge, and `resend` before re-triggering it. A code captured before `request`, or before the latest `resend`, never counts.
+- Report a code the provider rejected with `cancel` (recorded as `rejected`, and the code deleted), then make a new request.
+- A repeated `claim` by the requesting session returns the same code until it is deleted. Another session's claim exits 1.
+
+Read the OTP_CODE file with the browser tool's `secrets: {path: PATH, keys: ["OTP_CODE"]}`, or `source PATH` inside the one script that uses it. Never `cat`, `echo` or read it.
+
+### Matching and retention
+
+- An event is decided when it arrives, against the requests open then. It is eligible for a request when all of these hold:
+  - its `test` flag equals the request's;
+  - every hint the request has matches;
+  - exactly one code can be read from it;
+  - its capture time on the desktop clock lies between the request's `not_before` and its expiry.
+- Capture time:
+  - For an SMS, its service-centre time, never later than its arrival.
+  - For a notification, the earlier of its message time and its arrival minus its age.
+  - The age is `age_ms`, or `max(0, ts_ms - captured_at_ms)` without it.
+  - A source time more than 300 s after arrival is a `clock_anomaly` and matches nothing.
+- Outcomes:
+  - Eligible for exactly one open request: `matched`.
+  - Eligible for two or more: `ambiguous`, and given to none.
+  - Its hints fit an open request but it was captured before that request's `not_before`: `stale`.
+  - Otherwise `unmatched`, with the reason (`no_request`, `hints:<which>`, `no_code`, `clock_anomaly`).
+- A claim answers `ambiguous` when any candidate since the latest `resend` was ambiguous, or when two distinct codes arrived. Copies of the same code count once.
+- Retention:
+  - The event's content (number, name, body, label, package) is never written.
+  - A matched code is deleted an hour after its request is claimed or closed.
+  - Deliveries and closed requests are deleted after 7 days. A closed request drops its hints at once.
+  - The broker purges every minute, then checkpoints the WAL. With `secure_delete`, a deleted code leaves no copy in free pages or old log frames.
+
 ## Session picker
 
 The project/session picker is disabled by default because it exposes saved ACP working directories, session titles, and optional recent history previews.

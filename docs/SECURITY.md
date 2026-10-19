@@ -381,6 +381,58 @@ The WhatsApp route has no connector, so its boundary is the desktop app rather t
 - Held records and frozen replies are 0600 files in 0700 directories. A notice to a session carries the file path only, never a message id or text.
 - The optional HOLD verifier is the native app owner's code, executed by the relay as the same user with the relay's environment, not a sandboxed agent. Besides an operator release, it is the only automatic release authority under HOLD: only exit `0` with exactly `verified sN` can request release, and the normal relay release checks remain authoritative. A validated refusal discards without prompting; every other outcome fails closed and stays held. Output is accepted only in a fixed, sequence-bound grammar; raw stdout, stderr and spawn diagnostics are never logged, stored or forwarded. Treat changing the verifier command or its code as changing this release authority.
 
+## OTP Broker
+
+`ai-bridge-otp` (fork deviation 11) handles login codes. Its boundary concerns who can deliver a code and who receives one.
+
+Who can deliver a code:
+- Only a sender holding the shared HMAC key, which is the SMS Forward app.
+- The listener binds to loopback. Caddy forwards `POST /v1/events` from tailnet and local addresses only, and answers 404 to everything else.
+- These are refused with 401, and nothing is stored:
+  - a wrong MAC over the raw body bytes;
+  - a signature more than 300 s from the desktop clock;
+  - a header `t` that is not the signed `ts_ms`.
+- A replayed delivery is a duplicate and changes nothing. The same `delivery_id` with different content is refused with 409.
+
+Who receives a code:
+- The session that registered the request, through a 0600 Unix socket.
+  - Everything runs as one uid, so the session binding routes codes; it does not protect them.
+  - Any process of this user can reach the socket, the database and the OTP_CODE files.
+- A code never enters a prompt, a log line, the CLI's output or any export.
+- The broker is not a lifelog or Commitment Compiler source. Nothing about an event leaves it except the OTP_CODE file written for its requester.
+
+What is stored:
+- Per delivery: ids, a hash of its immutable fields, times (`captured_at_ms`, `ts_ms` of the storing attempt, arrival, computed age and capture time) and the decision. Never its sender, name, body, label or package.
+- A matched event's code stays until 1 hour after its request is claimed or closed. A closed request drops its hints at once, and everything goes after 7 days.
+- The content hash covers the body. A code with a known message template could be recovered from it by trying every code, but by then the provider has expired that code.
+
+### The correlation limit
+
+An SMS carries no challenge token. The broker proves only two things:
+- the code was captured after its request was registered, or last resent;
+- no other open request was eligible for it.
+
+It cannot tell this challenge's code from either of these:
+- a provider SMS from an earlier, abandoned attempt that the provider delivers only after the new registration;
+- a code from a provider that ignores the resend.
+
+Capture time is an estimate, and the guarantee is exactly this: an event whose computed capture time precedes `not_before` is never eligible. Nothing stronger holds.
+- **SMS.** Its service-centre (PDU) timestamp: carrier evidence rather than a trusted clock, at 1-second resolution. The phone's clock does not enter it.
+  - A code captured just before registration can still look eligible within that clock's error.
+  - A code captured just after can look stale.
+- **Notification.** The messaging app's message time, which may be on the phone's clock or the messaging service's; the broker cannot tell which.
+  - The broker takes the earlier of that time and the arrival minus the event's age, so phone clock error can only make a notification look older.
+  - The cost: with a slow phone stamping its own clock, or a fast phone against a service's clock, a fresh notification is refused as stale.
+  - Arrival minus age is late by the storing attempt's network latency.
+
+Mitigations, all in the CLI's use:
+- Register before triggering the provider's challenge.
+- `resend` before re-triggering it.
+- Leases: a sender, a package or a (service, account) has one open request at a time.
+- Ambiguity fails closed. An event eligible for two requests goes to neither, and two distinct codes for one request go to nobody.
+- An abandoned attempt is cancelled.
+- A code the provider rejects is reported with `cancel`, followed by a new request.
+
 ## Credential Security
 
 ### Environment Variables

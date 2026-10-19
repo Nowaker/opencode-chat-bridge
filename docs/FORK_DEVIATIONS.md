@@ -345,6 +345,39 @@ something to create. The path is configuration, never a literal in source.
   - See `CONFIGURATION.md`, "The WhatsApp route".
 - The socket is the privilege boundary: whoever can connect to it prompts a full-tool session as the owner. It sits in a 0700 directory and is itself 0600, so only its user and root reach it, and the one container that needs it gets that directory read-only. A compromised connector can therefore prompt as the owner, which the containerized agent could not; see `SECURITY.md`, "Relay mode".
 
+## 11. OTP broker: a login code goes to the session that asked for it
+
+**Upstream:** has nothing comparable. A code could reach an agent only as chat text.
+
+**This fork:** `ai-bridge-otp` (`src/otp/`) is a host process beside the relay.
+- It receives the SMS Forward app's signed webhook on a loopback port, `POST /v1/events`, which Caddy exposes to the tailnet only.
+- It serves its CLI over a 0600 Unix socket.
+- A session registers a login request with `ai-bridge-otp request` before it triggers the provider's challenge. `wait` or `claim` then writes the matching code to a 0600 file as `OTP_CODE=<code>`.
+- No code goes into a prompt, a log line or the CLI's output.
+
+**Why:** the owner wanted two-factor codes to reach the session that requested the login, rather than land in some session as a prompt. They are also stored, so a session can fetch its code by command.
+
+**Notes:**
+
+- It is its own process and user unit, not part of the relay. OTP intake keeps running through relay deploys, and the relay, whose socket can prompt full-tool sessions, gains no network listener.
+- The webhook is the app's existing generic one, verified in this order:
+  1. An HMAC-SHA256 over the raw body bytes. org.json escapes `/`, so the bytes are verified before parsing.
+  2. A signed `ts_ms` within 300 s of the desktop clock.
+  3. `Idempotency-Key` equal to the body's `delivery_id`.
+- Every answer the phone takes as an ACK is committed to SQLite with `synchronous = FULL` first.
+- A repeat of a stored delivery is a duplicate when its immutable fields hash the same, whatever its per-attempt fields (`ts_ms`, `age_ms`) say. It changes nothing but a counter.
+- An event is decided once, at arrival. Its capture time is never later than its arrival, and a request's window opens at registration, so only requests already open at arrival can take it.
+  - Its content is therefore never stored. Per delivery the database keeps ids, a content hash, times and the decision.
+  - A matched event also keeps its extracted code, deleted an hour after its request is claimed or closed.
+- A code goes to a request only when that request is the only open one eligible for the event; an event eligible for two goes to neither.
+  - Within one request, copies of the same code are one code. Two distinct codes since the latest `resend` make the request ambiguous.
+  - Leases refuse, as `busy`, a request that shares a sender, a package or a (service, account) with an open one. That serializes most would-be ambiguity.
+- Capture time depends on the event's kind:
+  - An SMS uses its service-centre time, so the phone's clock error does not enter.
+  - A notification takes the earlier of its message time and its arrival minus its age, so phone clock error can only make it look older.
+  - `SECURITY.md`, "OTP Broker", states what this can and cannot prove.
+- This is the fork's own code, not proposed upstream.
+
 ## Not implemented, deliberately
 
 ### Reverse session discovery
