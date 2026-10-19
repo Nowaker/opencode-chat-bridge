@@ -1,22 +1,21 @@
 #!/usr/bin/env bun
 /**
- * Sends a synthetic, signed test event to the broker's webhook through curl,
- * built and signed the way the SMS Forward app does it. For proofs only: each
- * event carries `"test": true`, so it can only ever match a test request.
+ * Sends a synthetic, signed test event to the broker's webhook, built and
+ * signed the way the SMS Forward app does it. For proofs only: each event
+ * carries `"test": true`, so it can only ever match a test request.
  *
- * The key is read from its file inside this process and never printed. The
- * synthetic code is random, kept in a private state file and never printed:
- * `compare` reports only whether an OTP_CODE file holds it.
+ * The key is read from its file inside this process and never printed, and
+ * the request is sent from this process too: a signed header handed to a
+ * command such as curl can be read from /proc while it runs, and replayed
+ * for 300 s. The synthetic code is random, kept in a private state file and
+ * never printed: `compare` reports only whether an OTP_CODE file holds it.
  *
  *   send-test-event.ts new --state FILE [--sender S] [--text 'X {code} Y'] [--captured-ago 0s] [--kind sms|notification]
  *   send-test-event.ts send --state FILE --url URL --key-file FILE [--phone-skew -4m] [--age phone|none] [--label L]
  *   send-test-event.ts compare --state FILE --otp-file FILE
  */
 
-import { spawnSync } from "child_process"
 import { randomInt, randomUUID } from "crypto"
-import { rmSync } from "fs"
-import { dirname, join } from "path"
 import { int, oneOf, record, text } from "./guards"
 import { readPrivateText, writePrivateText } from "./private-files"
 import { signatureHeader } from "./signature"
@@ -88,10 +87,10 @@ function create(map: Map<string, string>): void {
   console.log(`created ${state.deliveryId} captured_at=${new Date(state.capturedAtMs).toISOString()} kind=${kind}`)
 }
 
-function send(map: Map<string, string>): number {
-  const statePath = required(map, "state")
-  const state = readState(statePath)
+async function send(map: Map<string, string>): Promise<number> {
+  const state = readState(required(map, "state"))
   const key = readPrivateText(required(map, "key-file")).trim()
+  const url = required(map, "url")
   // The phone's clock: its own send time, and the age it would report, both on it.
   const tsMs = Date.now() + duration(map.get("phone-skew"))
   const age = map.get("age") ?? "phone"
@@ -115,32 +114,27 @@ function send(map: Map<string, string>): number {
     test: true,
   }
   // org.json writes `/` as `\/`; the signature covers exactly these bytes.
-  const raw = JSON.stringify(body).replace(/\//g, "\\/")
-  const bodyFile = join(dirname(statePath), `.body-${state.deliveryId}`)
-  writePrivateText(bodyFile, raw)
+  const raw = new TextEncoder().encode(JSON.stringify(body).replace(/\//g, "\\/"))
+  // A redirect is reported, never followed: following it would hand the signed header to another URL.
+  const init: RequestInit = {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "X-SmsForward-Signature": signatureHeader(key, raw, tsMs),
+      "Idempotency-Key": state.deliveryId,
+    },
+    body: raw,
+    redirect: "manual",
+    signal: AbortSignal.timeout(20_000),
+  }
   try {
-    const result = spawnSync(
-      "curl",
-      [
-        "-sS", "-X", "POST", "--max-time", "20", "--data-binary", `@${bodyFile}`,
-        "-H", "Content-Type: application/json; charset=utf-8",
-        "-H", `X-SmsForward-Signature: ${signatureHeader(key, new TextEncoder().encode(raw), tsMs)}`,
-        "-H", `Idempotency-Key: ${state.deliveryId}`,
-        "-w", "\n%{http_code}",
-        required(map, "url"),
-      ],
-      { encoding: "utf8" },
-    )
-    if (result.status !== 0) {
-      console.log(`curl failed: exit ${result.status}`)
-      return 1
-    }
-    const lines = result.stdout.trimEnd().split("\n")
-    const status = lines.pop()
-    console.log(`HTTP ${status} ${lines.join(" ")}`)
-    return status === "200" ? 0 : 1
-  } finally {
-    rmSync(bodyFile, { force: true })
+    const response = await fetch(url, init)
+    const answer = (await response.text()).trimEnd().split("\n").join(" ")
+    console.log(`HTTP ${response.status} ${answer}`)
+    return response.status === 200 ? 0 : 1
+  } catch (error) {
+    console.log(`request failed: ${error instanceof Error ? error.name : "unknown"}`)
+    return 1
   }
 }
 
@@ -152,14 +146,14 @@ function compare(map: Map<string, string>): number {
   return matches ? 0 : 1
 }
 
-function main(argv: string[]): number {
+async function main(argv: string[]): Promise<number> {
   const [command, ...rest] = argv
   const map = options(rest)
   if (command === "new") {
     create(map)
     return 0
   }
-  if (command === "send") return send(map)
+  if (command === "send") return await send(map)
   if (command === "compare") return compare(map)
   console.error("usage: send-test-event.ts new|send|compare --state FILE ...")
   return 2
@@ -167,7 +161,7 @@ function main(argv: string[]): number {
 
 if (import.meta.main) {
   try {
-    process.exit(main(process.argv.slice(2)))
+    process.exit(await main(process.argv.slice(2)))
   } catch (error) {
     console.error(`send-test-event: ${error instanceof Error ? error.message : String(error)}`)
     process.exit(1)

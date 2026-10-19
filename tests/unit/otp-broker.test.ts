@@ -8,7 +8,7 @@ import { apiCall, parseReceiptList, startApiServer } from "../../src/otp/api"
 import { Broker, type Profile, type Receipt } from "../../src/otp/broker"
 import { runCli } from "../../src/otp/cli"
 import { isRecord } from "../../src/otp/guards"
-import { signatureHeader } from "../../src/otp/signature"
+import { parseSignatureHeader, signatureHeader, signatureMatches } from "../../src/otp/signature"
 import { openStore } from "../../src/otp/store"
 import { startWebhookServer, webhookHandler } from "../../src/otp/webhook"
 
@@ -903,5 +903,71 @@ describe("entrypoints", () => {
       broker.kill("SIGTERM")
       expect(await broker.exited).toBe(0)
     }
+  })
+
+  test("send-test-event.ts sends the exact signed bytes from its own process, and never follows a redirect", async () => {
+    const dir = scratch()
+    const state = join(dir, "event.json")
+    const keyFile = join(dir, "webhook-signing-key")
+    writeFileSync(keyFile, KEY, { mode: 0o600 })
+    const run = async (...args: string[]) => {
+      const tool = Bun.spawn(["bun", "src/otp/send-test-event.ts", ...args], { stdout: "pipe", stderr: "pipe" })
+      const [code, out] = await Promise.all([tool.exited, new Response(tool.stdout).text()])
+      return { code, out }
+    }
+    const created = await run("new", "--state", state)
+    expect(created.code).toBe(0)
+    const deliveryId = defined(/^created (\S+) /.exec(created.out)?.[1], "the delivery id")
+
+    interface Received {
+      path: string
+      bytes: Uint8Array
+      signature: string | null
+      idempotencyKey: string | null
+      contentType: string | null
+    }
+    const received: Received[] = []
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch(request) {
+        const path = new URL(request.url).pathname
+        received.push({
+          path,
+          bytes: new Uint8Array(await request.arrayBuffer()),
+          signature: request.headers.get("x-smsforward-signature"),
+          idempotencyKey: request.headers.get("idempotency-key"),
+          contentType: request.headers.get("content-type"),
+        })
+        if (path === "/moved") return new Response(null, { status: 302, headers: { Location: "/v1/events" } })
+        return Response.json({ status: "stored", receipt_id: "rcpt-test" })
+      },
+    })
+    const events = new URL("/v1/events", server.url).href
+    const moved = new URL("/moved", server.url).href
+    try {
+      const stored = await run("send", "--state", state, "--url", events, "--key-file", keyFile)
+      expect(stored).toEqual({ code: 0, out: 'HTTP 200 {"status":"stored","receipt_id":"rcpt-test"}\n' })
+      const event = defined(received[0], "the request")
+      const raw = new TextDecoder().decode(event.bytes)
+      expect(raw).toContain("https:\\/\\/example.test\\/otp")
+      const signature = defined(parseSignatureHeader(event.signature) ?? undefined, "a signature the broker parses")
+      expect(signatureMatches(KEY, event.bytes, signature)).toBe(true)
+      const value = parseJson(raw)
+      if (!isRecord(value)) throw new Error("the body is not a JSON object")
+      expect(value.ts_ms).toBe(signature.t)
+      expect(value.delivery_id).toBe(deliveryId)
+      expect(event.idempotencyKey).toBe(deliveryId)
+      expect(event.contentType).toBe("application/json; charset=utf-8")
+
+      const redirected = await run("send", "--state", state, "--url", moved, "--key-file", keyFile)
+      expect(redirected).toEqual({ code: 1, out: "HTTP 302 \n" })
+      expect(received.map((request) => request.path)).toEqual(["/v1/events", "/moved"])
+    } finally {
+      await server.stop(true)
+    }
+    const refused = await run("send", "--state", state, "--url", events, "--key-file", keyFile)
+    expect(refused.code).toBe(1)
+    expect(refused.out).toMatch(/^request failed: \w+\n$/)
   })
 })
