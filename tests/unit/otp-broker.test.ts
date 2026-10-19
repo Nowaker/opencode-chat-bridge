@@ -1,11 +1,13 @@
-import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test"
+import { afterEach, describe, expect, setDefaultTimeout, spyOn, test } from "bun:test"
+import type { Database } from "bun:sqlite"
 import { createHmac, randomBytes } from "crypto"
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "fs"
 import { tmpdir } from "os"
 import { join } from "path"
-import { startApiServer } from "../../src/otp/api"
-import { Broker, type Profile } from "../../src/otp/broker"
+import { apiCall, parseReceiptList, startApiServer } from "../../src/otp/api"
+import { Broker, type Profile, type Receipt } from "../../src/otp/broker"
 import { runCli } from "../../src/otp/cli"
+import { isRecord } from "../../src/otp/guards"
 import { signatureHeader } from "../../src/otp/signature"
 import { openStore } from "../../src/otp/store"
 import { startWebhookServer, webhookHandler } from "../../src/otp/webhook"
@@ -37,6 +39,20 @@ function scratch(): string {
   return dir
 }
 
+/** The value, or a failed test naming what was missing. */
+function defined<T>(value: T | undefined, what: string): T {
+  if (value === undefined) throw new Error(`${what} is missing`)
+  return value
+}
+
+function parseJson(text: string): unknown {
+  try {
+    return JSON.parse(text)
+  } catch {
+    return null
+  }
+}
+
 /** What the phone knows about one captured message, on the true clock (the desktop's). */
 interface PhoneEvent {
   deliveryId?: string
@@ -59,7 +75,22 @@ interface PhoneEvent {
   package?: string
 }
 
-function body(event: PhoneEvent, desktopNow: number): Record<string, unknown> {
+/** The body the SMS Forward app sends. */
+interface EventBody {
+  version: number
+  ts_ms: number
+  redirect_id: number
+  event_id: number
+  source: { number: string; name: string; kind: "sms" | "notification"; package?: string }
+  body: string
+  label: string
+  delivery_id: string
+  captured_at_ms: number
+  age_ms?: number
+  test: boolean
+}
+
+function body(event: PhoneEvent, desktopNow: number): EventBody {
   const skew = event.skew ?? 0
   const kind = event.kind ?? "sms"
   const basis = event.basis ?? (kind === "sms" ? "source" : "phone")
@@ -92,15 +123,27 @@ function orgJson(value: unknown): string {
   return JSON.stringify(value).replace(/\//g, "\\/")
 }
 
+/** A webhook answer: its status, its text, the text parsed, and the receipt id it carries. */
+interface Answer {
+  status: number
+  text: string
+  json: unknown
+  receiptId: string | undefined
+}
+
+interface Running {
+  db: Database
+  broker: Broker
+  webhook: ReturnType<typeof startWebhookServer>
+  api: ReturnType<typeof startApiServer>
+}
+
 class Harness {
   clock = T0
   readonly runtime: string
   readonly socket: string
-  private db!: ReturnType<typeof openStore>
-  broker!: Broker
-  private webhook!: ReturnType<typeof startWebhookServer>
-  private api!: ReturnType<typeof startApiServer>
   logs: string[] = []
+  private running: Running | null = null
 
   constructor(readonly dir: string = scratch(), private readonly profiles: Record<string, Profile> = {}) {
     this.runtime = join(dir, "run")
@@ -115,20 +158,38 @@ class Harness {
     return join(this.dir, "state", "otp.sqlite")
   }
 
+  private get live(): Running {
+    if (this.running === null) throw new Error("the broker is stopped")
+    return this.running
+  }
+
+  get db(): Database {
+    return this.live.db
+  }
+
+  get broker(): Broker {
+    return this.live.broker
+  }
+
   start(): void {
-    this.db = openStore(this.dbPath)
-    this.broker = new Broker(this.db, { now: () => this.clock, profiles: () => this.profiles })
-    this.webhook = startWebhookServer(webhookHandler(this.broker, KEY, () => this.clock, (line) => this.logs.push(line)), "127.0.0.1", 0)
-    this.api = startApiServer(this.broker, this.socket)
+    const db = openStore(this.dbPath)
+    const broker = new Broker(db, { now: () => this.clock, profiles: () => this.profiles })
+    this.running = {
+      db,
+      broker,
+      webhook: startWebhookServer(webhookHandler(broker, KEY, () => this.clock, (line) => this.logs.push(line)), "127.0.0.1", 0),
+      api: startApiServer(broker, this.socket),
+    }
   }
 
   stop(): void {
-    if (!this.db) return
-    this.broker.stop()
-    this.webhook.stop(true)
-    this.api.stop(true)
-    this.db.close()
-    this.db = undefined as unknown as ReturnType<typeof openStore>
+    const running = this.running
+    if (running === null) return
+    this.running = null
+    running.broker.stop()
+    running.webhook.stop(true)
+    running.api.stop(true)
+    running.db.close()
   }
 
   restart(): void {
@@ -137,33 +198,33 @@ class Harness {
   }
 
   get url(): string {
-    return `http://127.0.0.1:${this.webhook.port}/v1/events`
+    return `http://127.0.0.1:${this.live.webhook.port}/v1/events`
   }
 
-  async postRaw(raw: string, headers: Record<string, string>, method = "POST", url = this.url): Promise<{ status: number; text: string; json: any }> {
+  async postRaw(raw: string, headers: Record<string, string>, method = "POST", url = this.url): Promise<Answer> {
     const response = await fetch(url, { method, body: method === "GET" ? undefined : raw, headers })
     const text = await response.text()
-    let json: any = null
-    try {
-      json = JSON.parse(text)
-    } catch {}
-    return { status: response.status, text, json }
+    const json = parseJson(text)
+    const receiptId = isRecord(json) && typeof json.receipt_id === "string" ? json.receipt_id : undefined
+    return { status: response.status, text, json, receiptId }
   }
 
   /** Sends what the phone would send right now, signed like the phone signs it. */
-  async send(value: Record<string, unknown>, options: { key?: string; t?: number; idempotencyKey?: string } = {}) {
+  async send<T extends { ts_ms: number; delivery_id: string }>(
+    value: T,
+    options: { key?: string; t?: number; idempotencyKey?: string } = {},
+  ): Promise<Answer> {
     const raw = orgJson(value)
     return this.postRaw(raw, {
       "content-type": "application/json; charset=utf-8",
-      "x-smsforward-signature": signatureHeader(options.key ?? KEY, new TextEncoder().encode(raw), options.t ?? (value.ts_ms as number)),
-      "idempotency-key": options.idempotencyKey ?? (value.delivery_id as string),
+      "x-smsforward-signature": signatureHeader(options.key ?? KEY, new TextEncoder().encode(raw), options.t ?? value.ts_ms),
+      "idempotency-key": options.idempotencyKey ?? value.delivery_id,
     })
   }
 
-  async phone(event: PhoneEvent) {
+  async phone(event: PhoneEvent): Promise<Answer & { value: EventBody }> {
     const value = body(event, this.clock)
-    const response = await this.send(value)
-    return { ...response, value }
+    return { ...(await this.send(value)), value }
   }
 
   async cli(session: string | null, ...args: string[]): Promise<{ code: number; out: string[]; err: string[] }> {
@@ -178,7 +239,7 @@ class Harness {
   async request(session: string, ...flags: string[]): Promise<string> {
     const result = await this.cli(session, "request", "--account", "synthetic@example.test", "--test", ...flags)
     expect(result.code).toBe(0)
-    return result.out.find((line) => line.startsWith("request_id="))!.slice("request_id=".length)
+    return defined(result.out.find((line) => line.startsWith("request_id=")), "request_id").slice("request_id=".length)
   }
 
   codeFile(requestId: string): string {
@@ -190,14 +251,15 @@ class Harness {
     return /^OTP_CODE=(.*)$/m.exec(readFileSync(this.codeFile(requestId), "utf8"))?.[1]
   }
 
-  async receipts(): Promise<any[]> {
+  /** Every delivery, read back through `receipts --json` and the CLI's own parser. */
+  async receipts(): Promise<Receipt[]> {
     const result = await this.cli(null, "receipts", "--since", "30d", "--json")
     expect(result.code).toBe(0)
-    return JSON.parse(result.out.join("\n"))
+    return parseReceiptList({ receipts: parseJson(result.out.join("\n")) })
   }
 
-  async receipt(deliveryId: string): Promise<any> {
-    return (await this.receipts()).find((r) => r.deliveryId === deliveryId)
+  async receipt(deliveryId: string): Promise<Receipt> {
+    return defined((await this.receipts()).find((r) => r.deliveryId === deliveryId), `the receipt of ${deliveryId}`)
   }
 }
 
@@ -220,7 +282,7 @@ describe("webhook signature", () => {
     const other = { ...value, delivery_id: crypto.randomUUID() }
     const otherRaw = orgJson(other)
     const refused = await h.postRaw(otherRaw, {
-      "x-smsforward-signature": signatureHeader(KEY, new TextEncoder().encode(JSON.stringify(other)), other.ts_ms as number),
+      "x-smsforward-signature": signatureHeader(KEY, new TextEncoder().encode(JSON.stringify(other)), other.ts_ms),
       "idempotency-key": other.delivery_id,
     })
     expect(refused.status).toBe(401)
@@ -233,12 +295,12 @@ describe("webhook signature", () => {
     expect((await h.send(value, { key: randomBytes(32).toString("base64url") })).json).toEqual({ status: "bad_signature" })
 
     const raw = orgJson(value)
-    const signature = signatureHeader(KEY, new TextEncoder().encode(raw), value.ts_ms as number)
+    const signature = signatureHeader(KEY, new TextEncoder().encode(raw), value.ts_ms)
     const tampered = raw.replace("482913", "482914")
-    expect((await h.postRaw(tampered, { "x-smsforward-signature": signature, "idempotency-key": value.delivery_id as string })).status).toBe(401)
-    expect((await h.postRaw(raw, { "idempotency-key": value.delivery_id as string })).status).toBe(401)
+    expect((await h.postRaw(tampered, { "x-smsforward-signature": signature, "idempotency-key": value.delivery_id })).status).toBe(401)
+    expect((await h.postRaw(raw, { "idempotency-key": value.delivery_id })).status).toBe(401)
     for (const header of ["t=abc,v1=00", `v1=${"0".repeat(64)}`, `t=${value.ts_ms}`, `t=${value.ts_ms},v1=xyz`]) {
-      expect((await h.postRaw(raw, { "x-smsforward-signature": header, "idempotency-key": value.delivery_id as string })).status).toBe(401)
+      expect((await h.postRaw(raw, { "x-smsforward-signature": header, "idempotency-key": value.delivery_id })).status).toBe(401)
     }
     expect(await h.receipts()).toEqual([])
   })
@@ -253,7 +315,7 @@ describe("webhook signature", () => {
     expect(await h.send(inside)).toMatchObject({ status: 200, json: { status: "stored" } })
 
     const value = body({ capturedAt: T0 }, T0)
-    expect(await h.send(value, { t: (value.ts_ms as number) + 1 })).toMatchObject({ status: 401, json: { status: "bad_signature" } })
+    expect(await h.send(value, { t: value.ts_ms + 1 })).toMatchObject({ status: 401, json: { status: "bad_signature" } })
   })
 
   test("answers 404 to anything but POST /v1/events", async () => {
@@ -267,15 +329,15 @@ describe("webhook signature", () => {
 
   test("refuses invalid fields by name, and never echoes content", async () => {
     const h = new Harness()
-    const cases: Array<[Record<string, unknown>, string, Record<string, string>?]> = [
-      [{ ...body({ capturedAt: T0 }, T0), delivery_id: "not-a-uuid" }, "delivery_id"],
-      [{ ...body({ capturedAt: T0 }, T0), age_ms: -1 }, "age_ms"],
-      [{ ...body({ capturedAt: T0 }, T0), captured_at_ms: "soon" }, "captured_at_ms"],
-      [{ ...body({ capturedAt: T0 }, T0), version: 2 }, "version"],
-      [{ ...body({ capturedAt: T0 }, T0), source: { number: SENDER_A, name: "x", kind: "notification" } }, "source.package"],
-      [{ ...body({ capturedAt: T0 }, T0), source: { number: SENDER_A, name: "x", kind: "email" } }, "source.kind"],
+    const cases = [
+      { value: { ...body({ capturedAt: T0 }, T0), delivery_id: "not-a-uuid" }, field: "delivery_id" },
+      { value: { ...body({ capturedAt: T0 }, T0), age_ms: -1 }, field: "age_ms" },
+      { value: { ...body({ capturedAt: T0 }, T0), captured_at_ms: "soon" }, field: "captured_at_ms" },
+      { value: { ...body({ capturedAt: T0 }, T0), version: 2 }, field: "version" },
+      { value: { ...body({ capturedAt: T0 }, T0), source: { number: SENDER_A, name: "x", kind: "notification" } }, field: "source.package" },
+      { value: { ...body({ capturedAt: T0 }, T0), source: { number: SENDER_A, name: "x", kind: "email" } }, field: "source.kind" },
     ]
-    for (const [value, field] of cases) {
+    for (const { value, field } of cases) {
       const response = await h.send(value)
       expect(response.status).toBe(400)
       expect(response.json).toEqual({ status: "invalid", error: field })
@@ -291,7 +353,7 @@ describe("webhook signature", () => {
     expect(await h.receipts()).toEqual([])
   })
 
-  test("treats JSON null in an optional field as absent, so a retry that drops it is a duplicate", async () => {
+  test("reads JSON null in an optional field like a missing one, so a retry that drops it is a duplicate", async () => {
     const h = new Harness()
     const id = await h.request(SESSION_A, "--service", "proof-a", "--sender", SENDER_A)
     h.clock += 5 * SECOND
@@ -302,24 +364,24 @@ describe("webhook signature", () => {
       redirect_id: null,
       event_id: null,
       label: null,
-      source: { ...(value.source as Record<string, unknown>), name: null, package: null, time_basis: null },
+      source: { ...value.source, name: null, package: null, time_basis: null },
     }
     const stored = await h.send(nulled)
     expect(stored).toMatchObject({ status: 200, json: { status: "stored" } })
-    expect(await h.receipt(value.delivery_id as string)).toMatchObject({ state: "matched", ageSource: "ts", timeBasis: null })
+    expect(await h.receipt(value.delivery_id)).toMatchObject({ state: "matched", ageSource: "ts", timeBasis: null })
 
     h.clock += 10 * SECOND
     const { age_ms: _a, redirect_id: _r, event_id: _e, label: _l, ...dropped } = nulled
     const { name: _n, package: _p, time_basis: _t, ...source } = nulled.source
     const retry = await h.send({ ...dropped, source, ts_ms: h.clock })
-    expect(retry).toMatchObject({ status: 200, json: { status: "duplicate", receipt_id: stored.json.receipt_id } })
+    expect(retry).toMatchObject({ status: 200, json: { status: "duplicate", receipt_id: defined(stored.receiptId, "the stored receipt id") } })
 
     const untested = body({ capturedAt: T0 + SECOND, code: "878787" }, h.clock)
-    expect((await h.send({ ...untested, test: null })).json.status).toBe("stored")
-    expect((await h.receipt(untested.delivery_id as string)).test).toBe(false)
+    expect((await h.send({ ...untested, test: null })).json).toMatchObject({ status: "stored" })
+    expect((await h.receipt(untested.delivery_id)).test).toBe(false)
 
     const note = body({ kind: "notification", capturedAt: T0 + SECOND }, h.clock)
-    const noPackage = { ...note, source: { ...(note.source as Record<string, unknown>), package: null } }
+    const noPackage = { ...note, source: { ...note.source, package: null } }
     expect(await h.send(noPackage)).toMatchObject({ status: 400, json: { status: "invalid", error: "source.package" } })
 
     expect((await h.cli(SESSION_A, "claim", id)).code).toBe(0)
@@ -333,24 +395,25 @@ describe("deduplication", () => {
     const id = await h.request(SESSION_A, "--service", "proof-a", "--sender", SENDER_A)
     h.clock += 5 * SECOND
     const first = await h.phone({ capturedAt: T0 + 2 * SECOND, code: "731905" })
-    expect(first.json.status).toBe("stored")
-    const before = await h.receipt(first.value.delivery_id as string)
+    expect(first.json).toMatchObject({ status: "stored" })
+    const receiptId = defined(first.receiptId, "the first receipt id")
+    const before = await h.receipt(first.value.delivery_id)
     expect(before.state).toBe("matched")
 
     // The ACK was lost: the phone retries 40 s later, re-signed, with a grown age_ms.
     h.clock += 40 * SECOND
-    const retry = { ...first.value, ts_ms: h.clock, age_ms: (first.value.age_ms as number) + 40 * SECOND }
-    expect(await h.send(retry)).toMatchObject({ status: 200, json: { status: "duplicate", receipt_id: first.json.receipt_id } })
+    const retry = { ...first.value, ts_ms: h.clock, age_ms: defined(first.value.age_ms, "age_ms") + 40 * SECOND }
+    expect(await h.send(retry)).toMatchObject({ status: 200, json: { status: "duplicate", receipt_id: receiptId } })
 
     // The phone rebooted: same delivery, no age_ms any more.
     h.clock += 60 * SECOND
     const { age_ms: _, ...rebooted } = { ...first.value, ts_ms: h.clock }
-    expect(await h.send(rebooted)).toMatchObject({ status: 200, json: { status: "duplicate", receipt_id: first.json.receipt_id } })
+    expect(await h.send(rebooted)).toMatchObject({ status: 200, json: { status: "duplicate", receipt_id: receiptId } })
 
     // And a byte-identical resend, which on its own would prove nothing.
-    expect((await h.send(retry)).json.status).toBe("duplicate")
+    expect((await h.send(retry)).json).toMatchObject({ status: "duplicate" })
 
-    const after = await h.receipt(first.value.delivery_id as string)
+    const after = await h.receipt(first.value.delivery_id)
     expect(after.duplicates).toBe(3)
     expect(after.captureDesktopMs).toBe(before.captureDesktopMs)
     expect(after.ageMs).toBe(before.ageMs)
@@ -376,18 +439,18 @@ describe("deduplication", () => {
     const h = new Harness()
     // Stored before any request existed, then retransmitted after one was registered.
     const early = await h.phone({ capturedAt: T0 - 30 * SECOND, code: "300300" })
-    expect(early.json.status).toBe("stored")
+    expect(early.json).toMatchObject({ status: "stored" })
     h.clock += 2 * MINUTE
     const id = await h.request(SESSION_A, "--service", "proof-a", "--sender", SENDER_A)
     h.clock += MINUTE
     const retransmit = { ...early.value, ts_ms: h.clock, age_ms: 3 * MINUTE + 30 * SECOND }
-    expect((await h.send(retransmit)).json.status).toBe("duplicate")
-    expect((await h.receipt(early.value.delivery_id as string)).state).toBe("unmatched")
+    expect((await h.send(retransmit)).json).toMatchObject({ status: "duplicate" })
+    expect((await h.receipt(early.value.delivery_id)).state).toBe("unmatched")
 
     // Never ACKed before: its first arrival comes after the registration, with its original capture time.
     const queued = await h.phone({ capturedAt: T0 - 20 * SECOND, observedAt: T0 - 20 * SECOND, code: "400400" })
-    expect(queued.json.status).toBe("stored")
-    const receipt = await h.receipt(queued.value.delivery_id as string)
+    expect(queued.json).toMatchObject({ status: "stored" })
+    const receipt = await h.receipt(queued.value.delivery_id)
     expect(receipt).toMatchObject({ state: "stale", reason: "before_registration", captureDesktopMs: T0 - 20 * SECOND })
 
     const claim = await h.cli(SESSION_A, "claim", id)
@@ -402,7 +465,7 @@ describe("capture time", () => {
     h.clock += 3 * SECOND
     const before = await h.phone({ capturedAt: T0 - 1, code: "111111" })
     const after = await h.phone({ capturedAt: T0 + 1, code: "222222" })
-    const [b, a] = [await h.receipt(before.value.delivery_id as string), await h.receipt(after.value.delivery_id as string)]
+    const [b, a] = [await h.receipt(before.value.delivery_id), await h.receipt(after.value.delivery_id)]
     expect(b).toMatchObject({ state: "stale", reason: "before_registration", captureDesktopMs: T0 - 1 })
     expect(b.requests).toEqual([{ requestId: id, role: "stale", notBefore: T0 }])
     expect(a).toMatchObject({ state: "matched", captureDesktopMs: T0 + 1 })
@@ -416,7 +479,7 @@ describe("capture time", () => {
     // Captured 2 s before the registration, delivered 3 s after it.
     h.clock = T0 + 3 * SECOND
     const inFlight = await h.phone({ capturedAt: T0 - 2 * SECOND, code: "121212" })
-    const receipt = await h.receipt(inFlight.value.delivery_id as string)
+    const receipt = await h.receipt(inFlight.value.delivery_id)
     expect(receipt.captureDesktopMs).toBe(T0 - 2 * SECOND)
     expect(receipt.arrivalMs).toBe(T0 + 3 * SECOND)
     expect(receipt.requests[0]).toEqual({ requestId: id, role: "stale", notBefore: T0 })
@@ -433,13 +496,13 @@ describe("capture time", () => {
     // PDU time 5 min before the registration; Android hands it over 1 min after it.
     h.clock = T0 + 70 * SECOND
     const late = await h.phone({ capturedAt: T0 - 5 * MINUTE, observedAt: T0 + MINUTE, code: "505050" })
-    const receipt = await h.receipt(late.value.delivery_id as string)
+    const receipt = await h.receipt(late.value.delivery_id)
     expect(receipt.ageMs).toBe(6 * MINUTE + 10 * SECOND)
     expect(receipt).toMatchObject({ state: "stale", reason: "before_registration", captureDesktopMs: T0 - 5 * MINUTE })
 
     // The same for a notification, whose capture time is the phone's: its age carries the time before observation.
     const note = await h.phone({ kind: "notification", capturedAt: T0 - 5 * MINUTE, observedAt: T0 + MINUTE, code: "515151" })
-    expect(await h.receipt(note.value.delivery_id as string)).toMatchObject({ state: "stale", captureDesktopMs: T0 - 5 * MINUTE })
+    expect(await h.receipt(note.value.delivery_id)).toMatchObject({ state: "stale", captureDesktopMs: T0 - 5 * MINUTE })
     expect((await h.cli(SESSION_A, "claim", id)).code).toBe(6)
   })
 
@@ -450,14 +513,14 @@ describe("capture time", () => {
     expect((await h.cli(SESSION_A, "resend", first)).out).toEqual([`not_before=${new Date(T0 + MINUTE).toISOString()}`])
     h.clock = T0 + 90 * SECOND
     const beforeResend = await h.phone({ capturedAt: T0 + 30 * SECOND, code: "616161" })
-    expect(await h.receipt(beforeResend.value.delivery_id as string)).toMatchObject({ state: "stale", reason: "before_resend" })
+    expect(await h.receipt(beforeResend.value.delivery_id)).toMatchObject({ state: "stale", reason: "before_resend" })
 
     expect((await h.cli(SESSION_A, "cancel", first)).out).toEqual([`cancelled ${first}`])
     h.clock = T0 + 2 * MINUTE
     const second = await h.request(SESSION_A, "--service", "proof-a", "--sender", SENDER_A)
     h.clock = T0 + 150 * SECOND
     const beforeSecond = await h.phone({ capturedAt: T0 + 100 * SECOND, code: "626262" })
-    expect(await h.receipt(beforeSecond.value.delivery_id as string)).toMatchObject({ state: "stale", reason: "before_registration" })
+    expect(await h.receipt(beforeSecond.value.delivery_id)).toMatchObject({ state: "stale", reason: "before_registration" })
     expect((await h.cli(SESSION_A, "claim", second)).code).toBe(6)
     expect((await h.cli(SESSION_A, "claim", first)).code).toBe(4)
   })
@@ -488,7 +551,7 @@ describe("capture time", () => {
       expect(fresh.status).toBe(200)
       const claim = await h.cli(SESSION_A, "claim", id)
       outcomes.push(
-        `${(await h.receipt(old.value.delivery_id as string)).state} ${(await h.receipt(fresh.value.delivery_id as string)).state} ${claim.code} ${h.claimedCode(id)}`,
+        `${(await h.receipt(old.value.delivery_id)).state} ${(await h.receipt(fresh.value.delivery_id)).state} ${claim.code} ${h.claimedCode(id)}`,
       )
     }
     expect(new Set(outcomes)).toEqual(new Set(["stale claimed 0 828282"]))
@@ -501,9 +564,9 @@ describe("capture time", () => {
         await h.request(SESSION_A, "--service", "proof-a", "--package", "org.aibridge.test")
         h.clock = T0 + 20 * SECOND
         const old = await h.phone({ kind: "notification", basis, capturedAt: T0 - 3 * MINUTE, skew, code: "919191" })
-        expect((await h.receipt(old.value.delivery_id as string)).state).toBe("stale")
+        expect((await h.receipt(old.value.delivery_id)).state).toBe("stale")
         const fresh = await h.phone({ kind: "notification", basis, capturedAt: T0 + 5 * SECOND, skew, code: "929292" })
-        const state = (await h.receipt(fresh.value.delivery_id as string)).state
+        const state = (await h.receipt(fresh.value.delivery_id)).state
         // The cost of failing closed: a slow phone stamping its own clock, or a fast phone
         // against a server's clock, makes a fresh notification look older.
         const failsClosed = (basis === "phone" && skew < 0) || (basis === "source" && skew > 0)
@@ -517,11 +580,11 @@ describe("capture time", () => {
     const id = await h.request(SESSION_A, "--service", "proof-a", "--sender", SENDER_A)
     h.clock += 10 * SECOND
     const future = await h.phone({ capturedAt: h.clock + 301 * SECOND, code: "131313" })
-    expect(future.json.status).toBe("stored")
-    expect(await h.receipt(future.value.delivery_id as string)).toMatchObject({ state: "unmatched", reason: "clock_anomaly" })
+    expect(future.json).toMatchObject({ status: "stored" })
+    expect(await h.receipt(future.value.delivery_id)).toMatchObject({ state: "unmatched", reason: "clock_anomaly" })
     // Inside the margin it is clamped to its arrival and counts.
     const near = await h.phone({ capturedAt: h.clock + 200 * SECOND, code: "141414" })
-    expect(await h.receipt(near.value.delivery_id as string)).toMatchObject({ state: "matched", captureDesktopMs: h.clock })
+    expect(await h.receipt(near.value.delivery_id)).toMatchObject({ state: "matched", captureDesktopMs: h.clock })
     expect((await h.cli(SESSION_A, "claim", id)).code).toBe(0)
     expect(h.claimedCode(id)).toBe("141414")
   })
@@ -531,7 +594,7 @@ describe("capture time", () => {
     const id = await h.request(SESSION_A, "--service", "proof-a", "--sender", SENDER_A, "--window", "1m")
     h.clock = T0 + 61 * SECOND
     const late = await h.phone({ capturedAt: T0 + 30 * SECOND, code: "151515" })
-    expect(await h.receipt(late.value.delivery_id as string)).toMatchObject({ state: "unmatched", reason: "no_request" })
+    expect(await h.receipt(late.value.delivery_id)).toMatchObject({ state: "unmatched", reason: "no_request" })
     expect(await h.cli(SESSION_A, "claim", id)).toMatchObject({ code: 2, out: ["expired"] })
     expect(await h.cli(SESSION_A, "wait", id, "--timeout", "2s")).toMatchObject({ code: 2, out: ["expired"] })
   })
@@ -564,9 +627,9 @@ describe("matching", () => {
     const b = await h.request(SESSION_B, "--service", "proof-b", "--body-pattern", "AIBRIDGE-AMBIG")
     h.clock += 5 * SECOND
     const event = await h.phone({ sender: SENDER_A, capturedAt: T0 + SECOND, text: "AIBRIDGE-AMBIG code 373737" })
-    const receipt = await h.receipt(event.value.delivery_id as string)
+    const receipt = await h.receipt(event.value.delivery_id)
     expect(receipt.state).toBe("ambiguous")
-    expect(receipt.requests.map((r: any) => r.requestId).sort()).toEqual([a, b].sort())
+    expect(receipt.requests.map((r) => r.requestId).sort()).toEqual([a, b].sort())
     expect(await h.cli(SESSION_A, "wait", a, "--timeout", "2s")).toMatchObject({ code: 3, out: ["ambiguous"] })
     expect(await h.cli(SESSION_B, "claim", b)).toMatchObject({ code: 3, out: ["ambiguous"] })
     expect(h.claimedCode(a)).toBeUndefined()
@@ -608,9 +671,9 @@ describe("matching", () => {
 
     h.clock += 10 * SECOND
     const next = await h.request(SESSION_B, "--service", "proof-a", "--sender", SENDER_A)
-    expect((await h.send({ ...event.value, ts_ms: h.clock })).json.status).toBe("duplicate")
+    expect((await h.send({ ...event.value, ts_ms: h.clock })).json).toMatchObject({ status: "duplicate" })
     expect((await h.cli(SESSION_B, "claim", next)).code).toBe(6)
-    expect((await h.receipt(event.value.delivery_id as string)).state).toBe("claimed")
+    expect((await h.receipt(event.value.delivery_id)).state).toBe("claimed")
   })
 
   test("a code the provider rejected is reported with cancel and deleted", async () => {
@@ -654,9 +717,9 @@ describe("matching", () => {
     const id = await h.request(SESSION_A, "--service", "proofsvc")
     h.clock += 5 * SECOND
     const wrong = await h.phone({ sender: SENDER_B, capturedAt: T0 + SECOND, code: "202020" })
-    expect(await h.receipt(wrong.value.delivery_id as string)).toMatchObject({ state: "unmatched", reason: "hints:sender" })
+    expect(await h.receipt(wrong.value.delivery_id)).toMatchObject({ state: "unmatched", reason: "hints:sender" })
     const twoCodes = await h.phone({ capturedAt: T0 + SECOND, text: "AIBRIDGE-TEST code 202021 or 202022" })
-    expect(await h.receipt(twoCodes.value.delivery_id as string)).toMatchObject({ state: "unmatched", reason: "no_code" })
+    expect(await h.receipt(twoCodes.value.delivery_id)).toMatchObject({ state: "unmatched", reason: "no_code" })
     await h.phone({ sender: "aibridge test a", capturedAt: T0 + 2 * SECOND, code: "303030" })
     expect((await h.cli(SESSION_A, "claim", id)).code).toBe(0)
     expect(h.claimedCode(id)).toBe("303030")
@@ -679,6 +742,42 @@ describe("matching", () => {
     for (const secret of ["414141", "424242", SENDER_A, SENDER_B, "Synthetic Contact", "example.test/otp", "synthetic@example.test", "secret-challenge-label"]) {
       expect(text).not.toContain(secret)
     }
+  })
+})
+
+describe("the CLI socket", () => {
+  test("refuses a field of the wrong type with a 400 naming it, and creates, changes and logs nothing", async () => {
+    const h = new Harness()
+    const logged: string[] = []
+    const capture = (...args: unknown[]) => {
+      logged.push(args.map(String).join(" "))
+    }
+    const log = spyOn(console, "log").mockImplementation(capture)
+    const error = spyOn(console, "error").mockImplementation(capture)
+    const wrongType = (field: string) => ({ status: 400, body: { error: `${field} has the wrong type`, kind: "invalid" } })
+    try {
+      const valid = { session: SESSION_A, service: "proof-a", account: "synthetic@example.test", senders: [SENDER_A], test: true }
+      const create = (request: Record<string, unknown>) => apiCall(h.socket, "POST", "/v1/requests", request)
+      expect(await create({ ...valid, test: "true" })).toEqual(wrongType("test"))
+      expect(await create({ ...valid, senders: SENDER_A })).toEqual(wrongType("senders"))
+      expect(await create({ ...valid, senders: [SENDER_A, 7] })).toEqual(wrongType("senders"))
+      expect(await create({ ...valid, windowMs: "600000" })).toEqual(wrongType("windowMs"))
+      expect(await create({ ...valid, supersede: "yes" })).toEqual(wrongType("supersede"))
+      expect(await create({ ...valid, account: 42 })).toEqual(wrongType("account"))
+      expect(await create({ ...valid, session: undefined })).toEqual({ status: 400, body: { error: "session is required", kind: "invalid" } })
+      expect(h.broker.status()).toEqual([])
+
+      const id = await h.request(SESSION_A, "--service", "proof-a", "--sender", SENDER_A)
+      for (const verb of ["claim", "resend", "cancel"]) {
+        expect(await apiCall(h.socket, "POST", `/v1/requests/${id}/${verb}`, { session: 42 })).toEqual(wrongType("session"))
+      }
+      expect(await apiCall(h.socket, "POST", `/v1/requests/${id}/claim`, { session: SESSION_A, waitMs: "abc" })).toEqual(wrongType("waitMs"))
+      expect(h.broker.status(id)).toMatchObject([{ state: "open", verdict: "pending", resends: 0 }])
+    } finally {
+      log.mockRestore()
+      error.mockRestore()
+    }
+    expect(logged).toEqual([])
   })
 })
 
@@ -729,7 +828,7 @@ describe("durability and retention", () => {
       expect(disk).not.toContain(secret)
     }
 
-    expect((await h.receipt(event.value.delivery_id as string)).state).toBe("claimed")
+    expect((await h.receipt(event.value.delivery_id)).state).toBe("claimed")
     h.clock += 7 * 24 * 60 * MINUTE
     expect(h.broker.purge()).toMatchObject({ events: 2, requests: 1 })
     expect(await h.receipts()).toEqual([])
@@ -738,9 +837,8 @@ describe("durability and retention", () => {
 
   test("the store is durable, private and owned by one broker", () => {
     const h = new Harness()
-    const db = (h as any).db
-    expect(db.query("PRAGMA journal_mode").get()).toEqual({ journal_mode: "wal" })
-    expect(db.query("PRAGMA synchronous").get()).toEqual({ synchronous: 2 })
+    expect(h.db.query("PRAGMA journal_mode").get()).toEqual({ journal_mode: "wal" })
+    expect(h.db.query("PRAGMA synchronous").get()).toEqual({ synchronous: 2 })
     expect(statSync(h.dbPath).mode & 0o777).toBe(0o600)
     expect(statSync(h.socket).mode & 0o777).toBe(0o600)
     expect(() => openStore(h.dbPath)).toThrow()
@@ -769,7 +867,7 @@ describe("entrypoints", () => {
     expect(`${loose.stdout}${loose.stderr}`).not.toContain("555")
   })
 
-  test("main.ts serves the webhook and the socket, and cli.ts talks to it, as separate processes", async () => {
+  test("main.ts serves the webhook and the socket, and cli.ts talks to it, in separate processes", async () => {
     const dir = scratch()
     const state = join(dir, "state")
     mkdirSync(state, { mode: 0o700 })
@@ -784,15 +882,15 @@ describe("entrypoints", () => {
         started += new TextDecoder().decode(chunk.value)
       }
       expect(started).not.toContain(KEY)
-      const port = / on 127\.0\.0\.1:(\d+) /.exec(started)![1]
+      const port = defined(/ on 127\.0\.0\.1:(\d+) /.exec(started)?.[1], "the broker's port")
       const value = body({ capturedAt: Date.now(), test: true }, Date.now())
       const raw = orgJson(value)
       const response = await fetch(`http://127.0.0.1:${port}/v1/events`, {
         method: "POST",
         body: raw,
         headers: {
-          "x-smsforward-signature": signatureHeader(KEY, new TextEncoder().encode(raw), value.ts_ms as number),
-          "idempotency-key": value.delivery_id as string,
+          "x-smsforward-signature": signatureHeader(KEY, new TextEncoder().encode(raw), value.ts_ms),
+          "idempotency-key": value.delivery_id,
         },
       })
       expect(response.status).toBe(200)

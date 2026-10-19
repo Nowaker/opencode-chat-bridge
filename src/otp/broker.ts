@@ -16,6 +16,7 @@
 import type { Database } from "bun:sqlite"
 import { randomBytes } from "crypto"
 import { captureTime, contentHash, type CaptureTime, type WebhookEvent } from "./event"
+import { nullable, record, strings, text } from "./guards"
 import { checkPattern, DEFAULT_CODE_PATTERN, extractCode, hasHints, hintFailures, leaseKeys, normalizeSender, type Hints } from "./match"
 
 export const DEFAULT_WINDOW_MS = 10 * 60_000
@@ -24,8 +25,13 @@ export const MAX_WINDOW_MS = 30 * 60_000
 export const CODE_RETENTION_MS = 60 * 60_000
 export const EVENT_RETENTION_MS = 7 * 24 * 60 * 60_000
 
-export type RequestState = "open" | "claimed" | "expired" | "cancelled"
-export type EventState = "matched" | "claimed" | "ambiguous" | "stale" | "unmatched"
+export const REQUEST_STATES = ["open", "claimed", "expired", "cancelled"] as const
+export const EVENT_STATES = ["matched", "claimed", "ambiguous", "stale", "unmatched"] as const
+export const VERDICTS = ["pending", "matched", "ambiguous"] as const
+export const CLAIM_STATUSES = ["matched", "pending", "ambiguous", "expired", "cancelled"] as const
+
+export type RequestState = (typeof REQUEST_STATES)[number]
+export type EventState = (typeof EVENT_STATES)[number]
 
 export interface Profile {
   senders?: string[]
@@ -60,7 +66,9 @@ export type CreateOutcome =
 
 export type ClaimOutcome =
   | { status: "matched"; code: string; receiptId: string }
-  | { status: "pending" | "ambiguous" | "expired" | "cancelled" }
+  | { status: Exclude<(typeof CLAIM_STATUSES)[number], "matched"> }
+
+type Verdict = Extract<ClaimOutcome, { status: "matched" }> | { status: Exclude<(typeof VERDICTS)[number], "matched"> }
 
 export type IngestOutcome =
   | { status: "stored"; receiptId: string; state: EventState }
@@ -74,7 +82,7 @@ export interface RequestStatus {
   test: boolean
   state: RequestState
   /** For an open request: what a claim would answer now. */
-  verdict: "pending" | "matched" | "ambiguous" | null
+  verdict: (typeof VERDICTS)[number] | null
   createdAt: number
   notBefore: number
   expiresAt: number
@@ -130,6 +138,24 @@ interface RequestRow {
   rejected_at: number | null
 }
 
+interface ReceiptRow {
+  receipt_id: string
+  delivery_id: string
+  arrival_ms: number
+  ts_ms: number
+  captured_at_ms: number
+  age_ms: number
+  age_source: string
+  capture_desktop_ms: number
+  kind: string
+  time_basis: string | null
+  test: number
+  state: EventState
+  reason: string | null
+  duplicates: number
+  last_duplicate_ms: number | null
+}
+
 interface Decision {
   state: EventState
   reason: string | null
@@ -147,32 +173,52 @@ function newId(prefix: string): string {
   return `${prefix}_${randomBytes(10).toString("hex")}`
 }
 
-function label(value: unknown, field: string, required: boolean): string | null {
-  if (value === undefined || value === null || value === "") {
-    if (required) throw new BrokerError(`${field} is required`, "invalid")
-    return null
-  }
-  if (typeof value !== "string" || value.length > 200 || CONTROL.test(value)) throw new BrokerError(`${field} is not a valid label`, "invalid")
+function label(value: string | null | undefined, field: string): string | null {
+  if (value === undefined || value === null || value === "") return null
+  if (value.length > 200 || CONTROL.test(value)) throw new BrokerError(`${field} is not a valid label`, "invalid")
   return value
 }
 
-function stringList(value: unknown, field: string, check: (item: string) => boolean): string[] | undefined {
+function stringList(value: string[] | undefined, field: string, check: (item: string) => boolean): string[] | undefined {
   if (value === undefined) return undefined
-  if (!Array.isArray(value) || value.length > 20 || !value.every((item) => typeof item === "string" && check(item))) {
-    throw new BrokerError(`${field} must be a list of valid values`, "invalid")
-  }
-  return [...new Set(value as string[])]
+  if (value.length > 20 || !value.every(check)) throw new BrokerError(`${field} must be a list of valid values`, "invalid")
+  return [...new Set(value)]
 }
 
-function pattern(value: unknown, field: string): string | undefined {
+function pattern(value: string | undefined, field: string): string | undefined {
   if (value === undefined) return undefined
-  if (typeof value !== "string" || value.length === 0 || value.length > 500) throw new BrokerError(`${field} is not a pattern`, "invalid")
+  if (value.length === 0 || value.length > 500) throw new BrokerError(`${field} is not a pattern`, "invalid")
   try {
     checkPattern(value, field)
   } catch (error) {
-    throw new BrokerError((error as Error).message, "invalid")
+    throw new BrokerError(error instanceof Error ? error.message : String(error), "invalid")
   }
   return value
+}
+
+/** JSON this broker wrote into a request row. One that does not parse is its own fault, never the caller's: a 500. */
+function stored<T>(what: string, read: () => T): T {
+  try {
+    return read()
+  } catch (error) {
+    throw new Error(`stored ${what} do not parse: ${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
+function storedHints(row: RequestRow): Hints {
+  return stored(`hints of ${row.request_id}`, () => {
+    const hints = record(JSON.parse(row.hints ?? "null"), "hints")
+    return {
+      senders: strings(hints.senders, "hints.senders"),
+      bodyPattern: nullable(hints.bodyPattern, text, "hints.bodyPattern"),
+      packages: strings(hints.packages, "hints.packages"),
+      codePattern: text(hints.codePattern, "hints.codePattern"),
+    }
+  })
+}
+
+function storedLeaseKeys(row: { request_id: string; lease_keys: string }): string[] {
+  return stored(`lease keys of ${row.request_id}`, () => strings(JSON.parse(row.lease_keys), "lease_keys"))
 }
 
 export class Broker {
@@ -245,7 +291,7 @@ export class Broker {
     const eligible: { row: RequestRow; code: string }[] = []
     const stale: RequestRow[] = []
     for (const row of open) {
-      const hints = JSON.parse(row.hints ?? "null") as Hints
+      const hints = storedHints(row)
       const failures = hintFailures(hints, event)
       if (failures.length > 0) {
         if (closest === null || failures.length < closest.length) closest = failures
@@ -304,10 +350,11 @@ export class Broker {
 
   createRequest(input: RequestInput): CreateOutcome {
     const now = this.now()
-    if (typeof input.session !== "string" || !SESSION.test(input.session)) throw new BrokerError("session is not a session id", "invalid")
-    if (typeof input.service !== "string" || !SERVICE.test(input.service)) throw new BrokerError("service must match [a-z0-9][a-z0-9_.-]*", "invalid")
-    const account = label(input.account, "account", true) as string
-    const challenge = label(input.challenge, "challenge", false)
+    if (!SESSION.test(input.session)) throw new BrokerError("session is not a session id", "invalid")
+    if (!SERVICE.test(input.service)) throw new BrokerError("service must match [a-z0-9][a-z0-9_.-]*", "invalid")
+    const account = label(input.account, "account")
+    if (account === null) throw new BrokerError("account is required", "invalid")
+    const challenge = label(input.challenge, "challenge")
     const windowMs = input.windowMs ?? DEFAULT_WINDOW_MS
     if (!Number.isSafeInteger(windowMs) || windowMs < MIN_WINDOW_MS || windowMs > MAX_WINDOW_MS) {
       throw new BrokerError(`window must be between ${MIN_WINDOW_MS / 1000}s and ${MAX_WINDOW_MS / 60_000}m`, "invalid")
@@ -338,7 +385,7 @@ export class Broker {
           "SELECT request_id, session_id, expires_at, lease_keys FROM requests WHERE state = 'open' ORDER BY created_at",
         )
         .all()
-      const conflicts = open.filter((row) => (JSON.parse(row.lease_keys) as string[]).some((key) => keys.includes(key)))
+      const conflicts = open.filter((row) => storedLeaseKeys(row).some((key) => keys.includes(key)))
       const foreign = conflicts.filter((row) => row.session_id !== input.session)
       if (conflicts.length > 0 && (!input.supersede || foreign.length > 0)) {
         const blocking = input.supersede ? foreign : conflicts
@@ -420,8 +467,10 @@ export class Broker {
       if (row.state === "claimed") {
         // The same requester reading its code again, until the code is deleted.
         if (row.rejected_at !== null) return { status: "cancelled" }
-        const event = this.db.query<{ code: string | null }, [string]>("SELECT code FROM events WHERE receipt_id = ?").get(row.claimed_receipt ?? "")
-        return event?.code ? { status: "matched", code: event.code, receiptId: row.claimed_receipt as string } : { status: "expired" }
+        const receiptId = row.claimed_receipt
+        if (receiptId === null) return { status: "expired" }
+        const event = this.db.query<{ code: string | null }, [string]>("SELECT code FROM events WHERE receipt_id = ?").get(receiptId)
+        return event?.code ? { status: "matched", code: event.code, receiptId } : { status: "expired" }
       }
       if (row.state !== "open") return { status: row.state }
       const verdict = this.verdict(row)
@@ -455,7 +504,7 @@ export class Broker {
     this.notify()
   }
 
-  private verdict(row: RequestRow): ClaimOutcome {
+  private verdict(row: RequestRow): Verdict {
     const candidates = this.db
       .query<{ receipt_id: string; state: EventState; code: string | null }, [string, number]>(
         `SELECT e.receipt_id, e.state, e.code FROM links l JOIN events e ON e.receipt_id = l.receipt_id
@@ -466,8 +515,9 @@ export class Broker {
     if (candidates.some((c) => c.state === "ambiguous")) return { status: "ambiguous" }
     const codes = new Set(candidates.map((c) => c.code))
     if (codes.size === 0) return { status: "pending" }
-    if (codes.size > 1 || candidates[0].code === null) return { status: "ambiguous" }
-    return { status: "matched", code: candidates[0].code, receiptId: candidates[0].receipt_id }
+    const newest = candidates[0]
+    if (codes.size > 1 || newest.code === null) return { status: "ambiguous" }
+    return { status: "matched", code: newest.code, receiptId: newest.receipt_id }
   }
 
   private ownRequest(requestId: string, session: string): RequestRow {
@@ -545,7 +595,7 @@ export class Broker {
         service: row.service,
         test: row.test === 1,
         state: row.state,
-        verdict: verdict as RequestStatus["verdict"],
+        verdict,
         createdAt: row.created_at,
         notBefore: row.not_before,
         expiresAt: row.expires_at,
@@ -568,7 +618,7 @@ export class Broker {
 
   receipts(sinceMs: number): Receipt[] {
     const rows = this.db
-      .query<Record<string, any>, [number]>(
+      .query<ReceiptRow, [number]>(
         `SELECT receipt_id, delivery_id, arrival_ms, ts_ms, captured_at_ms, age_ms, age_source, capture_desktop_ms, kind, time_basis,
            test, state, reason, duplicates, last_duplicate_ms FROM events WHERE arrival_ms >= ? ORDER BY arrival_ms, receipt_id`,
       )

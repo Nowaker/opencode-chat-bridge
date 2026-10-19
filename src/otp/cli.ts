@@ -14,7 +14,19 @@
 
 import { existsSync } from "fs"
 import { dirname, join, resolve } from "path"
-import { apiCall, MAX_WAIT_MS, type ApiResponse } from "./api"
+import {
+  apiCall,
+  errorMessage,
+  MAX_WAIT_MS,
+  parseCancelAnswer,
+  parseClaimAnswer,
+  parseCreateAnswer,
+  parseReceiptList,
+  parseRequestList,
+  parseResendAnswer,
+  type ApiResponse,
+} from "./api"
+import { ShapeError } from "./guards"
 import { ensurePrivateDir, writePrivateText } from "./private-files"
 
 export const EXIT = { ok: 0, error: 1, expired: 2, ambiguous: 3, cancelled: 4, busy: 5, pending: 6 } as const
@@ -83,12 +95,19 @@ function one(flags: Flags, name: string): string | undefined {
   return flags.get(name)?.at(-1)
 }
 
-const UNITS = { ms: 1, s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 }
+const UNITS = new Map([
+  ["ms", 1],
+  ["s", 1000],
+  ["m", 60_000],
+  ["h", 3_600_000],
+  ["d", 86_400_000],
+])
 
 export function parseDuration(value: string): number {
   const match = /^(\d+)(ms|s|m|h|d)?$/.exec(value.trim())
-  if (!match) throw new UsageError(`${value} is not a duration such as 90s, 10m, 1h or 7d`)
-  return Number(match[1]) * UNITS[(match[2] ?? "s") as keyof typeof UNITS]
+  const unit = match ? UNITS.get(match[2] ?? "s") : undefined
+  if (!match || unit === undefined) throw new UsageError(`${value} is not a duration such as 90s, 10m, 1h or 7d`)
+  return Number(match[1]) * unit
 }
 
 function iso(ms: number | null): string {
@@ -119,7 +138,22 @@ async function call(socket: string, method: "GET" | "POST", path: string, body?:
 }
 
 function failure(response: ApiResponse, io: CliIo): number {
-  io.err(`ai-bridge-otp: ${response.body?.error ?? `HTTP ${response.status}`}`)
+  io.err(`ai-bridge-otp: ${errorMessage(response)}`)
+  return EXIT.error
+}
+
+/** The answer read by `read`, or null when the broker sent something else. */
+function parsed<T>(read: (value: unknown) => T, body: unknown): T | null {
+  try {
+    return read(body)
+  } catch (error) {
+    if (error instanceof ShapeError) return null
+    throw error
+  }
+}
+
+function unexpected(io: CliIo): number {
+  io.err("ai-bridge-otp: unexpected answer from the broker")
   return EXIT.error
 }
 
@@ -139,17 +173,17 @@ function outPath(flag: string | undefined, env: Env, id: string): string {
 /** A claim's answer as an exit code, or null while it is still pending. */
 function settle(response: ApiResponse, out: string, io: CliIo): number | null {
   if (response.status !== 200) return failure(response, io)
-  switch (response.body?.status) {
-    case "matched": {
-      const code = response.body.code
-      if (typeof code !== "string" || !CODE.test(code)) {
+  const answer = parsed(parseClaimAnswer, response.body)
+  if (answer === null) return unexpected(io)
+  switch (answer.status) {
+    case "matched":
+      if (!CODE.test(answer.code)) {
         io.err("ai-bridge-otp: the broker answered with an unusable code")
         return EXIT.error
       }
-      writePrivateText(out, `OTP_CODE=${code}\n`)
+      writePrivateText(out, `OTP_CODE=${answer.code}\n`)
       io.out(`matched ${out}`)
       return EXIT.ok
-    }
     case "ambiguous":
       io.out("ambiguous")
       return EXIT.ambiguous
@@ -161,9 +195,6 @@ function settle(response: ApiResponse, out: string, io: CliIo): number | null {
       return EXIT.cancelled
     case "pending":
       return null
-    default:
-      io.err("ai-bridge-otp: unexpected answer from the broker")
-      return EXIT.error
   }
 }
 
@@ -192,14 +223,15 @@ async function request(argv: string[], env: Env, io: CliIo): Promise<number> {
     test: flags.has("test"),
     supersede: flags.has("supersede"),
   })
-  if (response.status === 200 && response.body?.status === "created") {
-    io.out(`request_id=${response.body.requestId}`)
-    io.out(`expires_at=${iso(response.body.expiresAt)}`)
-    for (const id of response.body.superseded ?? []) io.err(`superseded ${id}`)
+  const answer = parsed(parseCreateAnswer, response.body)
+  if (response.status === 200 && answer?.status === "created") {
+    io.out(`request_id=${answer.requestId}`)
+    io.out(`expires_at=${iso(answer.expiresAt)}`)
+    for (const id of answer.superseded) io.err(`superseded ${id}`)
     return EXIT.ok
   }
-  if (response.status === 409 && response.body?.status === "busy") {
-    for (const holder of response.body.holders) {
+  if (response.status === 409 && answer?.status === "busy") {
+    for (const holder of answer.holders) {
       io.out(`busy holder=${holder.requestId} session=${holder.session} expires_at=${iso(holder.expiresAt)}`)
     }
     return EXIT.busy
@@ -213,7 +245,9 @@ async function resend(argv: string[], env: Env, io: CliIo): Promise<number> {
   const ctx = context(flags, env, true)
   const response = await call(ctx.socket, "POST", `/v1/requests/${id}/resend`, { session: ctx.session })
   if (response.status !== 200) return failure(response, io)
-  io.out(`not_before=${iso(response.body.notBefore)}`)
+  const answer = parsed(parseResendAnswer, response.body)
+  if (answer === null) return unexpected(io)
+  io.out(`not_before=${iso(answer.notBefore)}`)
   return EXIT.ok
 }
 
@@ -264,7 +298,9 @@ async function cancel(argv: string[], env: Env, io: CliIo): Promise<number> {
   const ctx = context(flags, env, true)
   const response = await call(ctx.socket, "POST", `/v1/requests/${id}/cancel`, { session: ctx.session })
   if (response.status !== 200) return failure(response, io)
-  io.out(response.body.rejected ? `rejected ${id}` : `${response.body.state} ${id}`)
+  const answer = parsed(parseCancelAnswer, response.body)
+  if (answer === null) return unexpected(io)
+  io.out(answer.rejected ? `rejected ${id}` : `${answer.state} ${id}`)
   return EXIT.ok
 }
 
@@ -274,7 +310,8 @@ async function status(argv: string[], env: Env, io: CliIo): Promise<number> {
   const ctx = context(flags, env, false)
   const response = await call(ctx.socket, "GET", `/v1/requests${id ? `?id=${id}` : ""}`)
   if (response.status !== 200) return failure(response, io)
-  const requests: any[] = response.body.requests
+  const requests = parsed(parseRequestList, response.body)
+  if (requests === null) return unexpected(io)
   if (id && requests.length === 0) {
     io.err(`ai-bridge-otp: no such request ${id}`)
     return EXIT.error
@@ -312,13 +349,14 @@ async function receipts(argv: string[], env: Env, io: CliIo): Promise<number> {
   const within = parseDuration(one(flags, "since") ?? "1h")
   const response = await call(ctx.socket, "GET", `/v1/receipts?withinMs=${within}`)
   if (response.status !== 200) return failure(response, io)
-  const list: any[] = response.body.receipts
+  const list = parsed(parseReceiptList, response.body)
+  if (list === null) return unexpected(io)
   if (flags.has("json")) {
     io.out(JSON.stringify(list, null, 2))
     return EXIT.ok
   }
   for (const r of list) {
-    const requests = r.requests.map((q: any) => `${q.requestId}:${q.role}:not_before=${iso(q.notBefore)}`).join(",") || "-"
+    const requests = r.requests.map((q) => `${q.requestId}:${q.role}:not_before=${iso(q.notBefore)}`).join(",") || "-"
     io.out(
       [
         r.receiptId,

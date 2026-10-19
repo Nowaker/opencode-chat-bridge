@@ -4,6 +4,7 @@
  */
 
 import { createHash } from "crypto"
+import { absent, isRecord, isSafeInt, optionalString } from "./guards"
 
 export interface WebhookEvent {
   version: 1
@@ -34,69 +35,48 @@ const UUID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a
 /** A source time this far after the attempt's own time is a clock error, not an event. */
 export const CLOCK_ANOMALY_MS = 300_000
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-}
-
-function isSafeInt(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value)
-}
-
-/**
- * JSON null in an optional field means the same as leaving the field out.
- * Refusing it would be a 400, which stops the phone's retries and loses the
- * delivery.
- */
-function absent(value: unknown): value is null | undefined {
-  return value === undefined || value === null
-}
-
-function optionalString(value: unknown): value is string | null | undefined {
-  return absent(value) || typeof value === "string"
-}
-
 /** Validates every field the broker reads. Fields it does not know are ignored. */
 export function parseEvent(body: unknown): ParsedEvent {
   const fail = (field: string): ParsedEvent => ({ ok: false, field })
   if (!isRecord(body)) return fail("body")
-  if (body.version !== 1) return fail("version")
-  if (!isSafeInt(body.ts_ms) || body.ts_ms <= 0) return fail("ts_ms")
-  if (typeof body.delivery_id !== "string" || !UUID.test(body.delivery_id)) return fail("delivery_id")
-  if (!isSafeInt(body.captured_at_ms) || body.captured_at_ms <= 0) return fail("captured_at_ms")
-  if (!absent(body.age_ms) && (!isSafeInt(body.age_ms) || body.age_ms < 0)) return fail("age_ms")
-  if (!isRecord(body.source)) return fail("source")
-  const source = body.source
-  if (source.kind !== "sms" && source.kind !== "notification") return fail("source.kind")
-  if (typeof source.number !== "string") return fail("source.number")
-  if (!optionalString(source.name)) return fail("source.name")
-  if (!optionalString(source.package)) return fail("source.package")
-  if (source.kind === "notification" && !source.package) return fail("source.package")
-  if (!absent(source.time_basis) && (typeof source.time_basis !== "string" || !/^[a-z_]{1,32}$/.test(source.time_basis))) {
-    return fail("source.time_basis")
-  }
-  if (typeof body.body !== "string") return fail("body")
-  if (!optionalString(body.label)) return fail("label")
-  if (!absent(body.test) && typeof body.test !== "boolean") return fail("test")
-  if (!absent(body.redirect_id) && !isSafeInt(body.redirect_id)) return fail("redirect_id")
-  if (!absent(body.event_id) && !isSafeInt(body.event_id)) return fail("event_id")
+  const { version, ts_ms: tsMs, delivery_id: deliveryId, captured_at_ms: capturedAtMs, age_ms: ageMs, source } = body
+  if (version !== 1) return fail("version")
+  if (!isSafeInt(tsMs) || tsMs <= 0) return fail("ts_ms")
+  if (typeof deliveryId !== "string" || !UUID.test(deliveryId)) return fail("delivery_id")
+  if (!isSafeInt(capturedAtMs) || capturedAtMs <= 0) return fail("captured_at_ms")
+  if (!absent(ageMs) && (!isSafeInt(ageMs) || ageMs < 0)) return fail("age_ms")
+  if (!isRecord(source)) return fail("source")
+  const { kind, number: sourceNumber, name, package: sourcePackage, time_basis: timeBasis } = source
+  if (kind !== "sms" && kind !== "notification") return fail("source.kind")
+  if (typeof sourceNumber !== "string") return fail("source.number")
+  if (!optionalString(name)) return fail("source.name")
+  if (!optionalString(sourcePackage)) return fail("source.package")
+  if (kind === "notification" && !sourcePackage) return fail("source.package")
+  if (!absent(timeBasis) && (typeof timeBasis !== "string" || !/^[a-z_]{1,32}$/.test(timeBasis))) return fail("source.time_basis")
+  const { body: text, label, test, redirect_id: redirectId, event_id: eventId } = body
+  if (typeof text !== "string") return fail("body")
+  if (!optionalString(label)) return fail("label")
+  if (!absent(test) && typeof test !== "boolean") return fail("test")
+  if (!absent(redirectId) && !isSafeInt(redirectId)) return fail("redirect_id")
+  if (!absent(eventId) && !isSafeInt(eventId)) return fail("event_id")
   return {
     ok: true,
     event: {
       version: 1,
-      tsMs: body.ts_ms,
-      deliveryId: body.delivery_id,
-      capturedAtMs: body.captured_at_ms,
-      ageMs: absent(body.age_ms) ? null : (body.age_ms as number),
-      kind: source.kind,
-      timeBasis: absent(source.time_basis) ? null : (source.time_basis as string),
-      number: source.number,
-      name: source.name ?? "",
-      package: source.package || null,
-      body: body.body,
-      label: body.label ?? null,
-      test: body.test === true,
-      redirectId: absent(body.redirect_id) ? null : (body.redirect_id as number),
-      eventId: absent(body.event_id) ? null : (body.event_id as number),
+      tsMs,
+      deliveryId,
+      capturedAtMs,
+      ageMs: ageMs ?? null,
+      kind,
+      timeBasis: timeBasis ?? null,
+      number: sourceNumber,
+      name: name ?? "",
+      package: sourcePackage || null,
+      body: text,
+      label: label ?? null,
+      test: test === true,
+      redirectId: redirectId ?? null,
+      eventId: eventId ?? null,
     },
   }
 }

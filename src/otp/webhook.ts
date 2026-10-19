@@ -7,6 +7,7 @@
 
 import type { Broker } from "./broker"
 import { parseEvent } from "./event"
+import { isRecord, isSafeInt } from "./guards"
 import { MAX_SIGNATURE_SKEW_MS, parseSignatureHeader, SIGNATURE_HEADER, signatureMatches } from "./signature"
 
 export const MAX_EVENT_BYTES = 16 * 1024
@@ -50,8 +51,8 @@ export function webhookHandler(broker: Broker, key: string, now: () => number = 
     } catch {
       return invalid("json")
     }
-    const ts = (body as { ts_ms?: unknown } | null)?.ts_ms
-    if (typeof ts !== "number" || !Number.isSafeInteger(ts)) return invalid("ts_ms")
+    const ts = isRecord(body) ? body.ts_ms : undefined
+    if (!isSafeInt(ts)) return invalid("ts_ms")
     if (ts !== signature.t) return refused("bad_signature")
     const arrivalMs = now()
     if (Math.abs(arrivalMs - ts) > MAX_SIGNATURE_SKEW_MS) return refused("stale_signature")

@@ -17,16 +17,31 @@ import { spawnSync } from "child_process"
 import { randomInt, randomUUID } from "crypto"
 import { rmSync } from "fs"
 import { dirname, join } from "path"
+import { int, oneOf, record, text } from "./guards"
 import { readPrivateText, writePrivateText } from "./private-files"
 import { signatureHeader } from "./signature"
+
+const KINDS = ["sms", "notification"] as const
 
 interface State {
   deliveryId: string
   capturedAtMs: number
-  kind: "sms" | "notification"
+  kind: (typeof KINDS)[number]
   sender: string
   text: string
   code: string
+}
+
+function readState(path: string): State {
+  const state = record(JSON.parse(readPrivateText(path)), "state")
+  return {
+    deliveryId: text(state.deliveryId, "deliveryId"),
+    capturedAtMs: int(state.capturedAtMs, "capturedAtMs"),
+    kind: oneOf(state.kind, KINDS, "kind"),
+    sender: text(state.sender, "sender"),
+    text: text(state.text, "text"),
+    code: text(state.code, "code"),
+  }
 }
 
 function options(argv: string[]): Map<string, string> {
@@ -38,10 +53,17 @@ function options(argv: string[]): Map<string, string> {
   return map
 }
 
+const UNITS = new Map([
+  ["ms", 1],
+  ["s", 1000],
+  ["m", 60_000],
+  ["h", 3_600_000],
+])
+
 function duration(value: string | undefined): number {
   const match = /^(-?)(\d+)(ms|s|m|h)?$/.exec(value ?? "0")
-  if (!match) throw new Error(`${value} is not a duration`)
-  const unit = { ms: 1, s: 1000, m: 60_000, h: 3_600_000 }[(match[3] ?? "s") as "ms" | "s" | "m" | "h"]
+  const unit = match ? UNITS.get(match[3] ?? "s") : undefined
+  if (!match || unit === undefined) throw new Error(`${value} is not a duration`)
   return (match[1] ? -1 : 1) * Number(match[2]) * unit
 }
 
@@ -68,7 +90,7 @@ function create(map: Map<string, string>): void {
 
 function send(map: Map<string, string>): number {
   const statePath = required(map, "state")
-  const state = JSON.parse(readPrivateText(statePath)) as State
+  const state = readState(statePath)
   const key = readPrivateText(required(map, "key-file")).trim()
   // The phone's clock: its own send time, and the age it would report, both on it.
   const tsMs = Date.now() + duration(map.get("phone-skew"))
@@ -123,7 +145,7 @@ function send(map: Map<string, string>): number {
 }
 
 function compare(map: Map<string, string>): number {
-  const state = JSON.parse(readPrivateText(required(map, "state"))) as State
+  const state = readState(required(map, "state"))
   const claimed = /^OTP_CODE=(.*)$/m.exec(readPrivateText(required(map, "otp-file")))?.[1]
   const matches = claimed === state.code
   console.log(`code matches: ${matches}`)
