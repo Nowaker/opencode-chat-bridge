@@ -42,8 +42,17 @@ function isSafeInt(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value)
 }
 
+/**
+ * JSON null in an optional field means the same as leaving the field out.
+ * Refusing it would be a 400, which stops the phone's retries and loses the
+ * delivery.
+ */
+function absent(value: unknown): value is null | undefined {
+  return value === undefined || value === null
+}
+
 function optionalString(value: unknown): value is string | null | undefined {
-  return value === undefined || value === null || typeof value === "string"
+  return absent(value) || typeof value === "string"
 }
 
 /** Validates every field the broker reads. Fields it does not know are ignored. */
@@ -54,7 +63,7 @@ export function parseEvent(body: unknown): ParsedEvent {
   if (!isSafeInt(body.ts_ms) || body.ts_ms <= 0) return fail("ts_ms")
   if (typeof body.delivery_id !== "string" || !UUID.test(body.delivery_id)) return fail("delivery_id")
   if (!isSafeInt(body.captured_at_ms) || body.captured_at_ms <= 0) return fail("captured_at_ms")
-  if (body.age_ms !== undefined && (!isSafeInt(body.age_ms) || body.age_ms < 0)) return fail("age_ms")
+  if (!absent(body.age_ms) && (!isSafeInt(body.age_ms) || body.age_ms < 0)) return fail("age_ms")
   if (!isRecord(body.source)) return fail("source")
   const source = body.source
   if (source.kind !== "sms" && source.kind !== "notification") return fail("source.kind")
@@ -62,14 +71,14 @@ export function parseEvent(body: unknown): ParsedEvent {
   if (!optionalString(source.name)) return fail("source.name")
   if (!optionalString(source.package)) return fail("source.package")
   if (source.kind === "notification" && !source.package) return fail("source.package")
-  if (source.time_basis !== undefined && (typeof source.time_basis !== "string" || !/^[a-z_]{1,32}$/.test(source.time_basis))) {
+  if (!absent(source.time_basis) && (typeof source.time_basis !== "string" || !/^[a-z_]{1,32}$/.test(source.time_basis))) {
     return fail("source.time_basis")
   }
   if (typeof body.body !== "string") return fail("body")
   if (!optionalString(body.label)) return fail("label")
-  if (body.test !== undefined && typeof body.test !== "boolean") return fail("test")
-  if (body.redirect_id !== undefined && !isSafeInt(body.redirect_id)) return fail("redirect_id")
-  if (body.event_id !== undefined && !isSafeInt(body.event_id)) return fail("event_id")
+  if (!absent(body.test) && typeof body.test !== "boolean") return fail("test")
+  if (!absent(body.redirect_id) && !isSafeInt(body.redirect_id)) return fail("redirect_id")
+  if (!absent(body.event_id) && !isSafeInt(body.event_id)) return fail("event_id")
   return {
     ok: true,
     event: {
@@ -77,17 +86,17 @@ export function parseEvent(body: unknown): ParsedEvent {
       tsMs: body.ts_ms,
       deliveryId: body.delivery_id,
       capturedAtMs: body.captured_at_ms,
-      ageMs: body.age_ms === undefined ? null : (body.age_ms as number),
+      ageMs: absent(body.age_ms) ? null : (body.age_ms as number),
       kind: source.kind,
-      timeBasis: (source.time_basis as string | undefined) ?? null,
+      timeBasis: absent(source.time_basis) ? null : (source.time_basis as string),
       number: source.number,
       name: source.name ?? "",
       package: source.package || null,
       body: body.body,
       label: body.label ?? null,
       test: body.test === true,
-      redirectId: body.redirect_id === undefined ? null : (body.redirect_id as number),
-      eventId: body.event_id === undefined ? null : (body.event_id as number),
+      redirectId: absent(body.redirect_id) ? null : (body.redirect_id as number),
+      eventId: absent(body.event_id) ? null : (body.event_id as number),
     },
   }
 }

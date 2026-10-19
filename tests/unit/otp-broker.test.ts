@@ -290,6 +290,41 @@ describe("webhook signature", () => {
     expect(h.logs.join("\n")).not.toContain(SENDER_A)
     expect(await h.receipts()).toEqual([])
   })
+
+  test("treats JSON null in an optional field as absent, so a retry that drops it is a duplicate", async () => {
+    const h = new Harness()
+    const id = await h.request(SESSION_A, "--service", "proof-a", "--sender", SENDER_A)
+    h.clock += 5 * SECOND
+    const value = body({ capturedAt: T0 + SECOND, code: "868686" }, h.clock)
+    const nulled = {
+      ...value,
+      age_ms: null,
+      redirect_id: null,
+      event_id: null,
+      label: null,
+      source: { ...(value.source as Record<string, unknown>), name: null, package: null, time_basis: null },
+    }
+    const stored = await h.send(nulled)
+    expect(stored).toMatchObject({ status: 200, json: { status: "stored" } })
+    expect(await h.receipt(value.delivery_id as string)).toMatchObject({ state: "matched", ageSource: "ts", timeBasis: null })
+
+    h.clock += 10 * SECOND
+    const { age_ms: _a, redirect_id: _r, event_id: _e, label: _l, ...dropped } = nulled
+    const { name: _n, package: _p, time_basis: _t, ...source } = nulled.source
+    const retry = await h.send({ ...dropped, source, ts_ms: h.clock })
+    expect(retry).toMatchObject({ status: 200, json: { status: "duplicate", receipt_id: stored.json.receipt_id } })
+
+    const untested = body({ capturedAt: T0 + SECOND, code: "878787" }, h.clock)
+    expect((await h.send({ ...untested, test: null })).json.status).toBe("stored")
+    expect((await h.receipt(untested.delivery_id as string)).test).toBe(false)
+
+    const note = body({ kind: "notification", capturedAt: T0 + SECOND }, h.clock)
+    const noPackage = { ...note, source: { ...(note.source as Record<string, unknown>), package: null } }
+    expect(await h.send(noPackage)).toMatchObject({ status: 400, json: { status: "invalid", error: "source.package" } })
+
+    expect((await h.cli(SESSION_A, "claim", id)).code).toBe(0)
+    expect(h.claimedCode(id)).toBe("868686")
+  })
 })
 
 describe("deduplication", () => {
