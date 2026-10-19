@@ -16,7 +16,7 @@
  */
 
 import { createHash, randomBytes } from "crypto"
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "fs"
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "fs"
 import { join } from "path"
 import { isTerminalDispatch, Journal, threadKey, type OutboxRecord, type RelayRecord } from "./journal"
 import { buildRelayPrompt, parseRelayId } from "./prompt"
@@ -101,6 +101,7 @@ function sha256(text: string): string {
 export class Relay {
   readonly journal: Journal
   private readonly pendingDir: string
+  readonly requeueDir: string
   private readonly now: () => number
   private readonly log: (line: string) => void
   private readonly pollIntervalMs: number
@@ -126,6 +127,8 @@ export class Relay {
     this.journal = new Journal(join(options.stateDir, "journal.jsonl"), { sync: options.syncJournal !== false })
     this.pendingDir = join(options.stateDir, "pending")
     mkdirSync(this.pendingDir, { recursive: true, mode: 0o700 })
+    this.requeueDir = join(options.stateDir, "requeue")
+    mkdirSync(this.requeueDir, { recursive: true, mode: 0o700 })
     this.now = options.now ?? Date.now
     this.log = options.log ?? ((line) => console.log(`[RELAY] ${line}`))
     this.pollIntervalMs = options.pollIntervalMs ?? 3_000
@@ -171,7 +174,11 @@ export class Relay {
     for (const route of this.enabledRoutes()) this.expireClaims(route)
     const loaded = this.journal.loaded
     this.log(`journal: ${loaded.records} records${loaded.skipped ? `, ${loaded.skipped} unreadable lines skipped` : ""}`)
-    this.watchTimer = setInterval(() => void this.watchAll(), this.pollIntervalMs)
+    this.processRequeues()
+    this.watchTimer = setInterval(() => {
+      this.processRequeues()
+      void this.watchAll()
+    }, this.pollIntervalMs)
     await this.watchAll()
   }
 
@@ -215,26 +222,7 @@ export class Relay {
 
     const relayId = newId("rly")
     const replyThreadRootId = request.threadRootId || request.eventId
-    const text = buildRelayPrompt(
-      {
-        route: request.route,
-        chat: config.idsInPrompt
-          ? `${request.roomId}${config.chatLabel ? ` ("${config.chatLabel}")` : ""}`
-          : (config.chatLabel ?? request.route),
-        sender: config.idsInPrompt ? request.sender : "owner (own account)",
-        event: config.idsInPrompt ? request.eventId : `sha256:${sha256(request.eventId).slice(0, 16)}`,
-        thread: request.threadRootId
-          ? (config.idsInPrompt ? request.threadRootId : `sha256:${sha256(request.threadRootId).slice(0, 16)}`)
-          : "",
-        relayId,
-        postedAt: request.postedAt,
-        trust: "operator",
-        replyHint: config.repliesOnly
-          ? "your answer is posted back to this chat; reply exactly NO_REPLY to post nothing"
-          : "your answer is posted in this message's thread; reply exactly NO_REPLY to post nothing",
-      },
-      request.text,
-    )
+    const text = this.promptFor(config, request, relayId, request.text)
     this.writePending(relayId, { sessionID: config.sessionID, key: `ai-bridge-relay:${relayId}`, text })
     this.journal.append({
       kind: "inbound",
@@ -254,6 +242,79 @@ export class Relay {
     this.scheduleDispatch(relayId, 0)
     this.wake(request.route)
     return { state: "accepted", relayId }
+  }
+
+  private promptFor(
+    config: RouteConfig,
+    message: Pick<RelayRecord, "route" | "roomId" | "sender" | "eventId" | "threadRootId" | "postedAt">,
+    relayId: string,
+    text: string,
+  ): string {
+    return buildRelayPrompt(
+      {
+        route: message.route,
+        chat: config.idsInPrompt
+          ? `${message.roomId}${config.chatLabel ? ` ("${config.chatLabel}")` : ""}`
+          : (config.chatLabel ?? message.route),
+        sender: config.idsInPrompt ? message.sender : "owner (own account)",
+        event: config.idsInPrompt ? message.eventId : `sha256:${sha256(message.eventId).slice(0, 16)}`,
+        thread: message.threadRootId
+          ? (config.idsInPrompt ? message.threadRootId : `sha256:${sha256(message.threadRootId).slice(0, 16)}`)
+          : "",
+        relayId,
+        postedAt: message.postedAt,
+        trust: "operator",
+        replyHint: config.repliesOnly
+          ? "your answer is posted back to this chat; reply exactly NO_REPLY to post nothing"
+          : "your answer is posted in this message's thread; reply exactly NO_REPLY to post nothing",
+      },
+      text,
+    )
+  }
+
+  /**
+   * Redeliver the relays an operator requeued: `<stateDir>/requeue/<relayId>.json`
+   * holding `{"text": ...}`, the message as the connector handed it over. Only a
+   * definite refusal (`failed`) qualifies, only with the text whose hash the
+   * journal recorded, and only under the original key, so vibeterm-api's ledger
+   * still makes it one delivery at most. An uncertain relay is never requeued.
+   */
+  processRequeues(): void {
+    let names: string[]
+    try {
+      names = readdirSync(this.requeueDir)
+    } catch {
+      return
+    }
+    for (const name of names) {
+      if (!name.endsWith(".json")) continue
+      const path = join(this.requeueDir, name)
+      const verdict = this.requeue(name.slice(0, -".json".length), path)
+      rmSync(path, { force: true })
+      this.log(verdict)
+    }
+  }
+
+  private requeue(relayId: string, path: string): string {
+    const relay = this.state.relays.get(relayId)
+    if (!relay) return `requeue of ${relayId} refused: no such relay`
+    if (relay.dispatch !== "failed") return `requeue of ${relayId} refused: its delivery is ${relay.dispatch}, and only a definite refusal is redelivered`
+    const config = this.route(relay.route)
+    if (!config) return `requeue of ${relayId} refused: route ${relay.route} is disabled`
+    let text: unknown
+    try {
+      text = JSON.parse(readFileSync(path, "utf8"))?.text
+    } catch {
+      return `requeue of ${relayId} refused: unreadable request`
+    }
+    if (typeof text !== "string" || sha256(text) !== relay.textSha256) {
+      return `requeue of ${relayId} refused: the text does not match the one the journal recorded`
+    }
+    this.writePending(relayId, { sessionID: config.sessionID, key: `ai-bridge-relay:${relayId}`, text: this.promptFor(config, relay, relayId, text) })
+    this.journal.append({ kind: "requeue", at: this.now(), relayId })
+    this.scheduleDispatch(relayId, 0)
+    this.wake(relay.route)
+    return `requeued ${relayId} under its original key`
   }
 
   // ---------------------------------------------------------------------------

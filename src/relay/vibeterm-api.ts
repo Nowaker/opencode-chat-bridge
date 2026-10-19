@@ -153,6 +153,9 @@ export async function classifyPromptResponse(response: Response): Promise<Prompt
   if (status === 409) return { kind: "needs_attention", status, error }
   // Refused by the gate or before any delivery was attempted.
   if (status === 401 || status === 503 || status === 429) return { kind: "retry", status, error }
+  // A definite refusal (usually a parked tab still waking past the API's 60s
+  // pane wait): nothing was submitted and the ledger forgets the key.
+  if (status === 400 && body?.data?.possiblyAccepted === false) return { kind: "retry", status, error }
   if (status >= 500) return { kind: "uncertain", status, error }
   return { kind: "failed", status, error }
 }

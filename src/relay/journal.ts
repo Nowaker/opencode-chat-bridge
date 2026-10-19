@@ -84,6 +84,8 @@ export type JournalRecord =
       /** Relay-authored notices only: they carry no chat or model content. */
       noticeText?: string
     }
+  /** An operator redelivering a definite refusal; see `Relay.processRequeues`. */
+  | { kind: "requeue"; at: number; relayId: string }
   | { kind: "claim"; at: number; outboxId: string }
   | { kind: "sent"; at: number; outboxId: string; chatEventId: string }
   | { kind: "send_failed"; at: number; outboxId: string; error: string; definite: boolean }
@@ -101,6 +103,7 @@ export interface RelayRecord {
   sender: string
   postedAt: number
   receivedAt: number
+  textSha256: string
   dispatch: DispatchState
   attempts: number
   lastAttemptAt?: number
@@ -186,6 +189,7 @@ export class RelayState {
           sender: record.sender,
           postedAt: record.postedAt,
           receivedAt: record.at,
+          textSha256: record.textSha256,
           dispatch: "pending",
           attempts: 0,
         })
@@ -215,6 +219,11 @@ export class RelayState {
           default:
             relay.dispatch = record.outcome
         }
+        return
+      }
+      case "requeue": {
+        const relay = this.relays.get(record.relayId)
+        if (relay?.dispatch === "failed") relay.dispatch = "pending"
         return
       }
       case "turn": {

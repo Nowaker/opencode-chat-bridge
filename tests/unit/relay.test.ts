@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test"
-import { mkdtempSync, readdirSync, rmSync, statSync } from "fs"
+import { existsSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "fs"
 import { tmpdir } from "os"
 import { join } from "path"
 import { RelayClient } from "../../src/relay/client"
@@ -8,7 +8,7 @@ import { Relay, type RelayApi, type RouteConfig } from "../../src/relay/relay"
 import { parseInbound, startRelayServer } from "../../src/relay/server"
 import type { ApiMessage } from "../../src/relay/turns"
 import type { InboundRequest } from "../../src/relay/types"
-import type { PromptOutcome } from "../../src/relay/vibeterm-api"
+import { classifyPromptResponse, type PromptOutcome } from "../../src/relay/vibeterm-api"
 
 // Every journal record is written synchronously; on a loaded host that is slow.
 setDefaultTimeout(30_000)
@@ -207,6 +207,18 @@ describe("delivery", () => {
     expect(api.prompts[1].text).toBe(api.prompts[0].text)
   })
 
+  test("a parked tab that outlives the API's pane wait is delivered on retry, with no notice", async () => {
+    const api = new FakeApi()
+    const parked = { name: "BadRequest", data: { message: `session ${SESSION} did not publish a ready live pane within 60000ms; nothing submitted`, kind: "Body", possiblyAccepted: false } }
+    api.outcomes.push(await classifyPromptResponse(new Response(JSON.stringify(parked), { status: 400 })))
+    const { relay } = await startRelay(api)
+    const { relayId } = await relay.handleInbound(message("$e1", "hello"))
+    await until(() => relay.state.relays.get(relayId!)?.dispatch === "delivered")
+    expect(api.prompts).toHaveLength(2)
+    expect(api.prompts[1].key).toBe(api.prompts[0].key)
+    expect((await relay.takeOutbox("matrix", 0)).items).toHaveLength(0)
+  })
+
   test("gives up after its retry budget and says so in the thread", async () => {
     const api = new FakeApi()
     for (let i = 0; i < 4; i++) api.outcomes.push({ kind: "retry", error: "connection refused" })
@@ -218,6 +230,58 @@ describe("delivery", () => {
     expect(outbox.items).toHaveLength(1)
     expect(outbox.items[0]).toMatchObject({ kind: "notice", roomId: ROOM, threadRootId: "$e1", replyToEventId: "$e1" })
     expect(outbox.items[0].text).toContain("was not delivered")
+  })
+
+  test("a requeued refusal is delivered again under its original key, with the identical prompt", async () => {
+    const api = new FakeApi()
+    api.outcomes.push({ kind: "failed", status: 400, error: "BadRequest: refused" })
+    const { relay } = await startRelay(api)
+    const { relayId } = await relay.handleInbound(message("$e1", "hello"))
+    await until(() => relay.state.relays.get(relayId!)?.dispatch === "failed")
+    const request = join(relay.requeueDir, `${relayId}.json`)
+    writeFileSync(request, JSON.stringify({ text: "hello" }))
+    relay.processRequeues()
+    await until(() => relay.state.relays.get(relayId!)?.dispatch === "delivered")
+    expect(api.prompts).toHaveLength(2)
+    expect(api.prompts[1]).toEqual(api.prompts[0])
+    expect(existsSync(request)).toBe(false)
+  })
+
+  test("a requeue needs the recorded text and a definite refusal", async () => {
+    const api = new FakeApi()
+    api.outcomes.push({ kind: "failed", status: 400, error: "BadRequest: refused" })
+    const { relay } = await startRelay(api)
+    const { relayId: refused } = await relay.handleInbound(message("$e1", "hello"))
+    await until(() => relay.state.relays.get(refused!)?.dispatch === "failed")
+    writeFileSync(join(relay.requeueDir, `${refused}.json`), JSON.stringify({ text: "hello\n" }))
+    relay.processRequeues()
+    expect(relay.state.relays.get(refused!)?.dispatch).toBe("failed")
+
+    const { relayId: delivered } = await relay.handleInbound(message("$e2", "again"))
+    await until(() => relay.state.relays.get(delivered!)?.dispatch === "delivered")
+    writeFileSync(join(relay.requeueDir, `${delivered}.json`), JSON.stringify({ text: "again" }))
+    relay.processRequeues()
+    await Bun.sleep(20)
+    expect(api.prompts).toHaveLength(2)
+    expect(readdirSync(relay.requeueDir)).toEqual([])
+  })
+
+  test("a requeue survives a restart before it is delivered", async () => {
+    const api = new FakeApi()
+    api.outcomes.push({ kind: "failed", status: 400, error: "BadRequest: refused" })
+    const { relay, dir } = await startRelay(api, { options: { retryDelaysMs: [60_000, 60_000] } })
+    const { relayId } = await relay.handleInbound(message("$e1", "hello"))
+    await until(() => relay.state.relays.get(relayId!)?.dispatch === "failed")
+    api.outcomes.push({ kind: "retry", status: 503, error: "unavailable" })
+    writeFileSync(join(relay.requeueDir, `${relayId}.json`), JSON.stringify({ text: "hello" }))
+    relay.processRequeues()
+    await until(() => relay.state.relays.get(relayId!)?.attempts === 2)
+    expect(relay.state.relays.get(relayId!)?.dispatch).toBe("pending")
+    relay.stop()
+
+    const { relay: restarted } = await startRelay(api, { dir })
+    await until(() => restarted.state.relays.get(relayId!)?.dispatch === "delivered")
+    expect(api.prompts[2]).toEqual(api.prompts[0])
   })
 
   test("a refusal is reported once and not retried", async () => {

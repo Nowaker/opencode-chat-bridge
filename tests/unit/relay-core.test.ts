@@ -150,8 +150,27 @@ describe("prompt outcome classification", () => {
     expect((await classifyPromptResponse(response(502))).kind).toBe("uncertain")
   })
 
+  test("a refusal that submitted nothing is retried under the same key", async () => {
+    const parked = {
+      name: "BadRequest",
+      data: {
+        message: "session ses_x did not publish a ready live pane within 60000ms; nothing submitted",
+        kind: "Body",
+        possiblyAccepted: false,
+      },
+    }
+    expect(await classifyPromptResponse(response(400, parked))).toEqual({
+      kind: "retry",
+      status: 400,
+      error: "BadRequest: session ses_x did not publish a ready live pane within 60000ms; nothing submitted",
+    })
+    expect((await classifyPromptResponse(response(400, { name: "PromptAdmissionError", data: { message: "shutting down", possiblyAccepted: false } }))).kind).toBe("retry")
+  })
+
   test("definite answers are not retried blindly", async () => {
-    expect((await classifyPromptResponse(response(400, { name: "BadRequest", data: { possiblyAccepted: false } }))).kind).toBe("failed")
+    expect((await classifyPromptResponse(response(400, { name: "BadRequest", data: { message: "bad key", kind: "Header" } }))).kind).toBe("failed")
+    expect((await classifyPromptResponse(response(400, { name: "BadRequest", data: { message: "nothing to deliver", kind: "Body" } }))).kind).toBe("failed")
+    expect((await classifyPromptResponse(response(400))).kind).toBe("failed")
     expect((await classifyPromptResponse(response(404, { name: "NotFoundError" }))).kind).toBe("failed")
     expect((await classifyPromptResponse(response(422, { name: "IdempotencyKeyReused" }))).kind).toBe("failed")
     expect((await classifyPromptResponse(response(409, { name: "PromptNeedsAttention" }))).kind).toBe("needs_attention")

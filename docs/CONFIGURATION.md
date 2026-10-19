@@ -130,6 +130,14 @@ The relay is a host process, started with `bun src/relay/main.ts --config relay.
 
 An enabled route with an empty allowlist refuses to start. A message reaches the session as a `[chat_relay] ... [/chat_relay]` provenance block followed by its text. The session's answer is posted unless it is exactly `NO_REPLY`, and a first line `REPLY_TO: <relay_id>` sends a later turn into that message's thread.
 
+Delivery is `prompt_async` with `Idempotency-Key: ai-bridge-relay:<relay_id>`, retried under that key at 5 s, 15 s, 1 min, 2 min, 5 min and 10 min. A refusal that submitted nothing (HTTP 400 with `possiblyAccepted: false`, typically a parked tab still waking past vibeterm-api's 60 s pane wait) is retried; any other 400, a 404 and a 422 are final and reported in the thread. An operator can redeliver a final refusal under its original key:
+
+```bash
+printf '%s' '<message text as posted, trigger removed>' | bun src/relay/requeue.ts --config relay.json rly_...
+```
+
+The relay accepts it only for a relay whose delivery `failed`, never an uncertain one, and only when the text's sha256 matches the one its journal recorded; it logs `requeued rly_...` or the reason it refused.
+
 ## Session picker
 
 The project/session picker is disabled by default because it exposes saved ACP working directories, session titles, and optional recent history previews.
