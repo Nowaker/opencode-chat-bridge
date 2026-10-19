@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test"
 import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "fs"
-import { tmpdir } from "os"
+import { homedir, tmpdir } from "os"
 import { join } from "path"
 import { loadRelayConfig } from "../../src/relay/config"
 import { Journal, replayJournal } from "../../src/relay/journal"
@@ -280,6 +280,31 @@ describe("relay config", () => {
       minReleaseWindowMs: 90_000,
     })
     expect(config.whatsappNative!.capabilityFile.startsWith("~")).toBe(false)
+  })
+
+  test("the native verifier expands argv paths and defaults its timeout", () => {
+    const dir = scratch()
+    const native = {
+      clientModule: "/opt/app/control/client.cjs", capabilityFile: "~/cap.json", headFile: "~/head.json",
+      verifier: { command: ["~/bin/verify", "--config", "~/verifier.json"] },
+    }
+    const config = loadRelayConfig(write(dir, { whatsapp: { enabled: false, sessionID: "ses_def", native } }))
+    expect(config.whatsappNative?.verifier).toEqual({ command: [join(homedir(), "bin/verify"), "--config", join(homedir(), "verifier.json")], timeoutMs: 45_000 })
+  })
+
+  test.each([
+    null, false, [], "command", {}, { command: [] }, { command: [""] }, { command: ["node", 1] }, { command: "node" },
+    { command: ["node"], timeoutMs: 999 }, { command: ["node"], timeoutMs: 120_001 },
+    { command: ["node"], timeoutMs: 1_000.5 }, { command: ["node"], timeoutMs: "45000" }, { command: ["node"], timeoutMs: null },
+  ].map((verifier) => ({ verifier })))("refuses an invalid native verifier: %j", ({ verifier }) => {
+    const native = { clientModule: "/opt/app/control/client.cjs", capabilityFile: "~/cap.json", headFile: "~/head.json", verifier }
+    expect(() => loadRelayConfig(write(scratch(), { whatsapp: { enabled: false, sessionID: "ses_def", native } })))
+      .toThrow("relay config: routes.whatsapp.native.verifier")
+  })
+
+  test.each([1_000, 120_000])("accepts the verifier timeout boundary %i", (timeoutMs) => {
+    const native = { clientModule: "/opt/app/control/client.cjs", capabilityFile: "~/cap.json", headFile: "~/head.json", verifier: { command: ["node"], timeoutMs } }
+    expect(loadRelayConfig(write(scratch(), { whatsapp: { enabled: false, sessionID: "ses_def", native } })).whatsappNative?.verifier?.timeoutMs).toBe(timeoutMs)
   })
 })
 

@@ -62,6 +62,7 @@ async function startWhatsApp(config: LoadedRelayConfig, configPath: string, rela
       windowMs: native.replyWindowMs,
       safetyMarginMs: native.safetyMarginMs,
       minReleaseWindowMs: native.minReleaseWindowMs,
+      ...(native.verifier ? { verifier: native.verifier } : {}),
       notifySessions: native.notifySessions,
       ...(native.wakeCoordinatorOnHold ? { coordinatorSession: route.sessionID } : {}),
       notify: (sessionID, key, text) => api.promptAsync(sessionID, key, text),

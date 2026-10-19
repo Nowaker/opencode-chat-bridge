@@ -13,7 +13,7 @@
  * again when the reply is sent, and its refusal is final.
  *
  * In hold mode a qualifying message is written to a private record for review
- * instead, and only an operator release (`whatsapp-release.ts`) hands it on.
+ * instead; an operator or the native owner's verifier may release it.
  * Each owner message gets at most one `messages.reply`, whose exact request is
  * written down before the first attempt and only ever replayed unchanged.
  */
@@ -36,6 +36,7 @@ import {
 import { createRequire } from "node:module"
 import { dirname, join } from "node:path"
 import type { AckRequest, InboundRequest, InboundResponse, NackRequest, OutboxItem, OutboxResponse } from "./types"
+import { spawnVerifier, verifierVerdict, type Verification, type VerifierRunner } from "./whatsapp-verifier"
 
 export type NativeCall = (operation: string, payload: Record<string, unknown>) => Promise<any>
 
@@ -300,6 +301,7 @@ export interface HeldRecord {
   prompt: Prompt | null
   invalidated: { at: string; reason: string } | null
   released?: { at: string; outcome: string }
+  verification?: Verification & { at: string }
 }
 
 interface FrozenReply {
@@ -330,6 +332,8 @@ export interface WhatsAppNativeOptions {
   ownerSender: string
   aiPrefix: string
   hold: boolean
+  verifier?: { command: string[]; timeoutMs: number }
+  runVerifier?: VerifierRunner
   trigger?: string
   windowMs?: number
   /** Taken off every reply deadline, for the transport and the app's own checks. */
@@ -357,6 +361,10 @@ export class WhatsAppNativeDriver {
   private stopped = false
   private halted: string | null = null
   private pollTimer: ReturnType<typeof setTimeout> | null = null
+  private polling = false
+  private pollSoon = false
+  private readonly verifying = new Set<string>()
+  private lastVerification: HeldRecord["verification"] | null = null
   private readonly dirs: { held: string; release: string; done: string; discarded: string; replies: string }
   private readonly statePath: string
   private readonly now: () => number
@@ -401,8 +409,11 @@ export class WhatsAppNativeDriver {
       this.answeredParents.add(readPrivate<FrozenReply>(join(this.dirs.replies, file)).request.parent_message_id)
     }
     if (this.options.capabilityExpiresAt <= this.now()) this.log("the reply capability has expired; no reply can be sent until the app grants a new one")
-    this.log(`${this.options.hold ? "HOLD: own messages are kept for review, nothing is prompted" : "live"}; ${this.held.size} held`)
+    this.log(`${this.options.hold ? (this.options.verifier ? "HOLD: own prompts are verified before release" : "HOLD: own messages are kept for review, nothing is prompted") : "live"}; ${this.held.size} held`)
     this.schedulePoll(0)
+    for (const record of this.held.values()) {
+      if (existsSync(join(this.dirs.held, `${record.name}.json`))) this.verify(record)
+    }
     void this.outboxLoop()
   }
 
@@ -418,6 +429,11 @@ export class WhatsAppNativeDriver {
       lastPoll: this.lastPoll,
       held: [...this.held.values()].filter((r) => !r.invalidated).length,
       capabilityExpiresAt: new Date(this.options.capabilityExpiresAt).toISOString(),
+      verifier: {
+        configured: Boolean(this.options.verifier),
+        lastOutcome: this.lastVerification?.outcome ?? null,
+        lastAt: this.lastVerification?.at ?? null,
+      },
     }
   }
 
@@ -488,6 +504,7 @@ export class WhatsAppNativeDriver {
   }
 
   private async cycle(): Promise<void> {
+    this.polling = true
     try {
       while (!this.stopped && !this.halted && (await this.pollOnce())) {}
       if (!this.stopped && !this.halted) await this.processReleases()
@@ -503,7 +520,9 @@ export class WhatsAppNativeDriver {
       this.lastError = message
       this.lastPoll = { at: this.now(), ok: false, error: message }
     }
-    this.schedulePoll(this.options.pollIntervalMs ?? 3_000)
+    this.polling = false
+    this.schedulePoll(this.pollSoon ? 0 : (this.options.pollIntervalMs ?? 3_000))
+    this.pollSoon = false
   }
 
   /** One page. Everything it causes is on disk before the cursor moves past it. */
@@ -630,7 +649,41 @@ export class WhatsAppNativeDriver {
     writePrivate(join(this.dirs.held, `${name}.json`), record)
     this.held.set(name, record)
     this.log(`held ${name} for review: ${record.verdict}${record.reason ? ` (${record.reason})` : ""}`)
-    void this.announce(record)
+    if (this.options.verifier && record.verdict === "prompt") this.verify(record)
+    else void this.announce(record)
+  }
+
+  private verify(record: HeldRecord): void {
+    const verifier = this.options.verifier
+    if (!this.options.hold || !verifier || record.verdict !== "prompt" || this.verifying.has(record.name)) return
+    this.verifying.add(record.name)
+    void (async () => {
+      if (!record.verification) {
+        const result = await (this.options.runVerifier ?? spawnVerifier)([...verifier.command, record.name], verifier.timeoutMs)
+        if (this.stopped) return
+        const path = join(this.dirs.held, `${record.name}.json`)
+        if (!existsSync(path)) return
+        record.verification = { at: new Date(this.now()).toISOString(), ...verifierVerdict(result, record.name) }
+        writePrivate(path, record)
+      }
+      if (this.stopped) return
+      this.lastVerification = record.verification
+      const action = record.verification.outcome === "verified" ? "released" : record.verification.outcome === "refused" ? "discarded" : "still held"
+      if (action !== "still held") {
+        renameSync(join(this.dirs.held, `${record.name}.json`), join(action === "released" ? this.dirs.release : this.dirs.discarded, `${record.name}.json`))
+        if (action === "discarded") this.held.delete(record.name)
+        else {
+          // Drain the journal before processing this release, just as for an operator's rename.
+          if (this.polling) this.pollSoon = true
+          else {
+            if (this.pollTimer) clearTimeout(this.pollTimer)
+            this.schedulePoll(0)
+          }
+        }
+      }
+      this.log(`${record.name}: verifier ${record.verification.line ?? record.verification.reason}; ${action}`)
+      await this.announce(record, action)
+    })().catch(() => this.log(`${record.name}: verifier state update failed; inspect the held record`))
   }
 
   private locate(name: string): string | null {
@@ -651,18 +704,31 @@ export class WhatsAppNativeDriver {
     }
   }
 
-  private async announce(record: HeldRecord): Promise<void> {
+  private async announce(record: HeldRecord, action?: "released" | "discarded" | "still held"): Promise<void> {
     if (!this.options.notify) return
-    const lines = [
+    const file = `${record.name}.json`
+    const where = action === "released"
+      ? `${join(this.dirs.release, file)}, then ${join(this.dirs.done, file)} once the release checks have run`
+      : join(action === "discarded" ? this.dirs.discarded : this.dirs.held, file)
+    const lines = action ? [
+      "[ai-bridge-relay notice: automated, sent by the ai-bridge relay process; not typed by the owner, and not a chat message]",
+      `WhatsApp AI group: own message ${record.name}, record ${where} (0600).`,
+      `Relay gate verdict: ${record.verdict}.`,
+      `Verifier: ${record.verification?.line ?? record.verification?.reason}. Action: ${action}.` +
+        (action === "still held" && record.replyBy ? ` A reply is possible until ${new Date(record.replyBy).toISOString()}.` : ""),
+    ] : [
       "[ai-bridge-relay notice: automated, sent by the ai-bridge relay process; not typed by the owner, and not a chat message]",
       `WhatsApp AI group: an own message is HELD for review, journal sequence ${record.sequence}: ${join(this.dirs.held, `${record.name}.json`)} (0600). The relay prompted no session and sent nothing.`,
       `Relay gate verdict: ${record.verdict === "prompt" ? "prompt" : `not a prompt (${record.reason})`}.` +
         (record.replyBy ? ` A reply is possible until ${new Date(record.replyBy).toISOString()}.` : ""),
     ]
-    if (record.verdict === "prompt" && this.options.releaseCommand) lines.push(`Release after verification: ${this.options.releaseCommand} ${record.name}`)
+    if (record.verdict === "prompt" && this.options.releaseCommand && (!action || action === "still held")) {
+      lines.push(`Release after verification: ${this.options.releaseCommand} ${record.name}`)
+      if (action) lines.push(`Discard: ${this.options.releaseCommand} ${record.name} --discard`)
+    }
     const text = lines.join("\n")
     for (const session of this.options.notifySessions ?? []) void this.notice(session, `ai-bridge-relay:held:${record.name}:${session}`, text)
-    if (record.verdict === "prompt" && this.options.coordinatorSession) {
+    if (record.verdict === "prompt" && this.options.coordinatorSession && (!action || action === "still held")) {
       void this.notice(this.options.coordinatorSession, `ai-bridge-relay:wake:${record.name}`, [
         "[ai-bridge-relay notice: automated, sent by the ai-bridge relay process; not typed by the owner, and not a chat message]",
         "A WhatsApp message for this route is held for operator review. If it is released, it arrives here within minutes as a [chat_relay] prompt with a reply_by deadline.",

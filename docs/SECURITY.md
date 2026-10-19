@@ -379,6 +379,7 @@ The WhatsApp route has no connector, so its boundary is the desktop app rather t
 - The relay reads only the designated group's events, through the app's own client module, and can send only through the app's reply-only grant. That grant allows one `[AI] `-prefixed reply per fresh owner message, in that group, within 10 minutes, at most 5 a minute. The app enforces all of it, and the relay holds no WhatsApp credential and cannot send anything else.
 - Only the account's own fresh messages become prompts. Messages from other participants, history, forwards, quotes and edits never reach a session. Every other participant in the group reads every reply.
 - Held records and frozen replies are 0600 files in 0700 directories. A notice to a session carries the file path only, never a message id or text.
+- The optional HOLD verifier is the native app owner's code, executed by the relay as the same user with the relay's environment, not a sandboxed agent. Besides an operator release, it is the only automatic release authority under HOLD: only exit `0` with exactly `verified sN` can request release, and the normal relay release checks remain authoritative. A validated refusal discards without prompting; every other outcome fails closed and stays held. Output is accepted only in a fixed, sequence-bound grammar; raw stdout, stderr and spawn diagnostics are never logged, stored or forwarded. Treat changing the verifier command or its code as changing this release authority.
 
 ## Credential Security
 

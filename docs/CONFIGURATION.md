@@ -169,6 +169,7 @@ The WhatsApp route runs no connector. The relay reads the WhatsApp desktop app's
 | `wakeCoordinatorOnHold` | Wake the route's session when a prompt is held, so its tab is up by the time it is released. |
 | `trigger` | Default `!oc`. It must open the raw text. |
 | `replyWindowMs`, `safetyMarginMs`, `minReleaseWindowMs` | The app accepts a reply for 10 minutes after the post (`600000`). The relay stops 30 s short of that, and refuses a release with less than 90 s left. |
+| `verifier` | Optional native app owner's executable argv (`command`) and `timeoutMs` (default `45000`, integer `1000..120000`). Runs only for gate verdict `prompt` in HOLD mode. |
 
 A message is a prompt only when all of these hold:
 
@@ -190,6 +191,32 @@ bun src/relay/whatsapp-release.ts --config relay.json --discard s<sequence>
 ```
 
 The relay checks a released message again before it prompts anything: its verdict, anything that invalidated it, the generation and the time left. It logs `release of s<sequence>: ...` either way.
+
+To automate the native owner's review, add this optional block under `routes.whatsapp.native`:
+
+```json
+{
+  "verifier": {
+    "command": ["/usr/bin/node", "/opt/whatsapp-nativefier/resources/app/control/verify-held.cjs", "--config", "/home/nowaker/.local/share/whatsapp-nativefier-intake/verifier-config.json"],
+    "timeoutMs": 45000
+  }
+}
+```
+
+`command` is a non-empty argv array of non-empty strings, not a shell command. The relay appends `s<sequence>` LAST, inherits its own environment and ignores stdin. Every element starting with `~/` is expanded by the config loader; use absolute paths as above rather than relying on shell expansion. The held record is durably written before the verifier starts and stays in `held/` while it runs; journal polling continues. It runs once per record per process. Startup verifies unverified held prompts, but never reruns a recorded outcome. Live mode and non-prompt records do not run it.
+
+Across stdout and stderr there must be exactly one non-empty trimmed line, matching this record's `sN`:
+
+| Exit | Exact line contract | Outcome and action |
+|---|---|---|
+| `0` | `verified sN` | `verified`: persist the outcome, rename into `release/` and promptly run the ordinary release path. All release checks, including the minimum remaining window, still apply. |
+| `1` | `refuse sN: REASON` | `refused`: persist the outcome and rename into `discarded/`; never prompt it. |
+| `2` | `unavailable sN: REASON` | `unavailable`: persist the outcome and leave it held for operator review. |
+| Anything else | No accepted line | `inconclusive`: persist only a fixed description and leave it held. |
+
+`REASON` must match `[A-Za-z0-9 _.,:()/-]{1,120}`. A wrong sequence, mismatched exit/line, zero or multiple non-empty lines, or output exceeding the combined 8 KiB capture limit is inconclusive. Spawn failures record only `spawn failed: CODE`, other exits/signals only `exit N` / `signal NAME`, and timeouts only `timed out`. Unrecognized output records only `output not recognized (N lines, B bytes)`. Timeout sends SIGTERM, then SIGKILL about two seconds later if needed. Raw verifier output is never logged, stored or forwarded; only the validated line or fixed description is retained in `verification: { at, outcome, line, reason }` before any rename.
+
+With a verifier, prompt hold notices wait for the outcome: each `notifySessions` session receives one keyed, automated path-only notice with the gate verdict, safe verification result and action (`released`, `discarded`, `still held`). Only a still-held result includes both manual release and discard commands. `wakeCoordinatorOnHold` wakes the coordinator only for `unavailable` or `inconclusive`, never ahead of a verified prompt. Without a verifier, existing hold notices and operator release behavior are unchanged. Health adds `verifier: { configured, lastOutcome, lastAt }`, with no message ids.
 
 ## Session picker
 

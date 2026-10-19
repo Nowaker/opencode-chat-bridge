@@ -38,6 +38,7 @@ interface NativeFile {
   replyWindowMs?: number
   safetyMarginMs?: number
   minReleaseWindowMs?: number
+  verifier?: unknown
 }
 
 /** The WhatsApp route's link to the desktop app's controls (`whatsapp-native.ts`). */
@@ -52,6 +53,7 @@ export interface NativeRouteConfig {
   replyWindowMs: number
   safetyMarginMs: number
   minReleaseWindowMs: number
+  verifier?: { command: string[]; timeoutMs: number }
 }
 
 interface RelayFile {
@@ -145,11 +147,27 @@ export function loadRelayConfig(path: string): LoadedRelayConfig {
       const native = route.native
       const notifySessions = native.notifySessions ?? []
       if (!notifySessions.every((id) => /^ses_[A-Za-z0-9]+$/.test(id))) throw new Error("relay config: routes.whatsapp.native.notifySessions holds a non-session id")
+      let verifier: NativeRouteConfig["verifier"]
+      if (native.verifier !== undefined) {
+        const value = native.verifier
+        if (typeof value !== "object" || value === null || Array.isArray(value) || !("command" in value)) {
+          throw new Error("relay config: routes.whatsapp.native.verifier must hold a command array")
+        }
+        const command: unknown = value.command
+        if (!Array.isArray(command) || command.length === 0 || !command.every((arg): arg is string => typeof arg === "string" && arg.length > 0)) {
+          throw new Error("relay config: routes.whatsapp.native.verifier command must be a non-empty array of non-empty strings")
+        }
+        const timeoutMs = "timeoutMs" in value ? value.timeoutMs : 45_000
+        if (typeof timeoutMs !== "number" || !Number.isInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 120_000) {
+          throw new Error("relay config: routes.whatsapp.native.verifier timeoutMs must be an integer in 1000..120000")
+        }
+        verifier = { command: command.map(expand), timeoutMs }
+      }
       whatsappNative = {
         clientModule: required(native.clientModule, "routes.whatsapp.native.clientModule"),
         capabilityFile: required(native.capabilityFile, "routes.whatsapp.native.capabilityFile"),
         headFile: required(native.headFile, "routes.whatsapp.native.headFile"),
-        // Holding is the safe default: nothing is prompted until an operator releases it.
+        // Holding is the safe default: nothing is prompted until a reviewed release.
         hold: native.hold !== false,
         notifySessions,
         wakeCoordinatorOnHold: native.wakeCoordinatorOnHold === true,
@@ -157,6 +175,7 @@ export function loadRelayConfig(path: string): LoadedRelayConfig {
         replyWindowMs: native.replyWindowMs ?? 600_000,
         safetyMarginMs: native.safetyMarginMs ?? 30_000,
         minReleaseWindowMs: native.minReleaseWindowMs ?? 90_000,
+        ...(verifier ? { verifier } : {}),
       }
     }
   }

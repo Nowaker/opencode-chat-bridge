@@ -20,6 +20,7 @@ import {
   type ReplyRequest,
   type WhatsAppNativeOptions,
 } from "../../src/relay/whatsapp-native"
+import { spawnVerifier, verifierVerdict, type VerifierRun, type VerifierRunner } from "../../src/relay/whatsapp-verifier"
 
 setDefaultTimeout(30_000)
 
@@ -290,6 +291,7 @@ interface Rig {
   replies: ReplyRequest[]
   outcomes: ReplyOutcome[]
   clock: { now: number }
+  logs: string[]
   heldPath: (name: string) => string
 }
 
@@ -305,6 +307,7 @@ async function rig(options: Partial<WhatsAppNativeOptions> = {}, existing?: Pick
   const notices: Rig["notices"] = []
   const replies: ReplyRequest[] = []
   const outcomes: ReplyOutcome[] = []
+  const logs: string[] = []
   const stateDir = join(dir, "state", "whatsapp")
   mkdirSync(join(dir, "state"), { recursive: true, mode: 0o700 })
   const driver = new WhatsAppNativeDriver({
@@ -332,11 +335,11 @@ async function rig(options: Partial<WhatsAppNativeOptions> = {}, existing?: Pick
     releaseCommand: "bun src/relay/whatsapp-release.ts --config /x/relay.json",
     pollIntervalMs: 3_600_000,
     now: () => clock.now,
-    log: () => {},
+    log: (line) => logs.push(line),
     ...options,
   })
   drivers.push(driver)
-  return { dir, app, relay, driver, notices, replies, outcomes, clock, heldPath: (name) => join(stateDir, "held", `${name}.json`) }
+  return { dir, app, relay, driver, notices, replies, outcomes, clock, logs, heldPath: (name) => join(stateDir, "held", `${name}.json`) }
 }
 
 function release(r: Rig, name: string): void {
@@ -531,6 +534,284 @@ describe("hold and release", () => {
     await again.driver.start()
     await again.driver.pollOnce()
     expect(JSON.parse(readFileSync(r.heldPath(name), "utf8")).invalidated).toBeNull()
+  })
+})
+
+describe("the held-message verifier", () => {
+  const verifier = { command: ["/native/verifier", "--config", "/native/config.json"], timeoutMs: 45_000 }
+
+  function exited(code: number, output: string): VerifierRun {
+    return { kind: "exit", code, signal: null, output, lines: output.split("\n").filter((line) => line.trim()).length, bytes: Buffer.byteLength(output) }
+  }
+
+  function pending() {
+    let finish: (result: VerifierRun) => void = () => { throw new Error("verifier not started") }
+    const result = new Promise<VerifierRun>((resolve) => { finish = resolve })
+    const commands: Array<{ command: readonly string[]; timeoutMs: number }> = []
+    const runVerifier: VerifierRunner = async (command, timeoutMs) => {
+      commands.push({ command, timeoutMs })
+      return result
+    }
+    return { commands, runVerifier, finish }
+  }
+
+  function record(r: Rig, name: string): HeldRecord {
+    return JSON.parse(readFileSync(r.heldPath(name), "utf8"))
+  }
+
+  test("runs after the private write without blocking polling or sending early notices, then releases through the queue", async () => {
+    const child = pending()
+    const r = await rig({ hold: true, verifier, runVerifier: child.runVerifier, notifySessions: ["ses_native", "ses_operator"], coordinatorSession: "ses_coordinator" })
+    const e = event("!oc verifier happy path")
+    const name = `s${e.sequence}`
+    r.app.events.push(e)
+    await r.driver.start()
+    await until(() => child.commands.length === 1)
+    expect(record(r, name).verification).toBeUndefined()
+    expect(statSync(r.heldPath(name)).mode & 0o777).toBe(0o600)
+    expect(child.commands).toEqual([{ command: [...verifier.command, name], timeoutMs: 45_000 }])
+    expect(r.notices).toEqual([])
+    expect(r.driver.health().verifier).toEqual({ configured: true, lastOutcome: null, lastAt: null })
+    await r.driver.pollOnce()
+    expect(child.commands).toHaveLength(1)
+    let queued: HeldRecord | undefined
+    r.relay.handleInbound = async (request) => {
+      queued = JSON.parse(readFileSync(join(r.dir, "state", "whatsapp", "release", `${name}.json`), "utf8"))
+      r.relay.inbound.push(request)
+      return { state: "accepted", relayId: "rly_1" }
+    }
+    child.finish(exited(0, `verified ${name}\n`))
+    await until(() => existsSync(join(r.dir, "state", "whatsapp", "done", `${name}.json`)))
+    expect(queued?.verification).toEqual({ at: new Date(NOW).toISOString(), outcome: "verified", line: `verified ${name}`, reason: null })
+    expect(r.relay.inbound).toEqual([expect.objectContaining({ eventId: e.message.id, text: "verifier happy path", replyBy: NOW - 6_000 + 570_000 })])
+    expect(existsSync(r.heldPath(name))).toBe(false)
+    expect(r.notices.map((notice) => notice.key).sort()).toEqual([`ai-bridge-relay:held:${name}:ses_native`, `ai-bridge-relay:held:${name}:ses_operator`])
+    for (const notice of r.notices) {
+      expect(notice.text.startsWith("[ai-bridge-relay notice: automated,")).toBe(true)
+      expect(notice.text).toContain(join(r.dir, "state", "whatsapp", "release", `${name}.json`))
+      expect(notice.text).toContain(join(r.dir, "state", "whatsapp", "done", `${name}.json`))
+      expect(notice.text).not.toContain(r.heldPath(name))
+      expect(notice.text).toContain(`verified ${name}`)
+      expect(notice.text).toContain("Action: released")
+      expect(notice.text).not.toContain("whatsapp-release.ts")
+      expect(notice.text).not.toContain(e.message.id)
+      expect(notice.text).not.toContain("verifier happy path")
+    }
+    expect(r.driver.health().verifier).toEqual({ configured: true, lastOutcome: "verified", lastAt: new Date(NOW).toISOString() })
+  })
+
+  test("verification never bypasses the minimum release window", async () => {
+    const child = pending()
+    const r = await rig({ hold: true, verifier, runVerifier: child.runVerifier })
+    const e = event("!oc late verification")
+    const name = `s${e.sequence}`
+    r.app.events.push(e)
+    await r.driver.start()
+    await until(() => child.commands.length === 1)
+    r.clock.now = NOW - 6_000 + 570_000 - 60_000
+    child.finish(exited(0, `verified ${name}`))
+    await until(() => existsSync(join(r.dir, "state", "whatsapp", "done", `${name}.json`)))
+    expect(done(r, name).released?.outcome).toBe("refused: 60s left before the reply deadline; a new owner message is needed")
+    expect(r.relay.inbound).toEqual([])
+  })
+
+  test.each(["edit", "gap", "generation"])("verification never bypasses a concurrent %s invalidation", async (change) => {
+    const child = pending()
+    const r = await rig({ hold: true, verifier, runVerifier: child.runVerifier, pageLimit: 1 })
+    const e = event("!oc changed during verification")
+    const name = `s${e.sequence}`
+    r.app.events.push(e)
+    await r.driver.start()
+    await until(() => child.commands.length === 1)
+    r.app.events.push(change === "edit"
+      ? { ...event(null), kind: "edit", message: e.message }
+      : { sequence: ++seq, kind: "gap", reason: "test", generation: change === "generation" ? GEN2 : GEN, observed_at: NOW })
+    child.finish(exited(0, `verified ${name}`))
+    await until(() => existsSync(join(r.dir, "state", "whatsapp", "done", `${name}.json`)))
+    expect(done(r, name).released?.outcome.startsWith("refused:")).toBe(true)
+    expect(r.relay.inbound).toEqual([])
+  })
+
+  test("a refusal persists its verdict before discarding, without prompting or waking", async () => {
+    const e = event("!oc refused")
+    const name = `s${e.sequence}`
+    const r = await rig({ hold: true, verifier, runVerifier: async () => exited(1, `refuse ${name}: policy (owner-only)`), notifySessions: ["ses_native"], coordinatorSession: "ses_coordinator" })
+    r.app.events.push(e)
+    await r.driver.start()
+    const discarded = join(r.dir, "state", "whatsapp", "discarded", `${name}.json`)
+    await until(() => existsSync(discarded))
+    expect(JSON.parse(readFileSync(discarded, "utf8")).verification).toMatchObject({ outcome: "refused", line: `refuse ${name}: policy (owner-only)`, reason: null })
+    expect(existsSync(r.heldPath(name))).toBe(false)
+    expect(r.relay.inbound).toEqual([])
+    expect(r.notices).toHaveLength(1)
+    expect(r.notices[0].text).toContain("Action: discarded")
+    expect(r.notices[0].text).not.toContain("whatsapp-release.ts")
+  })
+
+  test("unavailable stays held, sends both operator commands and wakes only after the outcome", async () => {
+    const child = pending()
+    const r = await rig({ hold: true, verifier, runVerifier: child.runVerifier, notifySessions: ["ses_native"], coordinatorSession: "ses_coordinator" })
+    const e = event("!oc unavailable")
+    const name = `s${e.sequence}`
+    r.app.events.push(e)
+    await r.driver.start()
+    await until(() => child.commands.length === 1)
+    expect(r.notices).toEqual([])
+    child.finish(exited(2, `unavailable ${name}: app busy`))
+    await until(() => r.notices.length === 2)
+    expect(record(r, name).verification).toMatchObject({ outcome: "unavailable", line: `unavailable ${name}: app busy`, reason: null })
+    expect(r.notices[0].key).toBe(`ai-bridge-relay:held:${name}:ses_native`)
+    expect(r.notices[0].text).toContain("Action: still held")
+    expect(r.notices[0].text).toContain(`bun src/relay/whatsapp-release.ts --config /x/relay.json ${name}`)
+    expect(r.notices[0].text).toContain(`bun src/relay/whatsapp-release.ts --config /x/relay.json ${name} --discard`)
+    expect(r.notices[1].key).toBe(`ai-bridge-relay:wake:${name}`)
+    expect(r.relay.inbound).toEqual([])
+  })
+
+  test.each([
+    ["wrong record", 0, "verified s999999999", null],
+    ["two lines", 0, "verified NAME\n1234567890@g.us secret text", null],
+    ["unknown exit", 3, "1234567890@g.us secret text", "exit 3"],
+    ["unrecognized line", 0, "1234567890@g.us secret text", null],
+    ["no output", 0, " \n\t", null],
+    ["wrong refusal record", 1, "refuse s999999999: policy", null],
+    ["unsafe unavailable reason", 2, "unavailable NAME: 1234567890@g.us secret text", null],
+  ])("%s is inconclusive, with no raw output retained or forwarded", async (_label, code, raw, reason) => {
+    const e = event("!oc held")
+    const name = `s${e.sequence}`
+    const output = raw.replace("NAME", name)
+    const result = exited(code, output)
+    const r = await rig({ hold: true, verifier, runVerifier: async () => result, notifySessions: ["ses_native"], coordinatorSession: "ses_coordinator" })
+    r.app.events.push(e)
+    await r.driver.start()
+    await until(() => r.notices.length === 2)
+    const expected = reason ?? `output not recognized (${output.split("\n").filter((line) => line.trim()).length} lines, ${Buffer.byteLength(output)} bytes)`
+    expect(record(r, name).verification).toEqual({ at: new Date(NOW).toISOString(), outcome: "inconclusive", line: null, reason: expected })
+    const exposed = JSON.stringify({ logs: r.logs, notices: r.notices, stored: record(r, name) })
+    expect(exposed).not.toContain("1234567890@g.us secret text")
+    expect(exposed).not.toContain("s999999999")
+    expect(r.notices[0].text).toContain(expected)
+    expect(r.notices[0].text).toContain("Action: still held")
+    expect(r.notices[1].key).toBe(`ai-bridge-relay:wake:${name}`)
+    expect(r.relay.inbound).toEqual([])
+  })
+
+  test.each([true, false])("hold=%s never verifies a not-a-prompt record or a live prompt", async (hold) => {
+    let calls = 0
+    const r = await rig({ hold, verifier, runVerifier: async () => { calls++; return exited(3, "") } })
+    const e = event(hold ? "ordinary chat" : "!oc live prompt")
+    r.app.events.push(e)
+    await r.driver.start()
+    await r.driver.pollOnce()
+    expect(calls).toBe(0)
+    if (hold) expect(record(r, `s${e.sequence}`).verdict).toBe("not-a-prompt")
+    else expect(r.relay.inbound).toHaveLength(1)
+  })
+
+  test("restart verifies an unverified held record, but never reruns its recorded outcome", async () => {
+    const first = await rig({ hold: true })
+    const e = event("!oc restart")
+    const name = `s${e.sequence}`
+    first.app.events.push(e)
+    await first.driver.start()
+    await until(() => existsSync(first.heldPath(name)))
+    first.driver.stop()
+    let calls = 0
+    const options = { hold: true, verifier, notifySessions: ["ses_native"], runVerifier: async () => { calls++; return exited(2, `unavailable ${name}: offline`) } }
+    const second = await rig(options, first)
+    await second.driver.start()
+    await until(() => second.notices.length === 1)
+    second.driver.stop()
+    const third = await rig(options, first)
+    await third.driver.start()
+    await until(() => third.notices.length === 1)
+    await third.driver.pollOnce()
+    expect(calls).toBe(1)
+    expect(record(third, name).verification?.outcome).toBe("unavailable")
+  })
+
+  test("restart completes a recorded verified rename without running the verifier again", async () => {
+    const first = await rig({ hold: true })
+    const e = event("!oc recovered release")
+    const name = `s${e.sequence}`
+    first.app.events.push(e)
+    await first.driver.start()
+    await until(() => existsSync(first.heldPath(name)))
+    first.driver.stop()
+    writeFileSync(first.heldPath(name), JSON.stringify({ ...record(first, name), verification: { at: new Date(NOW).toISOString(), outcome: "verified", line: `verified ${name}`, reason: null } }), { mode: 0o600 })
+    let calls = 0
+    const second = await rig({ hold: true, verifier, runVerifier: async () => { calls++; return exited(3, "") } }, first)
+    await second.driver.start()
+    await until(() => existsSync(join(second.dir, "state", "whatsapp", "done", `${name}.json`)))
+    expect(calls).toBe(0)
+    expect(second.relay.inbound).toHaveLength(1)
+  })
+
+  test("a real executable receives argv with the record last, ignored stdin and the relay environment", async () => {
+    const dir = scratch()
+    const script = join(dir, "verify.sh")
+    writeFileSync(script, '#!/bin/sh\n[ "$1" = "--config" ] && [ "$2" = "/synthetic/config.json" ] && [ -n "$PATH" ] || exit 3\nif read -r input; then exit 3; fi\nprintf "  verified %s  \\n" "$3" >&2\n', { mode: 0o700 })
+    const r = await rig({ hold: true, verifier: { command: [script, "--config", "/synthetic/config.json"], timeoutMs: 1_000 } })
+    const e = event("!oc spawned")
+    r.app.events.push(e)
+    await r.driver.start()
+    await until(() => existsSync(join(r.dir, "state", "whatsapp", "done", `s${e.sequence}.json`)))
+    expect(done(r, `s${e.sequence}`).verification?.outcome).toBe("verified")
+    expect(r.relay.inbound).toHaveLength(1)
+  })
+
+  test("a real timeout terminates then kills the child, remains held and wakes the coordinator", async () => {
+    const dir = scratch()
+    const script = join(dir, "timeout.sh")
+    const pidFile = join(dir, "pid")
+    writeFileSync(script, '#!/bin/sh\ntrap "" TERM\nprintf "%s" "$$" > "$1"\nexec /bin/sleep 60\n', { mode: 0o700 })
+    const r = await rig({ hold: true, verifier: { command: [script, pidFile], timeoutMs: 1_000 }, notifySessions: ["ses_native"], coordinatorSession: "ses_coordinator" })
+    const e = event("!oc timeout")
+    r.app.events.push(e)
+    await r.driver.start()
+    await until(() => existsSync(pidFile))
+    const pid = Number(readFileSync(pidFile, "utf8"))
+    expect(() => process.kill(pid, 0)).not.toThrow()
+    await until(() => r.notices.length === 2)
+    expect(() => process.kill(pid, 0)).toThrow()
+    expect(record(r, `s${e.sequence}`).verification).toMatchObject({ outcome: "inconclusive", line: null, reason: "timed out" })
+    expect(r.relay.inbound).toEqual([])
+  })
+
+  test("a missing executable is inconclusive with only its errno", async () => {
+    const r = await rig({ hold: true, verifier: { command: [join(scratch(), "missing")], timeoutMs: 1_000 }, notifySessions: ["ses_native"] })
+    const e = event("!oc missing")
+    r.app.events.push(e)
+    await r.driver.start()
+    await until(() => r.notices.length === 1)
+    expect(record(r, `s${e.sequence}`).verification).toMatchObject({ outcome: "inconclusive", line: null, reason: "spawn failed: ENOENT" })
+    expect(r.notices[0].text).toContain("spawn failed: ENOENT")
+  })
+
+  test("the real capture counts both streams and caps their total at 8 KiB", async () => {
+    const script = join(scratch(), "output.sh")
+    writeFileSync(script, '#!/bin/sh\nprintf "verified s20\\n"\nprintf "1234567890@g.us secret text\\n" >&2\n', { mode: 0o700 })
+    const result = await spawnVerifier([script, "s20"], 1_000)
+    expect(result).toMatchObject({ kind: "exit", lines: 2 })
+    expect(verifierVerdict(result, "s20")).toMatchObject({ outcome: "inconclusive", line: null })
+    writeFileSync(script, '#!/bin/sh\nprintf "verified s20\\n"\n/bin/head -c 9000 /dev/zero | /usr/bin/tr "\\000" " " >&2\n', { mode: 0o700 })
+    const overflow = await spawnVerifier([script, "s20"], 1_000)
+    if (overflow.kind !== "exit") throw new Error("script did not exit")
+    expect(overflow.bytes).toBeGreaterThan(8_192)
+    expect(Buffer.byteLength(overflow.output)).toBeLessThanOrEqual(8_193)
+    expect(verifierVerdict(overflow, "s20")).toMatchObject({ outcome: "inconclusive", line: null })
+  })
+
+  test("a real signal exit records only the signal name", async () => {
+    const script = join(scratch(), "signal.sh")
+    writeFileSync(script, '#!/bin/sh\nprintf "1234567890@g.us secret text\\n"\nkill -TERM "$$"\n', { mode: 0o700 })
+    const r = await rig({ hold: true, verifier: { command: [script], timeoutMs: 1_000 }, notifySessions: ["ses_native"] })
+    const e = event("!oc signaled")
+    r.app.events.push(e)
+    await r.driver.start()
+    await until(() => r.notices.length === 1)
+    expect(record(r, `s${e.sequence}`).verification).toMatchObject({ outcome: "inconclusive", line: null, reason: "signal SIGTERM" })
+    expect(JSON.stringify({ notices: r.notices, logs: r.logs, record: record(r, `s${e.sequence}`) })).not.toContain("1234567890@g.us secret text")
   })
 })
 

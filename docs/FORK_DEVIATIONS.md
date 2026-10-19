@@ -341,7 +341,7 @@ something to create. The path is configuration, never a literal in source.
   - It reads the WhatsApp desktop app's event journal through that app's own client module.
   - It answers through the app's reply-only grant: one `[AI] ` reply per fresh owner message, within 10 minutes.
   - It never logs in, pairs or holds a WhatsApp credential.
-  - In hold mode an operator releases each message (`src/relay/whatsapp-release.ts`).
+  - In hold mode an operator releases each message (`src/relay/whatsapp-release.ts`), or the optional native owner's verifier requests release with exit `0` and `verified sN`. Verification is asynchronous after the private hold write, and every normal release check still applies. A validated refusal discards; unavailable or inconclusive results stay held. Notices wait for the safe outcome; only still-held results wake the coordinator. This avoids spending the 10-minute reply window on two agent turns and notices to idle-parked tabs.
   - See `CONFIGURATION.md`, "The WhatsApp route".
 - The socket is the privilege boundary: whoever can connect to it prompts a full-tool session as the owner. It sits in a 0700 directory and is itself 0600, so only its user and root reach it, and the one container that needs it gets that directory read-only. A compromised connector can therefore prompt as the owner, which the containerized agent could not; see `SECURITY.md`, "Relay mode".
 
