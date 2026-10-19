@@ -42,6 +42,7 @@ export type JournalRecord =
       postedAt: number
       textSha256: string
       textLength: number
+      replyBy?: number
     }
   | {
       kind: "dispatch"
@@ -104,6 +105,7 @@ export interface RelayRecord {
   postedAt: number
   receivedAt: number
   textSha256: string
+  replyBy?: number
   dispatch: DispatchState
   attempts: number
   lastAttemptAt?: number
@@ -190,6 +192,7 @@ export class RelayState {
           postedAt: record.postedAt,
           receivedAt: record.at,
           textSha256: record.textSha256,
+          ...(record.replyBy === undefined ? {} : { replyBy: record.replyBy }),
           dispatch: "pending",
           attempts: 0,
         })

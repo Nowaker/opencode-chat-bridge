@@ -258,6 +258,29 @@ describe("relay config", () => {
     expect(() => loadRelayConfig(write(dir, { slack: { enabled: false, sessionID: "ses_abc" } })))
       .toThrow("unknown route")
   })
+
+  test("the WhatsApp route needs its native block, one group and one account, and holds by default", () => {
+    const dir = scratch()
+    const native = { clientModule: "/opt/app/control/client.cjs", capabilityFile: "~/cap.json", headFile: "~/head.json" }
+    const route = { enabled: true, sessionID: "ses_def", allowedUsers: ["15550000001"], allowedRooms: ["120363000000000001@g.us"], repliesOnly: true }
+    expect(() => loadRelayConfig(write(dir, { whatsapp: route }))).toThrow("without its native block")
+    expect(() => loadRelayConfig(write(dir, { whatsapp: { ...route, native, allowedRooms: ["a@g.us", "b@g.us"] } }))).toThrow("exactly one group")
+    expect(() => loadRelayConfig(write(dir, { matrix: { enabled: false, sessionID: "ses_abc", native } }))).toThrow("whatsapp route only")
+    expect(() => loadRelayConfig(write(dir, { whatsapp: { ...route, native: { ...native, notifySessions: ["nope"] } } }))).toThrow("non-session id")
+    const config = loadRelayConfig(write(dir, { whatsapp: { ...route, replyMaxChars: 4000, native: { ...native, notifySessions: ["ses_x"] } } }))
+    expect(config.routes.whatsapp).toMatchObject({ enabled: true, replyMaxChars: 4000 })
+    expect(config.whatsappNative).toMatchObject({
+      clientModule: "/opt/app/control/client.cjs",
+      hold: true,
+      notifySessions: ["ses_x"],
+      wakeCoordinatorOnHold: false,
+      trigger: "!oc",
+      replyWindowMs: 600_000,
+      safetyMarginMs: 30_000,
+      minReleaseWindowMs: 90_000,
+    })
+    expect(config.whatsappNative!.capabilityFile.startsWith("~")).toBe(false)
+  })
 })
 
 describe("journal", () => {

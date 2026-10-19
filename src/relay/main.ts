@@ -7,10 +7,13 @@
  */
 
 import { spawnSync } from "child_process"
-import { loadRelayConfig } from "./config"
+import { readFileSync } from "fs"
+import { join, resolve } from "path"
+import { loadRelayConfig, type LoadedRelayConfig } from "./config"
 import { Relay } from "./relay"
 import { startRelayServer } from "./server"
 import { VibetermApi, vibetermSecretsPassword } from "./vibeterm-api"
+import { nativeClient, nativeReplySender, WhatsAppNativeDriver } from "./whatsapp-native"
 
 function argument(name: string): string | undefined {
   const index = process.argv.indexOf(name)
@@ -24,6 +27,56 @@ function revision(): string {
   if (head.status !== 0) return "unknown"
   const dirty = git("status", "--porcelain", "--", ".").stdout.trim() !== ""
   return `${head.stdout.trim()}${dirty ? "-dirty" : ""}`
+}
+
+/** A WhatsApp problem leaves that route down and the rest serving; it never stops the relay. */
+async function startWhatsApp(config: LoadedRelayConfig, configPath: string, relay: Relay, api: VibetermApi): Promise<WhatsAppNativeDriver | null> {
+  const route = config.routes.whatsapp
+  const native = config.whatsappNative
+  if (!route?.enabled || !native) return null
+  try {
+    const capability = JSON.parse(readFileSync(native.capabilityFile, "utf8"))
+    if (
+      typeof capability?.capability_id !== "string" ||
+      typeof capability?.conversation_id !== "string" ||
+      !Number.isSafeInteger(capability?.expires_at) ||
+      typeof capability?.prefix !== "string"
+    ) {
+      throw new Error("the reply capability reference is not one")
+    }
+    const call = nativeClient(native.clientModule)
+    const driver = new WhatsAppNativeDriver({
+      relay,
+      call,
+      sender: nativeReplySender(call),
+      stateDir: join(config.stateDir, "whatsapp"),
+      headFile: native.headFile,
+      groupJid: route.allowedRooms[0],
+      conversationId: capability.conversation_id,
+      capabilityId: capability.capability_id,
+      capabilityExpiresAt: capability.expires_at,
+      ownerSender: route.allowedUsers[0],
+      aiPrefix: capability.prefix,
+      hold: native.hold,
+      trigger: native.trigger,
+      windowMs: native.replyWindowMs,
+      safetyMarginMs: native.safetyMarginMs,
+      minReleaseWindowMs: native.minReleaseWindowMs,
+      notifySessions: native.notifySessions,
+      ...(native.wakeCoordinatorOnHold ? { coordinatorSession: route.sessionID } : {}),
+      notify: (sessionID, key, text) => api.promptAsync(sessionID, key, text),
+      releaseCommand: `bun ${join(import.meta.dir, "whatsapp-release.ts")} --config ${resolve(configPath)}`,
+      pollIntervalMs: config.pollIntervalMs,
+    })
+    await driver.start()
+    relay.healthExtras.set("whatsapp", () => driver.health())
+    return driver
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    console.error(`[RELAY] whatsapp route not started: ${message}`)
+    relay.healthExtras.set("whatsapp", () => ({ started: false, error: message }))
+    return null
+  }
 }
 
 async function main(): Promise<void> {
@@ -47,12 +100,14 @@ async function main(): Promise<void> {
   await relay.start()
   const server = startRelayServer(relay, config.socketPath)
   console.log(`[RELAY] listening on ${config.socketPath}`)
+  const whatsapp = await startWhatsApp(config, configPath, relay, api)
 
   let stopping = false
   const shutdown = (signal: string) => {
     if (stopping) return
     stopping = true
     console.log(`[RELAY] ${signal}: stopping`)
+    whatsapp?.stop()
     relay.stop()
     server.stop(true)
     process.exit(0)

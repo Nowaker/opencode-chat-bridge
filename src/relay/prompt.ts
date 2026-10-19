@@ -30,6 +30,8 @@ export interface Provenance {
   postedAt: number
   trust: "operator"
   replyHint: string
+  /** The platform accepts no answer after this, ms since the epoch. */
+  replyBy?: number
 }
 
 /** Strip anything that would let chat text end the block early or forge a field. */
@@ -49,6 +51,7 @@ export function buildRelayPrompt(p: Provenance, text: string): string {
     `relay_id: ${p.relayId}`,
     `posted: ${new Date(p.postedAt).toISOString()}`,
     `reply: ${field(p.replyHint)}`,
+    ...(p.replyBy === undefined ? [] : [`reply_by: ${new Date(p.replyBy).toISOString()}`]),
     BLOCK_END,
     "",
     text,

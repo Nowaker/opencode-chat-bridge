@@ -33,6 +33,11 @@ export interface InboundRequest {
    * never becomes a prompt.
    */
   implicit: boolean
+  /**
+   * The last moment the platform accepts an answer, ms since the epoch, when
+   * it has one. The coordinator is told, and the reply carries it.
+   */
+  replyBy?: number
 }
 
 export type InboundState = "accepted" | "duplicate" | "ignored" | "rejected"
@@ -58,6 +63,8 @@ export interface OutboxItem {
   replyToEventId: string
   text: string
   kind: "reply" | "notice"
+  /** The `replyBy` of the message this answers, when it had one. */
+  replyBy?: number
 }
 
 export interface OutboxResponse {

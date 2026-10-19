@@ -50,6 +50,8 @@ export interface RouteConfig {
   /** Whether platform ids may appear in the prompt and the logs. */
   idsInPrompt: boolean
   chatLabel?: string
+  /** The platform takes the answer as one message of at most this many characters. */
+  replyMaxChars?: number
 }
 
 export interface RelayOptions {
@@ -120,6 +122,8 @@ export class Relay {
   private readonly waiters = new Map<RelayRoute, Set<() => void>>()
   private readonly replyText = new Map<string, string>()
   readonly lastWatch = new Map<RelayRoute, { at: number; ok: boolean; error?: string }>()
+  /** Extra sections for `health()`, such as a route driver's own state. */
+  readonly healthExtras = new Map<string, () => unknown>()
   private stopped = false
 
   constructor(private readonly api: RelayApi, private readonly options: RelayOptions) {
@@ -237,6 +241,7 @@ export class Relay {
       postedAt: request.postedAt,
       textSha256: sha256(request.text),
       textLength: request.text.length,
+      ...(request.replyBy === undefined ? {} : { replyBy: request.replyBy }),
     })
     this.log(`inbound ${relayId} ${request.route} ${this.showId(config, request.eventId)} ${request.implicit ? "thread-reply " : ""}len=${request.text.length}`)
     this.scheduleDispatch(relayId, 0)
@@ -246,10 +251,13 @@ export class Relay {
 
   private promptFor(
     config: RouteConfig,
-    message: Pick<RelayRecord, "route" | "roomId" | "sender" | "eventId" | "threadRootId" | "postedAt">,
+    message: Pick<RelayRecord, "route" | "roomId" | "sender" | "eventId" | "threadRootId" | "postedAt" | "replyBy">,
     relayId: string,
     text: string,
   ): string {
+    const where = config.repliesOnly ? "your answer is posted back to this chat" : "your answer is posted in this message's thread"
+    const once = config.replyMaxChars ? ` as one message of at most ${config.replyMaxChars} characters` : ""
+    const until = message.replyBy === undefined ? "" : ", and only until reply_by"
     return buildRelayPrompt(
       {
         route: message.route,
@@ -264,9 +272,8 @@ export class Relay {
         relayId,
         postedAt: message.postedAt,
         trust: "operator",
-        replyHint: config.repliesOnly
-          ? "your answer is posted back to this chat; reply exactly NO_REPLY to post nothing"
-          : "your answer is posted in this message's thread; reply exactly NO_REPLY to post nothing",
+        replyHint: `${where}${once}${until}; reply exactly NO_REPLY to post nothing`,
+        ...(message.replyBy === undefined ? {} : { replyBy: message.replyBy }),
       },
       text,
     )
@@ -675,6 +682,7 @@ export class Relay {
         continue
       }
       this.journal.append({ kind: "claim", at: this.now(), outboxId: item.outboxId })
+      const replyBy = item.relayId ? this.state.relays.get(item.relayId)?.replyBy : undefined
       items.push({
         outboxId: item.outboxId,
         txnId: `aibr-${item.outboxId}`,
@@ -683,6 +691,7 @@ export class Relay {
         replyToEventId: item.replyToEventId,
         text,
         kind: item.itemKind,
+        ...(replyBy === undefined ? {} : { replyBy }),
       })
     }
     return { items, typingRooms: this.typingRooms(route) }
@@ -707,6 +716,16 @@ export class Relay {
     this.journal.append({ kind: "sent", at: this.now(), outboxId: item.outboxId, chatEventId: request.chatEventId })
     this.replyText.delete(item.outboxId)
     this.log(`posted ${item.outboxId} on ${item.route}`)
+    return true
+  }
+
+  /** The connector cannot tell whether a post went out. Recorded, and never offered again. */
+  markUncertain(outboxId: string, reason: string): boolean {
+    const item = this.state.outbox.get(outboxId)
+    if (!item) return false
+    if (item.state === "sent") return true
+    this.journal.append({ kind: "send_uncertain", at: this.now(), outboxId, reason: reason.slice(0, 300) })
+    this.log(`post ${outboxId} may have been sent; not offered again`)
     return true
   }
 
@@ -773,6 +792,7 @@ export class Relay {
       relays: count([...this.state.relays.values()].map((r) => r.dispatch)),
       outbox: count([...this.state.outbox.values()].map((o) => o.state)),
       journal: { records: this.journal.loaded.records, skipped: this.journal.loaded.skipped },
+      ...Object.fromEntries([...this.healthExtras].map(([name, read]) => [name, read()])),
     }
   }
 }

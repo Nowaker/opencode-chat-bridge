@@ -284,6 +284,20 @@ describe("delivery", () => {
     expect(api.prompts[2]).toEqual(api.prompts[0])
   })
 
+  test("a reply deadline reaches the coordinator, and travels with the answer to the connector", async () => {
+    const api = new FakeApi()
+    const { relay } = await startRelay(api, { route: { repliesOnly: true, replyMaxChars: 4000 } })
+    const replyBy = Date.UTC(2026, 9, 19, 9, 0, 0)
+    const { relayId } = await relay.handleInbound(message("$e1", "hello", { replyBy }))
+    await until(() => relay.state.relays.get(relayId!)?.dispatch === "delivered")
+    expect(api.prompts[0].text).toContain("reply_by: 2026-10-19T09:00:00.000Z")
+    expect(api.prompts[0].text).toContain("as one message of at most 4000 characters, and only until reply_by; reply exactly NO_REPLY")
+    api.addAssistant(relay.state.relays.get(relayId!)!.messageId!, { text: "done", finish: "stop" })
+    await relay.watchAll()
+    const outbox = await relay.takeOutbox("matrix", 0)
+    expect(outbox.items[0]).toMatchObject({ replyToEventId: "$e1", text: "done", replyBy })
+  })
+
   test("a refusal is reported once and not retried", async () => {
     const api = new FakeApi()
     api.outcomes.push({ kind: "failed", status: 404, error: "NotFoundError" })

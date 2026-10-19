@@ -337,7 +337,12 @@ something to create. The path is configuration, never a literal in source.
 - The relay checks the room and sender allowlists again, from the same env-file keys the connector reads.
 - A message posted before the relay registered its session is ignored, and so is an untriggered thread reply in a thread the relay does not serve.
 - `createACPClient` throws in relay mode, so no code path can start an agent in the container, and the entrypoint skips the opencode download.
-- Only Matrix speaks relay mode. The relay's `whatsapp` route exists and stays disabled until its transport is built.
+- Of the connectors, only Matrix speaks relay mode. The relay's `whatsapp` route needs no connector (`src/relay/whatsapp-native.ts`):
+  - It reads the WhatsApp desktop app's event journal through that app's own client module.
+  - It answers through the app's reply-only grant: one `[AI] ` reply per fresh owner message, within 10 minutes.
+  - It never logs in, pairs or holds a WhatsApp credential.
+  - In hold mode an operator releases each message (`src/relay/whatsapp-release.ts`).
+  - See `CONFIGURATION.md`, "The WhatsApp route".
 - The socket is the privilege boundary: whoever can connect to it prompts a full-tool session as the owner. It sits in a 0700 directory and is itself 0600, so only its user and root reach it, and the one container that needs it gets that directory read-only. A compromised connector can therefore prompt as the owner, which the containerized agent could not; see `SECURITY.md`, "Relay mode".
 
 ## Not implemented, deliberately

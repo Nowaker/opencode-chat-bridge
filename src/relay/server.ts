@@ -47,7 +47,9 @@ export function parseInbound(body: unknown): InboundRequest | string {
   if (typeof b.postedAt !== "number" || !Number.isFinite(b.postedAt)) return "postedAt"
   if (!str(b.text, 1, MAX_TEXT) || !(b.text as string).trim()) return "text"
   if (typeof b.implicit !== "boolean") return "implicit"
+  if (b.replyBy !== undefined && (typeof b.replyBy !== "number" || !Number.isFinite(b.replyBy))) return "replyBy"
   return {
+    ...(typeof b.replyBy === "number" ? { replyBy: b.replyBy } : {}),
     route: b.route,
     eventId: b.eventId as string,
     roomId: b.roomId as string,

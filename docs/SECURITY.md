@@ -374,6 +374,12 @@ What changes:
 - **The connector is now trusted.** A process that can reach the socket can prompt the receiving session as the owner. Before, compromising the connector reached an agent with no tools. Keep the room invite-only and the homeserver private, and treat a connector update as a change to a privileged component.
 - **Output rules move into the session.** The bridge's tool-message filters see nothing, because the connector only posts final answers. What a reply may contain is the receiving session's instructions to follow.
 
+The WhatsApp route has no connector, so its boundary is the desktop app rather than a container:
+
+- The relay reads only the designated group's events, through the app's own client module, and can send only through the app's reply-only grant. That grant allows one `[AI] `-prefixed reply per fresh owner message, in that group, within 10 minutes, at most 5 a minute. The app enforces all of it, and the relay holds no WhatsApp credential and cannot send anything else.
+- Only the account's own fresh messages become prompts. Messages from other participants, history, forwards, quotes and edits never reach a session. Every other participant in the group reads every reply.
+- Held records and frozen replies are 0600 files in 0700 directories. A notice to a session carries the file path only, never a message id or text.
+
 ## Credential Security
 
 ### Environment Variables

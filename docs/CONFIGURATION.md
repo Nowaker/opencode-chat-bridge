@@ -112,7 +112,22 @@ The relay is a host process, started with `bun src/relay/main.ts --config relay.
       "allowedRoomsFrom": "MATRIX_ALLOWED_ROOMS",
       "chatLabel": "Vibeterm AI"
     },
-    "whatsapp": { "enabled": false, "sessionID": "ses_...", "repliesOnly": true, "idsInPrompt": false }
+    "whatsapp": {
+      "enabled": true,
+      "sessionID": "ses_...",
+      "allowedUsersFrom": "WHATSAPP_ALLOWED_USERS",
+      "allowedRoomsFrom": "WHATSAPP_ALLOWED_GROUPS",
+      "repliesOnly": true,
+      "idsInPrompt": false,
+      "replyMaxChars": 4000,
+      "native": {
+        "clientModule": "/opt/whatsapp-nativefier/resources/app/control/client.cjs",
+        "capabilityFile": "~/.local/share/whatsapp-nativefier-intake/reply-capability-reference.json",
+        "headFile": "~/.local/share/whatsapp-nativefier-intake/reply-live-head.json",
+        "hold": true,
+        "notifySessions": ["ses_..."]
+      }
+    }
   }
 }
 ```
@@ -127,6 +142,8 @@ The relay is a host process, started with `bun src/relay/main.ts --config relay.
 | `defaultRoom` | Where a turn that answers no relayed message is posted. Defaults to the first allowlisted room; empty drops such turns. |
 | `repliesOnly` | Post only answers to a relayed message. |
 | `idsInPrompt` | Show platform ids in the prompt and the log (`true`), or hashes of them (`false`). |
+| `replyMaxChars` | The platform takes the answer as one message of at most this many characters; the session is told. |
+| `native` | The WhatsApp route's link to the desktop app; see "The WhatsApp route" below. |
 
 An enabled route with an empty allowlist refuses to start. A message reaches the session as a `[chat_relay] ... [/chat_relay]` provenance block followed by its text. The session's answer is posted unless it is exactly `NO_REPLY`, and a first line `REPLY_TO: <relay_id>` sends a later turn into that message's thread.
 
@@ -137,6 +154,42 @@ printf '%s' '<message text as posted, trigger removed>' | bun src/relay/requeue.
 ```
 
 The relay accepts it only for a relay whose delivery `failed`, never an uncertain one, and only when the text's sha256 matches the one its journal recorded; it logs `requeued rly_...` or the reason it refused.
+
+### The WhatsApp route
+
+The WhatsApp route runs no connector. The relay reads the WhatsApp desktop app's event journal through the app's own client module and replies through the app's reply operation (whatsapp-nativefier's local controls; see `control/PROTOCOL.txt` there). It holds no WhatsApp credential and never pairs a device. An enabled route needs exactly one allowlisted group and one allowlisted account.
+
+| `native` key | Meaning |
+|---|---|
+| `clientModule` | The app's `control/client.cjs`. It reads the app's endpoint record and secret itself; the relay never sees them. |
+| `capabilityFile` | The app's reference to its reply-only grant: capability id, the group's conversation id, expiry and the `[AI] ` prefix. |
+| `headFile` | The app's live-head record, read once to seed the cursor. Nothing before it is read, and the relay never asks for a new head, which would demote a message already observed. |
+| `hold` | Default `true`: each of the account's own messages is written to a private record for review instead of being prompted. |
+| `notifySessions` | Sessions told about each held message, by file path only. |
+| `wakeCoordinatorOnHold` | Wake the route's session when a prompt is held, so its tab is up by the time it is released. |
+| `trigger` | Default `!oc`. It must open the raw text. |
+| `replyWindowMs`, `safetyMarginMs`, `minReleaseWindowMs` | The app accepts a reply for 10 minutes after the post (`600000`). The relay stops 30 s short of that, and refuses a release with less than 90 s left. |
+
+A message is a prompt only when all of these hold:
+
+- It is in the designated group and written by the account itself (`from_me` and `trusted_self`).
+- It was observed live, after the head and after any gap or reset.
+- It is unedited plain text with no attachment, not forwarded and not quoted.
+- It is not the echo of a relay reply.
+- It starts with the trigger and is inside the reply window.
+
+An edit, a delete, a second plaintext observation, a gap, a reset or a new app generation after it means it is not answered. The app checks all of this again when the reply is sent, and its refusal is final.
+
+The session's prompt carries `reply_by`. Its answer goes out as exactly one `messages.reply`, bound to the owner's message, with the outbox id as `request_id`. The text is `[AI] ` plus the body, cut to fit 4096 UTF-16 units; nothing is chunked. The five-field request is written to a private file before the first attempt and only ever replayed unchanged, and a refusal or an unknown outcome is final.
+
+Held messages are `<stateDir>/whatsapp/held/s<sequence>.json` (0600). Release or discard one:
+
+```bash
+bun src/relay/whatsapp-release.ts --config relay.json s<sequence>
+bun src/relay/whatsapp-release.ts --config relay.json --discard s<sequence>
+```
+
+The relay checks a released message again before it prompts anything: its verdict, anything that invalidated it, the generation and the time left. It logs `release of s<sequence>: ...` either way.
 
 ## Session picker
 

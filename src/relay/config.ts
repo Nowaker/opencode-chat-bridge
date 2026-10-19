@@ -23,6 +23,35 @@ interface RouteFile {
   repliesOnly?: boolean
   idsInPrompt?: boolean
   chatLabel?: string
+  replyMaxChars?: number
+  native?: NativeFile
+}
+
+interface NativeFile {
+  clientModule?: string
+  capabilityFile?: string
+  headFile?: string
+  hold?: boolean
+  notifySessions?: string[]
+  wakeCoordinatorOnHold?: boolean
+  trigger?: string
+  replyWindowMs?: number
+  safetyMarginMs?: number
+  minReleaseWindowMs?: number
+}
+
+/** The WhatsApp route's link to the desktop app's controls (`whatsapp-native.ts`). */
+export interface NativeRouteConfig {
+  clientModule: string
+  capabilityFile: string
+  headFile: string
+  hold: boolean
+  notifySessions: string[]
+  wakeCoordinatorOnHold: boolean
+  trigger: string
+  replyWindowMs: number
+  safetyMarginMs: number
+  minReleaseWindowMs: number
 }
 
 interface RelayFile {
@@ -40,6 +69,7 @@ export interface LoadedRelayConfig {
   pollIntervalMs: number
   api: { url: string; username: string; secretsModule: string }
   routes: Partial<Record<RelayRoute, RouteConfig>>
+  whatsappNative?: NativeRouteConfig
 }
 
 function expand(path: string): string {
@@ -78,6 +108,7 @@ export function loadRelayConfig(path: string): LoadedRelayConfig {
   const env = envKeys.length ? readEnvKeys(required(file.envFile, "envFile"), envKeys) : {}
 
   const routes: Partial<Record<RelayRoute, RouteConfig>> = {}
+  let whatsappNative: NativeRouteConfig | undefined
   for (const [name, route] of routeFiles) {
     if (!isRelayRoute(name)) throw new Error(`relay config: unknown route ${name}`)
     const sessionID = route.sessionID ?? ""
@@ -99,6 +130,34 @@ export function loadRelayConfig(path: string): LoadedRelayConfig {
       repliesOnly: route.repliesOnly === true,
       idsInPrompt: route.idsInPrompt !== false,
       ...(route.chatLabel ? { chatLabel: route.chatLabel } : {}),
+      ...(route.replyMaxChars ? { replyMaxChars: route.replyMaxChars } : {}),
+    }
+
+    if (route.native && name !== "whatsapp") throw new Error(`relay config: routes.${name}.native is for the whatsapp route only`)
+    if (name === "whatsapp" && enabled) {
+      // The route has no other transport, and it answers one group as one account.
+      if (!route.native) throw new Error("relay config: routes.whatsapp is enabled without its native block")
+      if (allowedUsers.length !== 1 || allowedRooms.length !== 1) {
+        throw new Error("relay config: routes.whatsapp serves exactly one group for exactly one account")
+      }
+    }
+    if (name === "whatsapp" && route.native) {
+      const native = route.native
+      const notifySessions = native.notifySessions ?? []
+      if (!notifySessions.every((id) => /^ses_[A-Za-z0-9]+$/.test(id))) throw new Error("relay config: routes.whatsapp.native.notifySessions holds a non-session id")
+      whatsappNative = {
+        clientModule: required(native.clientModule, "routes.whatsapp.native.clientModule"),
+        capabilityFile: required(native.capabilityFile, "routes.whatsapp.native.capabilityFile"),
+        headFile: required(native.headFile, "routes.whatsapp.native.headFile"),
+        // Holding is the safe default: nothing is prompted until an operator releases it.
+        hold: native.hold !== false,
+        notifySessions,
+        wakeCoordinatorOnHold: native.wakeCoordinatorOnHold === true,
+        trigger: native.trigger ?? "!oc",
+        replyWindowMs: native.replyWindowMs ?? 600_000,
+        safetyMarginMs: native.safetyMarginMs ?? 30_000,
+        minReleaseWindowMs: native.minReleaseWindowMs ?? 90_000,
+      }
     }
   }
 
@@ -112,5 +171,6 @@ export function loadRelayConfig(path: string): LoadedRelayConfig {
       secretsModule,
     },
     routes,
+    ...(whatsappNative ? { whatsappNative } : {}),
   }
 }
