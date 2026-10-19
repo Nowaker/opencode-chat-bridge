@@ -216,7 +216,7 @@ describe("prompt outcome classification", () => {
 })
 
 describe("relay config", () => {
-  function write(dir: string, routes: Record<string, unknown>): string {
+  function write(dir: string, routes: Record<string, unknown>, options: { fullReadIntervalMs?: number } = {}): string {
     const env = join(dir, "bridge.env")
     writeFileSync(env, "MATRIX_ALLOWED_USERS=@owner:example.org\nMATRIX_ALLOWED_ROOMS=!room:example.org\nMATRIX_BOT_PASSWORD=never-read\n")
     const path = join(dir, "relay.json")
@@ -226,6 +226,7 @@ describe("relay config", () => {
       envFile: env,
       vibetermApi: { secretsModule: "/nonexistent/index.ts" },
       routes,
+      ...options,
     }))
     return path
   }
@@ -247,6 +248,12 @@ describe("relay config", () => {
     expect(config.routes.whatsapp).toMatchObject({ enabled: false, repliesOnly: true, idsInPrompt: false })
     expect(JSON.stringify(config)).not.toContain("never-read")
     expect(config.api).toEqual({ url: "http://127.0.0.1:6096", username: "opencode", secretsModule: "/nonexistent/index.ts" })
+  })
+
+  test("the full-read backstop defaults to 60 seconds and accepts a configured interval", () => {
+    const dir = scratch()
+    expect(loadRelayConfig(write(dir, {})).fullReadIntervalMs).toBe(60_000)
+    expect(loadRelayConfig(write(dir, {}, { fullReadIntervalMs: 15_000 })).fullReadIntervalMs).toBe(15_000)
   })
 
   test("an enabled route must have both allowlists and a real session id", () => {

@@ -58,6 +58,7 @@ export interface RelayOptions {
   stateDir: string
   routes: Partial<Record<RelayRoute, RouteConfig>>
   pollIntervalMs?: number
+  fullReadIntervalMs?: number
   messageWindow?: number
   now?: () => number
   log?: (line: string) => void
@@ -100,6 +101,19 @@ function sha256(text: string): string {
   return createHash("sha256").update(text, "utf8").digest("hex")
 }
 
+function messageChangeKey(message: ApiMessage | undefined): string {
+  const info = message?.info
+  const error: unknown = info?.["error"]
+  return JSON.stringify([
+    info?.["id"],
+    info?.["role"],
+    info?.["time"]?.["completed"],
+    info?.["finish"],
+    error !== undefined && error !== null,
+    typeof error === "object" && error !== null && "name" in error ? error.name : undefined,
+  ])
+}
+
 export class Relay {
   readonly journal: Journal
   private readonly pendingDir: string
@@ -107,6 +121,7 @@ export class Relay {
   private readonly now: () => number
   private readonly log: (line: string) => void
   private readonly pollIntervalMs: number
+  private readonly fullReadIntervalMs: number
   private readonly messageWindow: number
   private readonly retryDelaysMs: number[]
   private readonly uncertainSettleMs: number
@@ -119,6 +134,7 @@ export class Relay {
   private watchTimer: ReturnType<typeof setInterval> | null = null
   private readonly dispatching = new Set<string>()
   private readonly watching = new Set<RelayRoute>()
+  private readonly fullReads = new Map<RelayRoute, { readonly key: string; readonly at: number }>()
   private readonly waiters = new Map<RelayRoute, Set<() => void>>()
   private readonly replyText = new Map<string, string>()
   readonly lastWatch = new Map<RelayRoute, { at: number; ok: boolean; error?: string }>()
@@ -136,6 +152,7 @@ export class Relay {
     this.now = options.now ?? Date.now
     this.log = options.log ?? ((line) => console.log(`[RELAY] ${line}`))
     this.pollIntervalMs = options.pollIntervalMs ?? 3_000
+    this.fullReadIntervalMs = options.fullReadIntervalMs ?? 60_000
     this.messageWindow = options.messageWindow ?? 40
     this.retryDelaysMs = options.retryDelaysMs ?? [5_000, 15_000, 60_000, 120_000, 300_000, 600_000]
     this.uncertainSettleMs = options.uncertainSettleMs ?? 65_000
@@ -432,14 +449,21 @@ export class Relay {
     if (!config || !registration) return
     this.watching.add(route)
     try {
-      const messages = await this.api.messages(registration.sessionID, this.messageWindow)
+      const probe = await this.api.messages(registration.sessionID, 1)
       if (this.stopped) return
-      const turns = findFinalTurns(messages, registration.watermarkMs, this.state.processedTurns)
-      for (const turn of turns) {
-        if (this.stopped) return
-        await this.handleTurn(route, config, registration.sessionID, turn, messages)
-      }
       const previous = this.lastWatch.get(route)
+      const fullRead = this.fullReads.get(route)
+      if (!fullRead || !previous?.ok || messageChangeKey(probe.at(-1)) !== fullRead.key || this.now() - fullRead.at >= this.fullReadIntervalMs) {
+        const messages = await this.api.messages(registration.sessionID, this.messageWindow)
+        if (this.stopped) return
+        const turns = findFinalTurns(messages, registration.watermarkMs, this.state.processedTurns)
+        for (const turn of turns) {
+          if (this.stopped) return
+          await this.handleTurn(route, config, registration.sessionID, turn, messages)
+        }
+        if (this.stopped) return
+        this.fullReads.set(route, { key: messageChangeKey(messages.at(-1)), at: this.now() })
+      }
       if (previous && !previous.ok) this.log(`${route} transcript readable again`)
       this.lastWatch.set(route, { at: this.now(), ok: true })
     } catch (error) {

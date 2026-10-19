@@ -136,6 +136,8 @@ The relay is a host process, started with `bun src/relay/main.ts --config relay.
 |---|---|
 | `socketPath` | The relay's only listener. Its directory is created 0700 and the socket 0600. |
 | `stateDir` | `journal.jsonl` and `pending/`, both private. |
+| `pollIntervalMs` | Coordinator transcript probe cadence, default `3000` ms. Each poll reads only the newest message first. |
+| `fullReadIntervalMs` | Backstop full-window read interval, default `60000` ms since the last successful full read. A changed probe triggers a full read in the same poll; a failed watch retries at the next poll without waiting for this interval. |
 | `envFile`, `allowedUsersFrom`, `allowedRoomsFrom` | Allowlists read from these keys of that file and nothing else, so the relay enforces the same lists as the connector and private ids stay out of `relay.json`. `allowedUsers` / `allowedRooms` take literal lists instead. |
 | `vibetermApi.secretsModule` | opencode-tools' secrets module. The vibeterm-api password is read through it on every cache miss (60 s) and never copied. |
 | `sessionID` | The session each accepted message is prompted into. Changing it registers the route again; only turns that start after a registration are relayed. |
@@ -146,6 +148,8 @@ The relay is a host process, started with `bun src/relay/main.ts --config relay.
 | `native` | The WhatsApp route's link to the desktop app; see "The WhatsApp route" below. |
 
 An enabled route with an empty allowlist refuses to start. A message reaches the session as a `[chat_relay] ... [/chat_relay]` provenance block followed by its text. The session's answer is posted unless it is exactly `NO_REPLY`, and a first line `REPLY_TO: <relay_id>` sends a later turn into that message's thread.
+
+Each coordinator poll uses `GET /session/{id}/message?limit=1`. A change to that message's id, role, completion time, finish reason or error presence/name triggers the normal newest-40-message read and turn processing, even when the newest message is a user prompt after a completed answer. The first poll always reads the full window. The comparison key comes from the full read's newest message and is saved only after every turn in that window was handled successfully. Probe or full-read failures use the existing watch health/logging and retry the full read after the next successful probe. With no change, the first poll at or past `fullReadIntervalMs` performs a backstop full read; neither an idle probe nor a failed read advances that backstop.
 
 Delivery is `prompt_async` with `Idempotency-Key: ai-bridge-relay:<relay_id>`, retried under that key at 5 s, 15 s, 1 min, 2 min, 5 min and 10 min. A refusal that submitted nothing (HTTP 400 with `possiblyAccepted: false`, typically a parked tab still waking past vibeterm-api's 60 s pane wait) is retried; any other 400, a 404 and a 422 are final and reported in the thread. An operator can redeliver a final refusal under its original key:
 

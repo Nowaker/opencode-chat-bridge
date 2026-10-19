@@ -61,6 +61,7 @@ interface RelayFile {
   stateDir?: string
   envFile?: string
   pollIntervalMs?: number
+  fullReadIntervalMs?: number
   vibetermApi?: { url?: string; username?: string; secretsModule?: string }
   routes?: Record<string, RouteFile>
 }
@@ -69,6 +70,7 @@ export interface LoadedRelayConfig {
   socketPath: string
   stateDir: string
   pollIntervalMs: number
+  fullReadIntervalMs: number
   api: { url: string; username: string; secretsModule: string }
   routes: Partial<Record<RelayRoute, RouteConfig>>
   whatsappNative?: NativeRouteConfig
@@ -184,6 +186,7 @@ export function loadRelayConfig(path: string): LoadedRelayConfig {
     socketPath,
     stateDir,
     pollIntervalMs: file.pollIntervalMs ?? 3_000,
+    fullReadIntervalMs: file.fullReadIntervalMs ?? 60_000,
     api: {
       url: file.vibetermApi?.url ?? "http://127.0.0.1:6096",
       username: file.vibetermApi?.username ?? "opencode",

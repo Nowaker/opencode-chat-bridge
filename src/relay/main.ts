@@ -92,7 +92,12 @@ async function main(): Promise<void> {
     username: config.api.username,
     password: vibetermSecretsPassword(config.api.secretsModule),
   })
-  const relay = new Relay(api, { stateDir: config.stateDir, routes: config.routes, pollIntervalMs: config.pollIntervalMs })
+  const relay = new Relay(api, {
+    stateDir: config.stateDir,
+    routes: config.routes,
+    pollIntervalMs: config.pollIntervalMs,
+    fullReadIntervalMs: config.fullReadIntervalMs,
+  })
 
   console.log(`[RELAY] ai-bridge-relay ${revision()} starting; state ${config.stateDir}`)
   for (const [route, settings] of Object.entries(config.routes)) {

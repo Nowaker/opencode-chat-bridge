@@ -23,8 +23,11 @@ class FakeApi implements RelayApi {
   prompts: Array<{ sessionID: string; key: string; text: string }> = []
   outcomes: Outcome[] = []
   messageReads = 0
+  messageCalls: Array<{ sessionID: string; limit: number }> = []
+  onMessages?: (sessionID: string, limit: number) => void
   private readonly transcripts = new Map<string, ApiMessage[]>()
   private seq = 0
+  private createdAt = 0
 
   private list(sessionID: string): ApiMessage[] {
     let list = this.transcripts.get(sessionID)
@@ -36,15 +39,20 @@ class FakeApi implements RelayApi {
     return `${prefix}_${String(++this.seq).padStart(6, "0")}`
   }
 
+  private nextCreatedAt(): number {
+    this.createdAt = Math.max(Date.now(), this.createdAt + 1)
+    return this.createdAt
+  }
+
   addUser(text: string, sessionID = SESSION): string {
     const id = this.id("msg_u")
-    this.list(sessionID).push({ info: { id, role: "user", time: { created: Date.now() } }, parts: [{ type: "text", text }] })
+    this.list(sessionID).push({ info: { id, role: "user", time: { created: this.nextCreatedAt() } }, parts: [{ type: "text", text }] })
     return id
   }
 
-  addAssistant(parentID: string, opts: { text?: string; finish?: string; error?: unknown } = {}, sessionID = SESSION): string {
+  addAssistant(parentID: string, opts: { text?: string; finish?: string; error?: unknown; completed?: boolean } = {}, sessionID = SESSION): string {
     const id = this.id("msg_a")
-    const created = Date.now() + 5
+    const created = this.nextCreatedAt()
     this.list(sessionID).push({
       info: {
         id,
@@ -52,7 +60,7 @@ class FakeApi implements RelayApi {
         parentID,
         ...(opts.finish === undefined ? {} : { finish: opts.finish }),
         ...(opts.error === undefined ? {} : { error: opts.error }),
-        time: { created, completed: created + 1 },
+        time: { created, ...(opts.completed === false ? {} : { completed: created + 1 }) },
       },
       parts: opts.text === undefined ? [] : [{ type: "text", text: opts.text }],
     })
@@ -64,6 +72,12 @@ class FakeApi implements RelayApi {
     return String(users[users.length - 1]?.info["id"])
   }
 
+  updateInfo(messageID: string, info: Record<string, unknown>): void {
+    const message = this.list(SESSION).find((item) => item.info["id"] === messageID)
+    if (!message) throw new Error(`no fake message ${messageID}`)
+    Object.assign(message.info, info)
+  }
+
   async promptAsync(sessionID: string, key: string, text: string): Promise<PromptOutcome> {
     this.prompts.push({ sessionID, key, text })
     const next = this.outcomes.shift()
@@ -72,6 +86,8 @@ class FakeApi implements RelayApi {
   }
 
   async messages(sessionID: string, limit: number): Promise<ApiMessage[]> {
+    this.messageCalls.push({ sessionID, limit })
+    this.onMessages?.(sessionID, limit)
     return this.list(sessionID).slice(-limit)
   }
 
@@ -308,6 +324,228 @@ describe("delivery", () => {
     expect(api.prompts).toHaveLength(1)
     const outbox = await relay.takeOutbox("matrix", 0)
     expect(outbox.items[0].text).toContain("HTTP 404")
+  })
+})
+
+describe("transcript polling", () => {
+  test("idle polls read only the newest message after the initial full read", async () => {
+    const api = new FakeApi()
+    api.addAssistant(api.addUser("old prompt"), { text: "old answer", finish: "stop" })
+    const { relay } = await startRelay(api)
+
+    await relay.watchRoute("matrix")
+    await relay.watchRoute("matrix")
+
+    expect(api.messageCalls).toEqual([
+      { sessionID: SESSION, limit: 1 },
+      { sessionID: SESSION, limit: 40 },
+      { sessionID: SESSION, limit: 1 },
+      { sessionID: SESSION, limit: 1 },
+    ])
+  })
+
+  test("a newly completed final turn triggers one full read and is processed once", async () => {
+    const api = new FakeApi()
+    const { relay } = await startRelay(api)
+    const answerID = api.addAssistant(api.addUser("new prompt"), { text: "new answer", finish: "stop" })
+    api.messageCalls.length = 0
+
+    await relay.watchRoute("matrix")
+    await relay.watchRoute("matrix")
+
+    expect(relay.state.processedTurns.has(answerID)).toBe(true)
+    expect([...relay.state.outbox.values()].map((item) => item.messageID)).toEqual([answerID])
+    expect(api.messageCalls).toEqual([
+      { sessionID: SESSION, limit: 1 },
+      { sessionID: SESSION, limit: 40 },
+      { sessionID: SESSION, limit: 1 },
+    ])
+  })
+
+  test("a newer user message does not hide the final turn completed before the next poll", async () => {
+    const api = new FakeApi()
+    const { relay } = await startRelay(api)
+    const answerID = api.addAssistant(api.addUser("first prompt"), { text: "first answer", finish: "stop" })
+    api.addUser("next prompt")
+    api.messageCalls.length = 0
+
+    await relay.watchRoute("matrix")
+
+    expect(relay.state.processedTurns.has(answerID)).toBe(true)
+    expect((await relay.takeOutbox("matrix", 0)).items.map((item) => item.text)).toEqual(["first answer"])
+    expect(api.messageCalls).toEqual([
+      { sessionID: SESSION, limit: 1 },
+      { sessionID: SESSION, limit: 40 },
+    ])
+  })
+
+  test("a streaming turn is processed on the poll after its completion time appears", async () => {
+    const api = new FakeApi()
+    const { relay } = await startRelay(api)
+    const answerID = api.addAssistant(api.addUser("prompt"), { text: "answer", finish: "stop", completed: false })
+    await relay.watchRoute("matrix")
+    expect(relay.state.processedTurns.has(answerID)).toBe(false)
+    expect(relay.state.outbox.size).toBe(0)
+    await relay.watchRoute("matrix")
+    api.messageCalls.length = 0
+    api.updateInfo(answerID, { time: { created: Date.now() + 5, completed: Date.now() + 10 } })
+
+    await relay.watchRoute("matrix")
+
+    expect(relay.state.processedTurns.has(answerID)).toBe(true)
+    expect((await relay.takeOutbox("matrix", 0)).items.map((item) => item.text)).toEqual(["answer"])
+    expect(api.messageCalls).toEqual([
+      { sessionID: SESSION, limit: 1 },
+      { sessionID: SESSION, limit: 40 },
+    ])
+  })
+
+  test.each([undefined, 10_000])("an unchanged probe gets a backstop full read after %j ms", async (interval) => {
+    const api = new FakeApi()
+    let now = 1_000
+    const { relay } = await startRelay(api, { options: { now: () => now, fullReadIntervalMs: interval } })
+    const elapsed = interval ?? 60_000
+    now += elapsed - 1
+    await relay.watchRoute("matrix")
+    expect(api.messageCalls.map((call) => call.limit)).toEqual([1, 40, 1])
+    now++
+
+    await relay.watchRoute("matrix")
+    await relay.watchRoute("matrix")
+
+    expect(api.messageCalls.map((call) => call.limit)).toEqual([1, 40, 1, 1, 40, 1])
+    expect(relay.lastWatch.get("matrix")).toEqual({ at: now, ok: true })
+  })
+
+  test("a failed full read retries on the next poll with an unchanged key", async () => {
+    const api = new FakeApi()
+    let now = 1_000
+    const logs: string[] = []
+    const { relay } = await startRelay(api, { options: { now: () => now, fullReadIntervalMs: 10_000, log: (line) => logs.push(line) } })
+    now += 10_000
+    api.onMessages = (_sessionID, limit) => { if (limit === 40) throw new Error("full read unavailable") }
+    await relay.watchRoute("matrix")
+    expect(relay.lastWatch.get("matrix")).toEqual({ at: now, ok: false, error: "full read unavailable" })
+    api.onMessages = undefined
+    api.messageCalls.length = 0
+
+    await relay.watchRoute("matrix")
+    await relay.watchRoute("matrix")
+
+    expect(api.messageCalls.map((call) => call.limit)).toEqual([1, 40, 1])
+    expect(relay.lastWatch.get("matrix")).toEqual({ at: now, ok: true })
+    expect(logs.filter((line) => line.includes("transcript"))).toEqual([
+      "matrix transcript read failed: full read unavailable",
+      "matrix transcript readable again",
+    ])
+  })
+
+  test("a failed probe uses the same watch health and deduplicated logging, then retries the full read", async () => {
+    const api = new FakeApi()
+    let now = 1_000
+    const logs: string[] = []
+    const { relay } = await startRelay(api, { options: { now: () => now, log: (line) => logs.push(line) } })
+    now++
+    api.onMessages = (_sessionID, limit) => { if (limit === 1) throw new Error("probe unavailable") }
+    await relay.watchRoute("matrix")
+    await relay.watchRoute("matrix")
+    expect(relay.lastWatch.get("matrix")).toEqual({ at: now, ok: false, error: "probe unavailable" })
+    expect(api.messageCalls.map((call) => call.limit)).toEqual([1, 40, 1, 1])
+    api.onMessages = undefined
+    api.messageCalls.length = 0
+
+    await relay.watchRoute("matrix")
+
+    expect(api.messageCalls.map((call) => call.limit)).toEqual([1, 40])
+    expect(relay.lastWatch.get("matrix")).toEqual({ at: now, ok: true })
+    expect(logs.filter((line) => line.includes("transcript"))).toEqual([
+      "matrix transcript read failed: probe unavailable",
+      "matrix transcript readable again",
+    ])
+  })
+
+  test("the saved key comes from the full read when a message arrives after the probe", async () => {
+    const api = new FakeApi()
+    const { relay } = await startRelay(api)
+    const answerID = api.addAssistant(api.addUser("prompt"), { text: "answer", finish: "stop" })
+    api.onMessages = (_sessionID, limit) => { if (limit === 40) api.addUser("arrived during read") }
+    await relay.watchRoute("matrix")
+    api.onMessages = undefined
+    api.messageCalls.length = 0
+
+    await relay.watchRoute("matrix")
+
+    expect(api.messageCalls.map((call) => call.limit)).toEqual([1])
+    expect([...relay.state.outbox.values()].map((item) => item.messageID)).toEqual([answerID])
+  })
+
+  test("a turn handling failure leaves the full read uncommitted and retries its window", async () => {
+    const api = new FakeApi()
+    const { relay } = await startRelay(api)
+    api.addAssistant(api.addUser("first"), { text: "first answer", finish: "stop" })
+    const answerID = api.addAssistant("msg_missing_parent", { text: "second answer", finish: "stop" })
+    const readMessage = api.message.bind(api)
+    api.message = async () => { throw new Error("parent unreadable") }
+    await relay.watchRoute("matrix")
+    expect(relay.state.processedTurns.has(answerID)).toBe(false)
+    expect(relay.lastWatch.get("matrix")?.ok).toBe(false)
+    api.message = readMessage
+    api.messageCalls.length = 0
+
+    await relay.watchRoute("matrix")
+    await relay.watchRoute("matrix")
+
+    expect(api.messageCalls.map((call) => call.limit)).toEqual([1, 40, 1])
+    expect(relay.state.processedTurns.has(answerID)).toBe(true)
+    expect(relay.state.outbox.size).toBe(2)
+  })
+
+  test.each([
+    { role: "assistant" },
+    { finish: "length" },
+    { error: {} },
+    { error: { name: "MessageAbortedError" } },
+  ])("a newest-message info change triggers a full read: %j", async (info) => {
+    const api = new FakeApi()
+    const newestID = api.addUser("prompt")
+    const { relay } = await startRelay(api)
+    api.updateInfo(newestID, info)
+    api.messageCalls.length = 0
+
+    await relay.watchRoute("matrix")
+
+    expect(api.messageCalls.map((call) => call.limit)).toEqual([1, 40])
+  })
+
+  test("changing only the error name triggers a full read", async () => {
+    const api = new FakeApi()
+    const newestID = api.addAssistant(api.addUser("prompt"), { error: { name: "FirstError" } })
+    const { relay } = await startRelay(api)
+    api.updateInfo(newestID, { error: { name: "SecondError" } })
+    api.messageCalls.length = 0
+
+    await relay.watchRoute("matrix")
+
+    expect(api.messageCalls.map((call) => call.limit)).toEqual([1, 40])
+  })
+
+  test("routes keep independent probe keys and full-read deadlines", async () => {
+    const api = new FakeApi()
+    const route: RouteConfig = {
+      enabled: true, sessionID: SESSION, allowedUsers: [OWNER], allowedRooms: [ROOM],
+      defaultRoom: ROOM, repliesOnly: false, idsInPrompt: true,
+    }
+    const { relay } = await startRelay(api, { options: { routes: {
+      matrix: route,
+      whatsapp: { ...route, sessionID: "ses_whatsappcoordinator" },
+    } } })
+    api.addUser("WhatsApp prompt", "ses_whatsappcoordinator")
+    api.messageCalls.length = 0
+
+    await relay.watchAll()
+
+    expect(api.messageCalls.filter((call) => call.sessionID === SESSION).map((call) => call.limit)).toEqual([1])
+    expect(api.messageCalls.filter((call) => call.sessionID === "ses_whatsappcoordinator").map((call) => call.limit)).toEqual([1, 40])
   })
 })
 
