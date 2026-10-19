@@ -88,6 +88,48 @@ Ferrum is not a sandbox: an allowed tool or MCP server runs with the Unix permis
 
 For production chat bots, configure only trusted MCP commands, pass only required environment variables, keep credentials outside copied profiles and session stores, and prefer narrow MCP tools over enabling general shell access.
 
+## Relay mode
+
+`RELAY_SOCKET` in a connector's environment switches it from running its own ACP agent to forwarding each authenticated message to `ai-bridge-relay` over that Unix socket (fork deviation 10). Only the Matrix connector supports it. In relay mode the connector starts no `opencode acp`, the container entrypoint installs no opencode, and the bridge-local commands, session picker and chat permission replies are not used: the receiving session's own approvals apply.
+
+The relay is a host process, started with `bun src/relay/main.ts --config relay.json`:
+
+```json
+{
+  "socketPath": "~/ai-bridge-runtime/bridge/relay/relay.sock",
+  "stateDir": "~/ai-bridge-runtime/bridge/relay-state",
+  "envFile": "~/ai-bridge-runtime/bridge/bridge.env",
+  "vibetermApi": {
+    "url": "http://127.0.0.1:6096",
+    "username": "opencode",
+    "secretsModule": "~/projects/nowaker/opencode-tools/_lib/vibeterm-secrets/index.ts"
+  },
+  "routes": {
+    "matrix": {
+      "enabled": true,
+      "sessionID": "ses_...",
+      "allowedUsersFrom": "MATRIX_ALLOWED_USERS",
+      "allowedRoomsFrom": "MATRIX_ALLOWED_ROOMS",
+      "chatLabel": "Vibeterm AI"
+    },
+    "whatsapp": { "enabled": false, "sessionID": "ses_...", "repliesOnly": true, "idsInPrompt": false }
+  }
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `socketPath` | The relay's only listener. Its directory is created 0700 and the socket 0600. |
+| `stateDir` | `journal.jsonl` and `pending/`, both private. |
+| `envFile`, `allowedUsersFrom`, `allowedRoomsFrom` | Allowlists read from these keys of that file and nothing else, so the relay enforces the same lists as the connector and private ids stay out of `relay.json`. `allowedUsers` / `allowedRooms` take literal lists instead. |
+| `vibetermApi.secretsModule` | opencode-tools' secrets module. The vibeterm-api password is read through it on every cache miss (60 s) and never copied. |
+| `sessionID` | The session each accepted message is prompted into. Changing it registers the route again; only turns that start after a registration are relayed. |
+| `defaultRoom` | Where a turn that answers no relayed message is posted. Defaults to the first allowlisted room; empty drops such turns. |
+| `repliesOnly` | Post only answers to a relayed message. |
+| `idsInPrompt` | Show platform ids in the prompt and the log (`true`), or hashes of them (`false`). |
+
+An enabled route with an empty allowlist refuses to start. A message reaches the session as a `[chat_relay] ... [/chat_relay]` provenance block followed by its text. The session's answer is posted unless it is exactly `NO_REPLY`, and a first line `REPLY_TO: <relay_id>` sends a later turn into that message's thread.
+
 ## Session picker
 
 The project/session picker is disabled by default because it exposes saved ACP working directories, session titles, and optional recent history previews.

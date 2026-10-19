@@ -1,8 +1,11 @@
 #!/bin/sh
 set -e
 
-# Install OpenCode if not present
-if [ ! -f /root/.opencode/bin/opencode ]; then
+# Install OpenCode if not present. A relay-mode connector runs no agent, so it
+# neither needs the binary nor may fetch one.
+if [ -n "$RELAY_SOCKET" ]; then
+  echo "[DOCKER] Relay mode: no agent runs in this container; OpenCode not installed"
+elif [ ! -f /root/.opencode/bin/opencode ]; then
   echo "[DOCKER] Installing OpenCode..."
   curl -fsSL https://opencode.ai/install | bash
   echo "[DOCKER] OpenCode installed"

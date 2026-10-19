@@ -322,6 +322,24 @@ recursively; that path returns early when pinned. Config and profile copying is
 skipped. A pinned directory that does not exist is an error rather than
 something to create. The path is configuration, never a literal in source.
 
+## 10. Relay mode: a connector hands its chat to a host session
+
+**Upstream:** every connector spawns its own `opencode acp` child and runs the agent beside the chat client.
+
+**This fork:** with `RELAY_SOCKET` set, the Matrix connector runs no agent at all. It still authenticates each message the way it always did (room and sender allowlists, its own echo, the room's encryption), then forwards it over that Unix socket to `ai-bridge-relay` and posts whatever the relay hands back. The relay (`src/relay/`, a separate host process) delivers each message to a configured Vibeterm session through vibeterm-api's keyed `prompt_async`, watches that session's transcript, and queues every turn that ends normally for the connector: in the thread of the message it answers, or top-level when it answers none.
+
+**Why:** the owner wanted chat prompts to reach a real session with the host's tools and project instructions, not an agent confined to a container with no tools. Running the agent next to the chat client is exactly what this removes.
+
+**Notes:**
+
+- Nothing is resent blindly. A prompt that may have landed is retried only with the same `Idempotency-Key`, which vibeterm-api reconciles against its own ledger. A reply the connector took but never confirmed is offered again only under the same Matrix transaction id, which the homeserver deduplicates, and only for 20 minutes; after that it is recorded as uncertain and left alone.
+- The journal (`journal.jsonl`) records ids, hashes and lengths, never a message body. A prompt's text waits in a 0600 file only until its delivery settles, and a reply's text is read back from vibeterm-api by message id when it has to be offered again.
+- The relay checks the room and sender allowlists again, from the same env-file keys the connector reads.
+- A message posted before the relay registered its session is ignored, and so is an untriggered thread reply in a thread the relay does not serve.
+- `createACPClient` throws in relay mode, so no code path can start an agent in the container, and the entrypoint skips the opencode download.
+- Only Matrix speaks relay mode. The relay's `whatsapp` route exists and stays disabled until its transport is built.
+- The socket is the privilege boundary: whoever can connect to it prompts a full-tool session as the owner. It sits in a 0700 directory and is itself 0600, so only its user and root reach it, and the one container that needs it gets that directory read-only. A compromised connector can therefore prompt as the owner, which the containerized agent could not; see `SECURITY.md`, "Relay mode".
+
 ## Not implemented, deliberately
 
 ### Reverse session discovery

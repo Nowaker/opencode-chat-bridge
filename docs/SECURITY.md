@@ -359,6 +359,21 @@ function checkRateLimit(userId: string): boolean {
 }
 ```
 
+## Relay Mode
+
+Everything above assumes the agent runs inside the bridge, under the bridge's `opencode.json` permissions. Relay mode (fork deviation 10) removes that assumption: a relayed message reaches a host session with its normal tools, and that session's own permissions and approvals are what apply.
+
+What still holds:
+
+- The connector authenticates the sender exactly as before: stable-id room and user allowlists, its own echo rejected, and the room's encryption. The relay checks both allowlists again.
+- Nothing in the container can start an agent, and the container holds no vibeterm-api credential. The relay reads that credential itself.
+- The relay listens only on a Unix socket in a 0700 directory, and the socket is 0600. Only its user and root reach it; that user already holds the vibeterm-api credential, so the socket adds no authority the user lacks.
+
+What changes:
+
+- **The connector is now trusted.** A process that can reach the socket can prompt the receiving session as the owner. Before, compromising the connector reached an agent with no tools. Keep the room invite-only and the homeserver private, and treat a connector update as a change to a privileged component.
+- **Output rules move into the session.** The bridge's tool-message filters see nothing, because the connector only posts final answers. What a reply may contain is the receiving session's instructions to follow.
+
 ## Credential Security
 
 ### Environment Variables

@@ -106,6 +106,18 @@ import {
 } from "./matrix-thread-helpers"
 import { diagnoseEmptyResponse } from "../src/acp-response-diagnostics"
 import { resolveMatrixAccessToken, writePrivateFileAtomically } from "./matrix-auth"
+import { RelayClient, RelayError } from "../src/relay/client"
+import type { InboundRequest, OutboxItem } from "../src/relay/types"
+
+// Relay mode: this container is transport only. Accepted messages go to
+// ai-bridge-relay on the host, which prompts a Vibeterm coordinator session,
+// and that session's answers come back through the relay's outbox. No agent
+// runs here, and BaseConnector refuses to create one.
+const RELAY_SOCKET = process.env.RELAY_SOCKET || ""
+const RELAY_INBOUND_DELAYS_MS = [1_000, 3_000, 10_000, 30_000, 60_000]
+const RELAY_OUTBOX_WAIT_MS = 8_000
+const TYPING_TIMEOUT_MS = 30_000
+const TYPING_REFRESH_MS = 20_000
 
 // =============================================================================
 // Session Type
@@ -123,6 +135,9 @@ interface RoomSession extends BaseSession {
 export class MatrixConnector extends BaseConnector<RoomSession> {
   private matrix: MatrixClient | null = null
   private threadIsolation: boolean
+  private readonly relay: RelayClient | null = RELAY_SOCKET ? new RelayClient(RELAY_SOCKET) : null
+  private stopping = false
+  private typingRooms = new Map<string, number>()
 
   constructor() {
     super({
@@ -155,7 +170,11 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
     console.log(`  E2EE: enabled (Rust crypto with SQLite)`)
     this.logStartup()
     console.log(`  Thread isolation: ${this.threadIsolation ? "on (per-thread sessions)" : "off (per-room sessions)"}`)
-    await this.cleanupSessions()
+    if (this.relay) {
+      console.log(`  Backend: ai-bridge-relay at ${RELAY_SOCKET} (transport only; no agent runs in this container)`)
+    } else {
+      await this.cleanupSessions()
+    }
 
     fs.mkdirSync(STORAGE_PATH, { recursive: true })
     fs.mkdirSync(CRYPTO_STORAGE_PATH, { recursive: true })
@@ -183,12 +202,19 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
     this.matrix.on("room.message", this.handleRoomMessage.bind(this))
     await this.matrix.start()
 
-    this.startSessionExpiryLoop()
+    if (this.relay) {
+      await this.logRelayHealth()
+      void this.runRelayOutbox()
+    } else {
+      this.startSessionExpiryLoop()
+    }
     this.log("Started! Listening for messages...")
   }
 
   async stop(): Promise<void> {
     this.log("Stopping...")
+    this.stopping = true
+    await this.updateTyping([])
     await this.disconnectAllSessions()
     if (this.matrix) this.matrix.stop()
     this.log("Stopped.")
@@ -431,6 +457,7 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
 
     // Extract query
     let query = ""
+    let implicit = false
     const botNameQuery = extractBotNameQuery(body, BOT_NAME)
     if (body.startsWith(TRIGGER + " ")) {
       query = body.slice(TRIGGER.length + 1).trim()
@@ -448,9 +475,11 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
       threadRootEventId,
       trigger: TRIGGER,
       botUserId: myUserId,
-    }) && this.sessionManager.has(context.sessionId)) {
-      // Implicit thread follow-up
+    }) && (this.relay !== null || this.sessionManager.has(context.sessionId))) {
+      // Implicit thread follow-up. In relay mode the relay knows which
+      // threads it serves; there is no local session to ask.
       query = body
+      implicit = true
       this.logInbound("THREAD", message.sender, context.sessionId, body)
     } else {
       return
@@ -458,6 +487,12 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
 
     query = query.replace(/^[:\s]+/, "").trim()
     if (!query) return
+
+    if (this.relay) {
+      if (!implicit) this.logInbound("MSG", message.sender, context.sessionId, body)
+      await this.forwardToRelay(context, event, query, implicit)
+      return
+    }
 
     // Before anything that could start a turn or be rate limited: a permission
     // reply answers the turn already waiting, it does not open a new one.
@@ -490,6 +525,149 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
 
     if (!this.checkRateLimit(message.sender)) return
     await this.processQuery(context, query)
+  }
+
+  // ---------------------------------------------------------------------------
+  // Relay mode
+  // ---------------------------------------------------------------------------
+
+  private async logRelayHealth(): Promise<void> {
+    try {
+      const health = await this.relay!.health()
+      const routes = (health.routes ?? {}) as Record<string, { enabled?: boolean; sessionID?: string }>
+      const route = routes["matrix"]
+      this.log(`[RELAY] reachable; matrix route ${route?.enabled ? `-> ${route.sessionID}` : "is not enabled there"}`)
+    } catch (err) {
+      this.logError(`[RELAY] not reachable yet: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
+  /** The relay dedupes on the event id, so a retry after a lost answer is never a second prompt. */
+  private async forwardToRelay(context: MatrixEventContext, event: any, query: string, implicit: boolean): Promise<void> {
+    const request: InboundRequest = {
+      route: "matrix",
+      eventId: context.eventId,
+      roomId: context.roomId,
+      threadRootId: context.threadRootEventId,
+      sender: context.sender,
+      postedAt: typeof event?.origin_server_ts === "number" ? event.origin_server_ts : Date.now(),
+      text: query,
+      implicit,
+    }
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const result = await this.relay!.inbound(request)
+        const detail = [result.relayId, result.reason].filter(Boolean).join(": ")
+        this.log(`[RELAY] ${result.state}${detail ? ` ${detail}` : ""} [${context.sessionId}]`)
+        return
+      } catch (err) {
+        const retryable = !(err instanceof RelayError) || err.retryable
+        const delay = RELAY_INBOUND_DELAYS_MS[attempt]
+        if (!retryable || delay === undefined || this.stopping) {
+          this.logError(`[RELAY] inbound failed [${context.sessionId}]: ${err instanceof Error ? err.message : String(err)}`)
+          await this.sendNoticeReply(context, "⚠ The relay did not take this message, so it was not delivered. Resend it once the relay is back.")
+          return
+        }
+        await Bun.sleep(delay)
+      }
+    }
+  }
+
+  private async runRelayOutbox(): Promise<void> {
+    let lastError = ""
+    while (!this.stopping) {
+      try {
+        const batch = await this.relay!.outbox("matrix", RELAY_OUTBOX_WAIT_MS)
+        if (lastError) {
+          this.log("[RELAY] outbox reachable again")
+          lastError = ""
+        }
+        await this.updateTyping(batch.typingRooms)
+        for (const item of batch.items) {
+          if (this.stopping) return
+          await this.deliverRelayItem(item)
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        if (message !== lastError) this.logError(`[RELAY] outbox unavailable: ${message}`)
+        lastError = message
+        await Bun.sleep(5_000)
+      }
+    }
+  }
+
+  private async deliverRelayItem(item: OutboxItem): Promise<void> {
+    let chatEventId: string
+    try {
+      chatEventId = await this.sendRelayItem(item)
+    } catch (err) {
+      const status = (err as { statusCode?: unknown })?.statusCode
+      // A 4xx other than rate limiting is a refusal that a retry cannot fix.
+      // Anything else may have landed; the relay offers it again under the
+      // same transaction id, which the homeserver deduplicates.
+      const definite = typeof status === "number" && status >= 400 && status < 500 && status !== 429
+      const message = err instanceof Error ? err.message : String(err)
+      this.logError(`[RELAY] post ${item.outboxId} failed${definite ? " (refused)" : ""}: ${message}`)
+      await this.relay!.nack(item.outboxId, message, definite)
+        .catch((nackErr) => this.logError(`[RELAY] nack of ${item.outboxId} failed:`, nackErr))
+      return
+    }
+    this.log(`[RELAY] posted ${item.outboxId} as ${chatEventId}`)
+    await this.relay!.ack(item.outboxId, chatEventId)
+      .catch((ackErr) => this.logError(`[RELAY] ack of ${item.outboxId} failed; it will be offered again under the same transaction id:`, ackErr))
+  }
+
+  /**
+   * matrix-bot-sdk's `sendEvent`, but with the relay's transaction id. The
+   * homeserver deduplicates a repeated id per access token, so posting an item
+   * again after a lost acknowledgement returns the first event; the SDK mints a
+   * fresh id on every call, which would make that retry a second message.
+   */
+  private async sendRelayItem(item: OutboxItem): Promise<string> {
+    const matrix = this.matrix!
+    const body = this.safeOutboundText(item.text)
+    const content: Record<string, unknown> = { msgtype: item.kind === "notice" ? "m.notice" : "m.text", body }
+    if (FORMAT_HTML) {
+      content.format = "org.matrix.custom.html"
+      content.formatted_body = await marked.parse(body)
+    }
+    if (item.threadRootId) {
+      content["m.relates_to"] = buildThreadRelation(item.threadRootId, item.replyToEventId || item.threadRootId)
+    }
+    let eventType = "m.room.message"
+    let payload: unknown = content
+    if (await matrix.crypto?.isRoomEncrypted(item.roomId)) {
+      payload = await matrix.crypto.encryptRoomEvent(item.roomId, eventType, content)
+      eventType = "m.room.encrypted"
+    }
+    const path = `/_matrix/client/v3/rooms/${encodeURIComponent(item.roomId)}/send/` +
+      `${encodeURIComponent(eventType)}/${encodeURIComponent(item.txnId)}`
+    const response = await matrix.doRequest("PUT", path, null, payload)
+    const eventId = response?.event_id
+    if (typeof eventId !== "string" || !eventId) throw new Error("the homeserver answered without an event id")
+    return eventId
+  }
+
+  private async updateTyping(rooms: string[]): Promise<void> {
+    if (!this.matrix) return
+    const now = Date.now()
+    const next = new Map<string, number>()
+    for (const room of rooms.filter((r) => this.isChannelAllowedQuietly(r))) {
+      const refreshedAt = this.typingRooms.get(room)
+      if (refreshedAt !== undefined && now - refreshedAt < TYPING_REFRESH_MS) {
+        next.set(room, refreshedAt)
+        continue
+      }
+      await this.matrix.setTyping(room, true, TYPING_TIMEOUT_MS)
+        .catch((err) => this.logError(`[RELAY] typing on in ${room} failed:`, err))
+      next.set(room, now)
+    }
+    for (const room of this.typingRooms.keys()) {
+      if (next.has(room)) continue
+      await this.matrix.setTyping(room, false)
+        .catch((err) => this.logError(`[RELAY] typing off in ${room} failed:`, err))
+    }
+    this.typingRooms = next
   }
 
   // ---------------------------------------------------------------------------
