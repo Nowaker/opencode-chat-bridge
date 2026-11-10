@@ -30,7 +30,7 @@ import { ensurePrivateDir } from "./private-files"
 
 /**
  * Under Bun.serve()'s 10 s idle timeout on a Unix socket, which the socket form
- * of its options cannot raise (measured for the relay, `src/relay/relay.ts`).
+ * of its options cannot raise (measured for the relay, now opencode-tools `_lib/vibeterm-channels/relay.ts`).
  * The CLI waits longer by asking again.
  */
 export const MAX_WAIT_MS = 8_000

@@ -6,9 +6,13 @@
  * The connector authenticates the sender (allowlists, its own bot echo, the
  * platform's encryption) and forwards; the relay owns everything after that:
  * dedupe, the Vibeterm prompt, the reply and where it goes.
+ *
+ * The relay itself now runs in opencode-tools as vibeterm-channels
+ * (`_lib/vibeterm-channels/types.ts`), which keeps the same types; change both
+ * together.
  */
 
-export const RELAY_ROUTES = ["matrix", "whatsapp"] as const
+export const RELAY_ROUTES = ["matrix", "whatsapp", "slack"] as const
 export type RelayRoute = (typeof RELAY_ROUTES)[number]
 
 export function isRelayRoute(value: unknown): value is RelayRoute {
@@ -62,7 +66,8 @@ export interface OutboxItem {
   /** The event a threaded post names as its in-reply-to fallback. */
   replyToEventId: string
   text: string
-  kind: "reply" | "notice"
+  /** `attention` is an item of the attention inbox; a reply in its thread answers it. */
+  kind: "reply" | "notice" | "attention"
   /** The `replyBy` of the message this answers, when it had one. */
   replyBy?: number
 }

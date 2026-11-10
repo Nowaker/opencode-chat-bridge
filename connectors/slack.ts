@@ -18,6 +18,8 @@
  *   SLACK_APP_TOKEN        - App-Level Token for Socket Mode (starts with xapp-)
  *   SLACK_TRIGGER          - Trigger prefix (default: !oc)
  *   SESSION_RETENTION_MINS - Minutes of inactivity before session expires (default: 30)
+ *   RELAY_SOCKET           - Relay mode: forward to the vibeterm-channels relay on this
+ *                            Unix socket and post what it hands back; no agent runs here
  */
 
 import fs from "fs"
@@ -35,6 +37,8 @@ import {
   removeImageMarkers,
   sanitizeServerPaths,
 } from "../src"
+import { RelayClient, RelayError } from "../src/relay/client"
+import type { InboundRequest, OutboxItem } from "../src/relay/types"
 
 // =============================================================================
 // Configuration
@@ -55,6 +59,14 @@ const ENV_ALLOWED_CHANNELS = parseCsvList(process.env.SLACK_ALLOWED_CHANNELS)
 const ALLOWED_CHANNELS = ENV_ALLOWED_CHANNELS.length > 0 ? ENV_ALLOWED_CHANNELS : config.slack.allowedChannels
 const LOG_INBOUND_MESSAGES = config.slack.logInboundMessages
 const AUTO_UPLOAD_FILES = config.slack.autoUploadFiles
+// Relay mode, as on Matrix: accepted messages go to the vibeterm-channels relay
+// on the host, which prompts a real Vibeterm session; its answers come back
+// through the relay's outbox.
+const RELAY_SOCKET = process.env.RELAY_SOCKET || ""
+const RELAY_INBOUND_DELAYS_MS = [1_000, 3_000, 10_000, 30_000, 60_000]
+const RELAY_OUTBOX_WAIT_MS = 8_000
+
+type RelayPort = Pick<RelayClient, "inbound" | "outbox" | "ack" | "nack" | "health">
 
 function parseSessionRetentionMins(env: NodeJS.ProcessEnv): number {
   const raw = env.SESSION_RETENTION_MINS
@@ -222,8 +234,10 @@ interface ChannelSession extends BaseSession {}
 export class SlackConnector extends BaseConnector<ChannelSession> {
   private app: App | null = null
   private threadIsolation: boolean
+  private readonly relay: RelayPort | null
+  private stopping = false
 
-  constructor() {
+  constructor(options: { relay?: RelayPort | null } = {}) {
     super({
       connector: "slack",
       trigger: TRIGGER,
@@ -235,6 +249,7 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
       allowedChannels: ALLOWED_CHANNELS,
     })
     this.threadIsolation = THREAD_ISOLATION
+    this.relay = options.relay !== undefined ? options.relay : RELAY_SOCKET ? new RelayClient(RELAY_SOCKET) : null
   }
 
   // ---------------------------------------------------------------------------
@@ -255,7 +270,11 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
 
     this.logStartup()
     console.log(`  Thread isolation: ${this.threadIsolation ? "on (per-thread sessions)" : "off (per-channel sessions)"}`)
-    await this.cleanupSessions()
+    if (this.relay) {
+      console.log(`  Backend: vibeterm-channels relay at ${RELAY_SOCKET} (transport only; no agent runs in this container)`)
+    } else {
+      await this.cleanupSessions()
+    }
 
     this.app = new App({
       token: BOT_TOKEN,
@@ -265,7 +284,12 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
     this.registerHandlers(this.app)
 
     await this.app.start()
-    this.startSessionExpiryLoop()
+    if (this.relay) {
+      await this.logRelayHealth()
+      void this.runRelayOutbox(this.app.client)
+    } else {
+      this.startSessionExpiryLoop()
+    }
     this.log("Started! Listening for messages...")
   }
 
@@ -305,6 +329,7 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
 
       const query = context.text.replace(/<@[A-Z0-9]+>/g, "").trim()
       if (!query) return
+      if (this.relay) return await this.forwardToRelay(context, query, false, client)
       if (await this.interceptPermissionReply(context, sessionId, query, client)) return
       if (!this.checkRateLimit(context.userId)) return
 
@@ -345,6 +370,7 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
       const match = context.text.match(new RegExp(`^${TRIGGER}\\s+(.+)`, "i"))
       if (!match) return
       const query = match[1].trim()
+      if (this.relay) return await this.forwardToRelay(context, query, false, client)
 
       if (await this.interceptPermissionReply(context, sessionId, query, client)) return
 
@@ -404,7 +430,9 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
       if (this.isDuplicateEvent(context.dedupeId)) return
       if (!this.isUserAllowed(context.userId)) return
 
-      // Only forward if there is already a session for this thread
+      // In relay mode the relay knows which threads it serves; otherwise only
+      // forward if there is already a session for this thread.
+      if (this.relay) return await this.forwardToRelay(context, context.text.trim(), true, client)
       const sessionId = resolveSessionId(context.channelId, context.replyThreadTs, this.threadIsolation)
       if (!this.sessionManager.has(sessionId)) {
         return
@@ -423,9 +451,117 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
 
   async stop(): Promise<void> {
     this.log("Stopping...")
+    this.stopping = true
     await this.disconnectAllSessions()
     if (this.app) await this.app.stop()
     this.log("Stopped.")
+  }
+
+  // ---------------------------------------------------------------------------
+  // Relay mode
+  // ---------------------------------------------------------------------------
+
+  private async logRelayHealth(): Promise<void> {
+    try {
+      const health = await this.relay!.health()
+      const routes = (health.routes ?? {}) as Record<string, { enabled?: boolean; sessionID?: string }>
+      const route = routes["slack"]
+      this.log(`[RELAY] reachable; slack route ${route?.enabled ? `-> ${route.sessionID}` : "is not enabled there"}`)
+    } catch (err) {
+      this.logError(`[RELAY] not reachable yet: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
+  /**
+   * The relay dedupes on the event id, so a retry after a lost answer, or the
+   * same message arriving as both a mention and a message event, is never a
+   * second prompt. The event id is the message's own `ts`, because the relay
+   * answers a top-level message in the thread rooted at its event id, and a
+   * Slack thread is named by its root's `ts`.
+   */
+  async forwardToRelay(context: SlackEventContext, query: string, implicit: boolean, slackClient: any): Promise<void> {
+    if (!query) return
+    if (implicit) this.logInbound("THREAD", context.userId, context.contextId, query)
+    const request: InboundRequest = {
+      route: "slack",
+      eventId: context.eventTs,
+      roomId: context.channelId,
+      threadRootId: context.threadTs ?? "",
+      sender: context.userId,
+      postedAt: Math.round(Number(context.eventTs) * 1000) || Date.now(),
+      text: query,
+      implicit,
+    }
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const result = await this.relay!.inbound(request)
+        const detail = [result.relayId, result.reason].filter(Boolean).join(": ")
+        this.log(`[RELAY] ${result.state}${detail ? ` ${detail}` : ""} [${context.contextId}]`)
+        return
+      } catch (err) {
+        const retryable = !(err instanceof RelayError) || err.retryable
+        const delay = RELAY_INBOUND_DELAYS_MS[attempt]
+        if (!retryable || delay === undefined || this.stopping) {
+          this.logError(`[RELAY] inbound failed [${context.contextId}]: ${err instanceof Error ? err.message : String(err)}`)
+          await postThreadReply(slackClient, context.channelId, context.replyThreadTs,
+            "⚠ The relay did not take this message, so it was not delivered. Resend it once the relay is back.")
+            .catch((postErr) => this.logError("[RELAY] could not say so in the thread:", postErr))
+          return
+        }
+        await Bun.sleep(delay)
+      }
+    }
+  }
+
+  async runRelayOutbox(slackClient: any): Promise<void> {
+    let lastError = ""
+    while (!this.stopping) {
+      try {
+        const batch = await this.relay!.outbox("slack", RELAY_OUTBOX_WAIT_MS)
+        if (lastError) {
+          this.log("[RELAY] outbox reachable again")
+          lastError = ""
+        }
+        for (const item of batch.items) {
+          if (this.stopping) return
+          await this.deliverRelayItem(slackClient, item)
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        if (message !== lastError) this.logError(`[RELAY] outbox unavailable: ${message}`)
+        lastError = message
+        await Bun.sleep(5_000)
+      }
+    }
+  }
+
+  /**
+   * Slack has no transaction id to deduplicate a repeated post on, so only an
+   * answer from Slack itself counts as a refusal; anything else may have
+   * posted, and the relay never offers a Slack post twice.
+   */
+  async deliverRelayItem(slackClient: any, item: OutboxItem): Promise<void> {
+    let ts: string
+    try {
+      const result = await slackClient.chat.postMessage({
+        channel: item.roomId,
+        text: this.safeOutboundText(item.text),
+        unfurl_links: false,
+        ...(item.threadRootId ? { thread_ts: item.threadRootId } : {}),
+      })
+      if (typeof result?.ts !== "string" || !result.ts) throw new Error("Slack answered without a message ts")
+      ts = result.ts
+    } catch (err) {
+      const definite = (err as { code?: unknown })?.code === "slack_webapi_platform_error"
+      const message = err instanceof Error ? err.message : String(err)
+      this.logError(`[RELAY] post ${item.outboxId} failed${definite ? " (refused)" : ""}: ${message}`)
+      await this.relay!.nack(item.outboxId, message, definite)
+        .catch((nackErr) => this.logError(`[RELAY] nack of ${item.outboxId} failed:`, nackErr))
+      return
+    }
+    this.log(`[RELAY] posted ${item.outboxId} as ${ts}`)
+    await this.relay!.ack(item.outboxId, ts)
+      .catch((ackErr) => this.logError(`[RELAY] ack of ${item.outboxId} failed:`, ackErr))
   }
 
   // Required by BaseConnector -- not used directly (we use postThreadReply)

@@ -365,16 +365,16 @@ Everything above assumes the agent runs inside the bridge, under the bridge's `o
 
 What still holds:
 
-- The connector authenticates the sender exactly as before: stable-id room and user allowlists, its own echo rejected, and the room's encryption. The relay checks both allowlists again.
+- The connector authenticates the sender exactly as before: stable-id room (or Slack channel) and user allowlists, its own echo rejected, and the Matrix room's encryption. The relay (opencode-tools' `vibeterm-channels`) checks both allowlists again.
 - Nothing in the container can start an agent, and the container holds no vibeterm-api credential. The relay reads that credential itself.
 - The relay listens only on a Unix socket in a 0700 directory, and the socket is 0600. Only its user and root reach it; that user already holds the vibeterm-api credential, so the socket adds no authority the user lacks.
 
 What changes:
 
-- **The connector is now trusted.** A process that can reach the socket can prompt the receiving session as the owner. Before, compromising the connector reached an agent with no tools. Keep the room invite-only and the homeserver private, and treat a connector update as a change to a privileged component.
+- **The connector is now trusted.** A process that can reach the socket can prompt the receiving session as the owner, and answer the questions and permissions the relay posts. Before, compromising the connector reached an agent with no tools. Keep the room invite-only and the homeserver private, keep the Slack channel's membership to the owner and the bot, and treat a connector update as a change to a privileged component.
 - **Output rules move into the session.** The bridge's tool-message filters see nothing, because the connector only posts final answers. What a reply may contain is the receiving session's instructions to follow.
 
-The WhatsApp route has no connector, so its boundary is the desktop app rather than a container:
+The WhatsApp route has no connector, so its boundary is the desktop app rather than a container; the relay documents it in opencode-tools (`_lib/vibeterm-channels/README.md`). In short:
 
 - The relay reads only the designated group's events, through the app's own client module, and can send only through the app's reply-only grant. That grant allows one `[AI] `-prefixed reply per fresh owner message, in that group, within 10 minutes, at most 5 a minute. The app enforces all of it, and the relay holds no WhatsApp credential and cannot send anything else.
 - Only the account's own fresh messages become prompts. Messages from other participants, history, forwards, quotes and edits never reach a session. Every other participant in the group reads every reply.

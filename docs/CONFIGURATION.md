@@ -90,137 +90,17 @@ For production chat bots, configure only trusted MCP commands, pass only require
 
 ## Relay mode
 
-`RELAY_SOCKET` in a connector's environment switches it from running its own ACP agent to forwarding each authenticated message to `ai-bridge-relay` over that Unix socket (fork deviation 10). Only the Matrix connector supports it. In relay mode the connector starts no `opencode acp`, the container entrypoint installs no opencode, and the bridge-local commands, session picker and chat permission replies are not used: the receiving session's own approvals apply.
+`RELAY_SOCKET` in a connector's environment switches it from running its own ACP agent to forwarding each authenticated message to the relay over that Unix socket (fork deviation 10). The Matrix and Slack connectors support it. In relay mode the connector starts no `opencode acp`, the container entrypoint installs no opencode, and the bridge-local commands, session picker and chat permission replies are not used: the receiving session's own approvals apply.
 
-The relay is a host process, started with `bun src/relay/main.ts --config relay.json`:
+The relay itself is not part of this fork. It runs on the host as `vibeterm-channels` in [opencode-tools](https://gitlab.com/Nowaker/opencode-tools) (`_lib/vibeterm-channels/`), which documents its config file, delivery, the WhatsApp route and the attention feed. The wire types the connectors share with it are `src/relay/types.ts`, kept identical to its `_lib/vibeterm-channels/types.ts`.
 
-```json
-{
-  "socketPath": "~/ai-bridge-runtime/bridge/relay/relay.sock",
-  "stateDir": "~/ai-bridge-runtime/bridge/relay-state",
-  "envFile": "~/ai-bridge-runtime/bridge/bridge.env",
-  "vibetermApi": {
-    "url": "http://127.0.0.1:6096",
-    "username": "opencode",
-    "secretsModule": "~/projects/nowaker/opencode-tools/_lib/vibeterm-secrets/index.ts"
-  },
-  "routes": {
-    "matrix": {
-      "enabled": true,
-      "sessionID": "ses_...",
-      "allowedUsersFrom": "MATRIX_ALLOWED_USERS",
-      "allowedRoomsFrom": "MATRIX_ALLOWED_ROOMS",
-      "chatLabel": "Vibeterm AI"
-    },
-    "whatsapp": {
-      "enabled": true,
-      "sessionID": "ses_...",
-      "allowedUsersFrom": "WHATSAPP_ALLOWED_USERS",
-      "allowedRoomsFrom": "WHATSAPP_ALLOWED_GROUPS",
-      "repliesOnly": true,
-      "idsInPrompt": false,
-      "replyMaxChars": 4000,
-      "native": {
-        "clientModule": "/opt/whatsapp-nativefier/resources/app/control/client.cjs",
-        "capabilityFile": "~/.local/share/whatsapp-nativefier-intake/reply-capability-reference.json",
-        "headFile": "~/.local/share/whatsapp-nativefier-intake/reply-live-head.json",
-        "hold": true,
-        "notifySessions": ["ses_..."]
-      }
-    }
-  }
-}
-```
+What a connector does in relay mode:
 
-| Key | Meaning |
-|---|---|
-| `socketPath` | The relay's only listener. Its directory is created 0700 and the socket 0600. |
-| `stateDir` | `journal.jsonl` and `pending/`, both private. |
-| `pollIntervalMs` | Coordinator transcript probe cadence, default `3000` ms. Each poll reads only the newest message first. |
-| `fullReadIntervalMs` | Backstop full-window read interval, default `60000` ms since the last successful full read. A changed probe triggers a full read in the same poll; a failed watch retries at the next poll without waiting for this interval. |
-| `envFile`, `allowedUsersFrom`, `allowedRoomsFrom` | Allowlists read from these keys of that file and nothing else, so the relay enforces the same lists as the connector and private ids stay out of `relay.json`. `allowedUsers` / `allowedRooms` take literal lists instead. |
-| `vibetermApi.secretsModule` | opencode-tools' secrets module. The vibeterm-api password is read through it on every cache miss (60 s) and never copied. |
-| `sessionID` | The session each accepted message is prompted into. Changing it registers the route again; only turns that start after a registration are relayed. |
-| `defaultRoom` | Where a turn that answers no relayed message is posted. Defaults to the first allowlisted room; empty drops such turns. |
-| `repliesOnly` | Post only answers to a relayed message. |
-| `idsInPrompt` | Show platform ids in the prompt and the log (`true`), or hashes of them (`false`). |
-| `replyMaxChars` | The platform takes the answer as one message of at most this many characters; the session is told. |
-| `native` | The WhatsApp route's link to the desktop app; see "The WhatsApp route" below. |
+- Authenticates the sender as always (stable-id room or channel and user allowlists, its own echo rejected, Matrix room encryption) and forwards the message with the trigger or mention removed. The relay checks both allowlists again.
+- Forwards an untriggered reply inside a thread too, marked `implicit`; the relay answers it only in a thread it serves, which includes the thread of an attention post, where a reply answers that question or permission.
+- Drains the relay's outbox and posts each item: a `reply` or an `attention` post as an ordinary message, a `notice` as a Matrix `m.notice`. Matrix sends each under the relay's transaction id, which the homeserver deduplicates; Slack has no such id, so a Slack post that may have gone out is never offered twice.
+- Uses the message's own id as the event id: the Matrix event id, or the Slack message `ts`, so the relay's reply thread is a real thread on the platform.
 
-An enabled route with an empty allowlist refuses to start. A message reaches the session as a `[chat_relay] ... [/chat_relay]` provenance block followed by its text. The session's answer is posted unless it is exactly `NO_REPLY`, and a first line `REPLY_TO: <relay_id>` sends a later turn into that message's thread.
-
-Each coordinator poll uses `GET /session/{id}/message?limit=1`. A change to that message's id, role, completion time, finish reason or error presence/name triggers the normal newest-40-message read and turn processing, even when the newest message is a user prompt after a completed answer. The first poll always reads the full window. The comparison key comes from the full read's newest message and is saved only after every turn in that window was handled successfully. Probe or full-read failures use the existing watch health/logging and retry the full read after the next successful probe. With no change, the first poll at or past `fullReadIntervalMs` performs a backstop full read; neither an idle probe nor a failed read advances that backstop.
-
-Delivery is `prompt_async` with `Idempotency-Key: ai-bridge-relay:<relay_id>`, retried under that key at 5 s, 15 s, 1 min, 2 min, 5 min and 10 min. A refusal that submitted nothing (HTTP 400 with `possiblyAccepted: false`, typically a parked tab still waking past vibeterm-api's 60 s pane wait) is retried; any other 400, a 404 and a 422 are final and reported in the thread. An operator can redeliver a final refusal under its original key:
-
-```bash
-printf '%s' '<message text as posted, trigger removed>' | bun src/relay/requeue.ts --config relay.json rly_...
-```
-
-The relay accepts it only for a relay whose delivery `failed`, never an uncertain one, and only when the text's sha256 matches the one its journal recorded; it logs `requeued rly_...` or the reason it refused.
-
-### The WhatsApp route
-
-The WhatsApp route runs no connector. The relay reads the WhatsApp desktop app's event journal through the app's own client module and replies through the app's reply operation (whatsapp-nativefier's local controls; see `control/PROTOCOL.txt` there). It holds no WhatsApp credential and never pairs a device. An enabled route needs exactly one allowlisted group and one allowlisted account.
-
-| `native` key | Meaning |
-|---|---|
-| `clientModule` | The app's `control/client.cjs`. It reads the app's endpoint record and secret itself; the relay never sees them. |
-| `capabilityFile` | The app's reference to its reply-only grant: capability id, the group's conversation id, expiry and the `[AI] ` prefix. |
-| `headFile` | The app's live-head record, read once to seed the cursor. Nothing before it is read, and the relay never asks for a new head, which would demote a message already observed. |
-| `hold` | Default `true`: each of the account's own messages is written to a private record for review instead of being prompted. |
-| `notifySessions` | Sessions told about each held message, by file path only. |
-| `wakeCoordinatorOnHold` | Wake the route's session when a prompt is held, so its tab is up by the time it is released. |
-| `trigger` | Default `!oc`. It must open the raw text. |
-| `replyWindowMs`, `safetyMarginMs`, `minReleaseWindowMs` | The app accepts a reply for 10 minutes after the post (`600000`). The relay stops 30 s short of that, and refuses a release with less than 90 s left. |
-| `verifier` | Optional native app owner's executable argv (`command`) and `timeoutMs` (default `45000`, integer `1000..120000`). Runs only for gate verdict `prompt` in HOLD mode. |
-
-A message is a prompt only when all of these hold:
-
-- It is in the designated group and written by the account itself (`from_me` and `trusted_self`).
-- It was observed live, after the head and after any gap or reset.
-- It is unedited plain text with no attachment, not forwarded and not quoted.
-- It is not the echo of a relay reply.
-- It starts with the trigger and is inside the reply window.
-
-An edit, a delete, a second plaintext observation, a gap, a reset or a new app generation after it means it is not answered. The app checks all of this again when the reply is sent, and its refusal is final.
-
-The session's prompt carries `reply_by`. Its answer goes out as exactly one `messages.reply`, bound to the owner's message, with the outbox id as `request_id`. The text is `[AI] ` plus the body, cut to fit 4096 UTF-16 units; nothing is chunked. The five-field request is written to a private file before the first attempt and only ever replayed unchanged, and a refusal or an unknown outcome is final.
-
-Held messages are `<stateDir>/whatsapp/held/s<sequence>.json` (0600). Release or discard one:
-
-```bash
-bun src/relay/whatsapp-release.ts --config relay.json s<sequence>
-bun src/relay/whatsapp-release.ts --config relay.json --discard s<sequence>
-```
-
-The relay checks a released message again before it prompts anything: its verdict, anything that invalidated it, the generation and the time left. It logs `release of s<sequence>: ...` either way.
-
-To automate the native owner's review, add this optional block under `routes.whatsapp.native`:
-
-```json
-{
-  "verifier": {
-    "command": ["/usr/bin/node", "/opt/whatsapp-nativefier/resources/app/control/verify-held.cjs", "--config", "/home/nowaker/.local/share/whatsapp-nativefier-intake/verifier-config.json"],
-    "timeoutMs": 45000
-  }
-}
-```
-
-`command` is a non-empty argv array of non-empty strings, not a shell command. The relay appends `s<sequence>` LAST, inherits its own environment and ignores stdin. Every element starting with `~/` is expanded by the config loader; use absolute paths as above rather than relying on shell expansion. The held record is durably written before the verifier starts and stays in `held/` while it runs; journal polling continues. It runs once per record per process. Startup verifies unverified held prompts, but never reruns a recorded outcome. Live mode and non-prompt records do not run it.
-
-Across stdout and stderr there must be exactly one non-empty trimmed line, matching this record's `sN`:
-
-| Exit | Exact line contract | Outcome and action |
-|---|---|---|
-| `0` | `verified sN` | `verified`: persist the outcome, rename into `release/` and promptly run the ordinary release path. All release checks, including the minimum remaining window, still apply. |
-| `1` | `refuse sN: REASON` | `refused`: persist the outcome and rename into `discarded/`; never prompt it. |
-| `2` | `unavailable sN: REASON` | `unavailable`: persist the outcome and leave it held for operator review. |
-| Anything else | No accepted line | `inconclusive`: persist only a fixed description and leave it held. |
-
-`REASON` must match `[A-Za-z0-9 _.,:()/-]{1,120}`. A wrong sequence, mismatched exit/line, zero or multiple non-empty lines, or output exceeding the combined 8 KiB capture limit is inconclusive. Spawn failures record only `spawn failed: CODE`, other exits/signals only `exit N` / `signal NAME`, and timeouts only `timed out`. Unrecognized output records only `output not recognized (N lines, B bytes)`. Timeout sends SIGTERM, then SIGKILL about two seconds later if needed. Raw verifier output is never logged, stored or forwarded; only the validated line or fixed description is retained in `verification: { at, outcome, line, reason }` before any rename.
-
-With a verifier, prompt hold notices wait for the outcome: each `notifySessions` session receives one keyed, automated path-only notice with the gate verdict, safe verification result and action (`released`, `discarded`, `still held`). Only a still-held result includes both manual release and discard commands. `wakeCoordinatorOnHold` wakes the coordinator only for `unavailable` or `inconclusive`, never ahead of a verified prompt. Without a verifier, existing hold notices and operator release behavior are unchanged. Health adds `verifier: { configured, lastOutcome, lastAt }`, with no message ids.
 
 ## OTP broker
 

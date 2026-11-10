@@ -1098,7 +1098,7 @@ export abstract class BaseConnector<TSession extends BaseSession> {
     // Relay mode promises that this container runs no agent. Every path to one
     // comes through here, so the promise does not depend on each caller.
     if (process.env.RELAY_SOCKET) {
-      throw new Error("relay mode: this connector forwards to ai-bridge-relay and runs no agent")
+      throw new Error("relay mode: this connector forwards to the vibeterm-channels relay and runs no agent")
     }
     return new ACPClient({
       cwd,

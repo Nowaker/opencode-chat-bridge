@@ -110,7 +110,7 @@ import { RelayClient, RelayError } from "../src/relay/client"
 import type { InboundRequest, OutboxItem } from "../src/relay/types"
 
 // Relay mode: this container is transport only. Accepted messages go to
-// ai-bridge-relay on the host, which prompts a Vibeterm coordinator session,
+// the vibeterm-channels relay on the host, which prompts a Vibeterm coordinator session,
 // and that session's answers come back through the relay's outbox. No agent
 // runs here, and BaseConnector refuses to create one.
 const RELAY_SOCKET = process.env.RELAY_SOCKET || ""
@@ -171,7 +171,7 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
     this.logStartup()
     console.log(`  Thread isolation: ${this.threadIsolation ? "on (per-thread sessions)" : "off (per-room sessions)"}`)
     if (this.relay) {
-      console.log(`  Backend: ai-bridge-relay at ${RELAY_SOCKET} (transport only; no agent runs in this container)`)
+      console.log(`  Backend: vibeterm-channels relay at ${RELAY_SOCKET} (transport only; no agent runs in this container)`)
     } else {
       await this.cleanupSessions()
     }
