@@ -185,3 +185,25 @@ export class EncryptedRelations {
     return { ...raw, content: { ...(raw.content ?? {}), "m.relates_to": relation } }
   }
 }
+
+/**
+ * The event a rich reply (Element's "Reply") answers, or "". A thread reply's
+ * `m.in_reply_to` is only the fallback for clients without threads
+ * (`is_falling_back`), so it names nothing here.
+ */
+export function extractReplyToEventId(event: any): string {
+  const relation = event?.content?.["m.relates_to"]
+  const target = relation?.["m.in_reply_to"]?.event_id
+  if (typeof target !== "string" || !target) return ""
+  if (relation?.rel_type === "m.thread" && relation?.is_falling_back === true) return ""
+  return target
+}
+
+/** A reply's body without the quoted fallback older clients prepend: `> ` lines, then a blank line. */
+export function stripReplyFallback(body: string): string {
+  if (!body.startsWith("> ")) return body
+  const lines = body.split("\n")
+  let index = 0
+  while (index < lines.length && (lines[index] ?? "").startsWith(">")) index++
+  return lines.slice(index).join("\n").trim()
+}

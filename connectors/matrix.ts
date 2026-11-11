@@ -104,6 +104,8 @@ import {
   buildThreadRelation,
   shouldHandleThreadReply,
   EncryptedRelations,
+  extractReplyToEventId,
+  stripReplyFallback,
 } from "./matrix-thread-helpers"
 import { diagnoseEmptyResponse } from "../src/acp-response-diagnostics"
 import { resolveMatrixAccessToken, writePrivateFileAtomically } from "./matrix-auth"
@@ -434,7 +436,8 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
     if (message.sender === myUserId) return
     if (!this.isUserAllowed(message.sender)) return
 
-    const body = message.textBody.trim()
+    const replyToEventId = extractReplyToEventId(event)
+    const body = (replyToEventId ? stripReplyFallback(message.textBody) : message.textBody).trim()
     if (!body) return
 
     // Deduplicate events (Matrix sync replays)
@@ -472,6 +475,12 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
       query = botNameQuery
     } else if (isDM) {
       query = body
+    } else if (this.relay !== null && replyToEventId) {
+      // A reply to some message, untriggered: the relay answers it only when
+      // it replies to a question or permission the relay posted.
+      query = body
+      implicit = true
+      this.logInbound("REPLY", message.sender, context.sessionId, body)
     } else if (this.threadIsolation && shouldHandleThreadReply({
       enabled: config.matrix.respondToThreadReplies,
       text: body,
@@ -557,6 +566,8 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
       text: query,
       implicit,
     }
+    const replyToEventId = extractReplyToEventId(event)
+    if (replyToEventId) request.replyToEventId = replyToEventId
     for (let attempt = 0; ; attempt++) {
       try {
         const result = await this.relay!.inbound(request)
@@ -636,6 +647,9 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
     }
     if (item.threadRootId) {
       content["m.relates_to"] = buildThreadRelation(item.threadRootId, item.replyToEventId || item.threadRootId)
+    } else if (item.replyToEventId) {
+      // Top-level, answering one message: a rich reply, where the owner replied.
+      content["m.relates_to"] = { "m.in_reply_to": { event_id: item.replyToEventId } }
     }
     let eventType = "m.room.message"
     let payload: unknown = content

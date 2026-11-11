@@ -12,6 +12,8 @@ import {
   buildThreadRelation,
   shouldHandleThreadReply,
   EncryptedRelations,
+  extractReplyToEventId,
+  stripReplyFallback,
 } from "../../connectors/matrix-thread-helpers"
 
 // =============================================================================
@@ -284,5 +286,24 @@ describe("EncryptedRelations", () => {
     for (const id of ["$a", "$b", "$c"]) relations.remember({ ...encrypted, event_id: id })
     expect(extractThreadRootId(relations.restore({ ...decrypted, event_id: "$a" }))).toBe("")
     expect(extractThreadRootId(relations.restore({ ...decrypted, event_id: "$c" }))).toBe("$root")
+  })
+})
+
+// =============================================================================
+// Rich replies
+// =============================================================================
+
+describe("rich replies", () => {
+  test("a reply names the event it answers; a thread's fallback reply names none", () => {
+    expect(extractReplyToEventId({ content: { "m.relates_to": { "m.in_reply_to": { event_id: "$post" } } } })).toBe("$post")
+    expect(extractReplyToEventId({ content: { "m.relates_to": { rel_type: "m.thread", event_id: "$root", is_falling_back: true, "m.in_reply_to": { event_id: "$last" } } } })).toBe("")
+    expect(extractReplyToEventId({ content: { "m.relates_to": { rel_type: "m.thread", event_id: "$root", "m.in_reply_to": { event_id: "$quoted" } } } })).toBe("$quoted")
+    expect(extractReplyToEventId({ content: { body: "2" } })).toBe("")
+  })
+
+  test("the quoted fallback older clients prepend is dropped", () => {
+    expect(stripReplyFallback("> <@bot:example.org> Q: deploy?\n> 1. Now\n\n2")).toBe("2")
+    expect(stripReplyFallback("2")).toBe("2")
+    expect(stripReplyFallback(">not a fallback")).toBe(">not a fallback")
   })
 })

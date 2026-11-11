@@ -42,6 +42,11 @@ export interface InboundRequest {
    * it has one. The coordinator is told, and the reply carries it.
    */
   replyBy?: number
+  /**
+   * The event a rich reply (Matrix "Reply") answers. A reply to a question or
+   * permission the relay posted answers it, as a reply in its thread does.
+   */
+  replyToEventId?: string
 }
 
 export type InboundState = "accepted" | "duplicate" | "ignored" | "rejected"
@@ -63,7 +68,7 @@ export interface OutboxItem {
   roomId: string
   /** "" posts top-level. */
   threadRootId: string
-  /** The event a threaded post names as its in-reply-to fallback. */
+  /** The event a threaded post names as its in-reply-to fallback; with no thread, the message a top-level post replies to. */
   replyToEventId: string
   text: string
   /** `attention` is an item of the attention inbox; a reply in its thread answers it. */
