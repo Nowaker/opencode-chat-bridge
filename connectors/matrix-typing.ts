@@ -11,6 +11,7 @@
  * "Send typing notifications" setting is on.
  */
 import { MatrixClient } from "matrix-bot-sdk"
+import type { TypingRequest } from "../src/relay/types"
 
 export type TypingState = "start" | "stop"
 
@@ -22,18 +23,35 @@ export interface TypingTransition {
   partial?: true
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function stringList(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null
+  const strings: string[] = []
+  for (const item of value) {
+    if (typeof item !== "string") return null
+    strings.push(item)
+  }
+  return strings
+}
+
 /** Each joined room's typist set in a raw /sync response; a malformed entry is skipped, never thrown on. */
 export function typingSets(raw: unknown): Map<string, string[]> {
   const sets = new Map<string, string[]>()
-  const join = (raw as { rooms?: { join?: unknown } } | null)?.rooms?.join
-  if (join === null || typeof join !== "object") return sets
-  for (const [roomId, room] of Object.entries(join as Record<string, unknown>)) {
-    const events = (room as { ephemeral?: { events?: unknown } } | null)?.ephemeral?.events
+  const rooms = isRecord(raw) ? raw.rooms : undefined
+  const join = isRecord(rooms) ? rooms.join : undefined
+  if (!isRecord(join)) return sets
+  for (const [roomId, room] of Object.entries(join)) {
+    const ephemeral = isRecord(room) ? room.ephemeral : undefined
+    const events = isRecord(ephemeral) ? ephemeral.events : undefined
     if (!Array.isArray(events)) continue
     for (const event of events) {
-      if ((event as { type?: unknown } | null)?.type !== "m.typing") continue
-      const ids = (event as { content?: { user_ids?: unknown } }).content?.user_ids
-      if (!Array.isArray(ids) || !ids.every((id): id is string => typeof id === "string")) continue
+      if (!isRecord(event) || event.type !== "m.typing") continue
+      const content = event.content
+      const ids = isRecord(content) ? stringList(content.user_ids) : null
+      if (ids === null) continue
       // Several in one response: the last is the room's current set.
       sets.set(roomId, [...new Set(ids)])
     }
@@ -69,20 +87,56 @@ export class TypingTransitions {
   }
 }
 
-export type TypingListener = (roomId: string, userIds: string[]) => void
+export interface TypingForwarding {
+  /** The bot's own user id: its typing never counts. */
+  botUserId: string
+  rooms: readonly string[]
+  users: readonly string[]
+  /** The allowlists: whether `sender` in `roomId` may be observed. */
+  allowed(roomId: string, sender: string): boolean
+  send(request: TypingRequest): void
+  now(): number
+}
+
+/**
+ * Starts forwarding received typing to the relay: a `reset` for every room
+ * and sender first, since observation (re)starts now, then returns the
+ * listener that turns each room's typist set into the owner's transitions.
+ */
+export function forwardTyping(options: TypingForwarding): (roomId: string, userIds: string[]) => void {
+  const transitions = new TypingTransitions((roomId, sender) => sender !== options.botUserId && options.allowed(roomId, sender))
+  const observedAt = options.now()
+  for (const roomId of options.rooms) {
+    for (const sender of options.users) options.send({ route: "matrix", roomId, sender, state: "reset", observedAt })
+  }
+  return (roomId, userIds) => {
+    const at = options.now()
+    for (const transition of transitions.apply(roomId, userIds)) options.send({ route: "matrix", ...transition, observedAt: at })
+  }
+}
+
+export interface TypingObserver {
+  /** One room's current typist set, from the sync about to be processed. */
+  typing(roomId: string, userIds: string[]): void
+  /** `typing` threw. The sync is processed anyway: typing is a side channel. */
+  failed(error: unknown): void
+}
 
 /** A MatrixClient that also reports each room's typist set from the sync it already makes. */
 export class TypingAwareClient extends MatrixClient {
-  onTyping: TypingListener | null = null
+  typingObserver: TypingObserver | null = null
 
-  protected override async processSync(raw: any, emitFn?: (emitEventType: string, ...payload: any[]) => Promise<any>): Promise<any> {
-    const listener = this.onTyping
-    if (listener) {
+  protected override async processSync(
+    raw: unknown,
+    emitFn?: (emitEventType: string, ...payload: unknown[]) => Promise<unknown>,
+  ): Promise<unknown> {
+    const observer = this.typingObserver
+    if (observer) {
       for (const [roomId, userIds] of typingSets(raw)) {
         try {
-          listener(roomId, userIds)
-        } catch {
-          // Typing is a side channel: it must never stop the sync loop.
+          observer.typing(roomId, userIds)
+        } catch (error) {
+          observer.failed(error)
         }
       }
     }

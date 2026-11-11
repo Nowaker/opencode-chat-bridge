@@ -14,6 +14,7 @@ import {
   EncryptedRelations,
   extractReplyToEventId,
   extractReplacedEventId,
+  relayInboundRequest,
   stripReplyFallback,
   extractReaction,
   isShortIdAnswer,
@@ -302,6 +303,18 @@ describe("rich replies", () => {
     expect(extractReplyToEventId({ content: { "m.relates_to": { rel_type: "m.thread", event_id: "$root", is_falling_back: true, "m.in_reply_to": { event_id: "$last" } } } })).toBe("")
     expect(extractReplyToEventId({ content: { "m.relates_to": { rel_type: "m.thread", event_id: "$root", "m.in_reply_to": { event_id: "$quoted" } } } })).toBe("$quoted")
     expect(extractReplyToEventId({ content: { body: "2" } })).toBe("")
+  })
+
+  test("the relay request names the event a reply answers and the event an edit edits", () => {
+    const context = normalizeMatrixEventContext({ roomId: "!r:x", sender: "@o:x", text: "hi", eventId: "$edit", threadRootEventId: "" }, true)
+    const edit = { event_id: "$edit", origin_server_ts: 5, content: { body: "* hi", "m.new_content": { body: "hi" }, "m.relates_to": { rel_type: "m.replace", event_id: "$orig" } } }
+    expect(relayInboundRequest(context, edit, "* hi", false, 99)).toEqual({
+      route: "matrix", eventId: "$edit", roomId: "!r:x", threadRootId: "", sender: "@o:x", postedAt: 5, text: "* hi", implicit: false, originalEventId: "$orig",
+    })
+    const reply = { event_id: "$edit", content: { body: "2", "m.relates_to": { "m.in_reply_to": { event_id: "$post" } } } }
+    const request = relayInboundRequest(context, reply, "2", true, 99)
+    expect(request).toMatchObject({ postedAt: 99, replyToEventId: "$post", implicit: true })
+    expect("originalEventId" in request).toBe(false)
   })
 
   test("an edit names the event it replaces; nothing else does", () => {

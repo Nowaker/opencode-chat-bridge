@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
-import { TypingAwareClient, TypingTransitions, typingSets } from "../../connectors/matrix-typing"
+import { TypingAwareClient, TypingTransitions, forwardTyping, typingSets } from "../../connectors/matrix-typing"
+import type { TypingRequest } from "../../src/relay/types"
 
 const ROOM = "!room:example.org"
 const OTHER_ROOM = "!other:example.org"
@@ -7,31 +8,57 @@ const OWNER = "@owner:example.org"
 const BOT = "@bot:example.org"
 const STRANGER = "@stranger:example.org"
 
-/** A raw /sync response with one m.typing per room, as Synapse sends it. */
-function sync(typing: Record<string, unknown>, extra: Record<string, unknown> = {}): Record<string, unknown> {
+interface RoomFixture {
+  /** `content.user_ids` of the room's m.typing, as sent (possibly malformed). */
+  typing: unknown
+  /** More ephemeral events after it, in order. */
+  ephemeral?: unknown[]
+  timeline?: unknown[]
+}
+
+/** A raw /sync response: per joined room an m.receipt and an m.typing, as Synapse sends them. */
+function sync(rooms: Record<string, RoomFixture>) {
   return {
     next_batch: "s2",
     rooms: {
-      join: Object.fromEntries(Object.entries(typing).map(([roomId, userIds]) => [roomId, {
-        timeline: { events: [] },
-        ephemeral: { events: [{ type: "m.receipt", content: {} }, { type: "m.typing", content: { user_ids: userIds } }] },
+      join: Object.fromEntries(Object.entries(rooms).map(([roomId, room]) => [roomId, {
+        timeline: { events: room.timeline ?? [] },
+        ephemeral: {
+          events: [{ type: "m.receipt", content: {} }, { type: "m.typing", content: { user_ids: room.typing } }, ...(room.ephemeral ?? [])],
+        },
       }])),
     },
-    ...extra,
+  }
+}
+
+const TOPIC_EVENT = { type: "m.room.topic", event_id: "$t", sender: OWNER, content: { topic: "x" } }
+
+function eventId(event: unknown): string {
+  return typeof event === "object" && event !== null && "event_id" in event && typeof event.event_id === "string" ? event.event_id : "?"
+}
+
+/** The SDK's protected sync hook, run on a fixture as the sync loop would. */
+class SyncProbe extends TypingAwareClient {
+  constructor() {
+    super("https://matrix.example.org", "token")
+  }
+
+  runSync(raw: unknown): Promise<unknown> {
+    return this.processSync(raw)
   }
 }
 
 describe("typingSets", () => {
   test("reads each joined room's typist set; the last m.typing in a response wins", () => {
-    const raw = sync({ [ROOM]: [OWNER, BOT] })
-    ;(raw.rooms as any).join[ROOM].ephemeral.events.push({ type: "m.typing", content: { user_ids: [] } })
+    const raw = sync({ [ROOM]: { typing: [OWNER, BOT], ephemeral: [{ type: "m.typing", content: { user_ids: [] } }] } })
     expect([...typingSets(raw)]).toEqual([[ROOM, []]])
-    expect([...typingSets(sync({ [ROOM]: [OWNER, OWNER] }))]).toEqual([[ROOM, [OWNER]]])
+    expect([...typingSets(sync({ [ROOM]: { typing: [OWNER, OWNER] } }))]).toEqual([[ROOM, [OWNER]]])
   })
 
   test("malformed or missing ephemeral data yields nothing and never throws", () => {
     for (const raw of [null, {}, { rooms: null }, { rooms: { join: 5 } }, { rooms: { join: { [ROOM]: { ephemeral: { events: "x" } } } } },
-      sync({ [ROOM]: "not a list" }), sync({ [ROOM]: [OWNER, 7] }), { rooms: { join: { [ROOM]: { ephemeral: { events: [null, { type: "m.typing" }] } } } } }]) {
+      sync({ [ROOM]: { typing: "not a list" } }), sync({ [ROOM]: { typing: [OWNER, 7] } }),
+      { rooms: { join: { [ROOM]: { ephemeral: { events: [null, { type: "m.typing" }, { type: "m.typing", content: [] }] } } } } }]) {
       expect(typingSets(raw).size).toBe(0)
     }
   })
@@ -61,66 +88,71 @@ describe("TypingTransitions", () => {
 
 describe("TypingAwareClient", () => {
   test("reports typing from the raw sync before the SDK processes the same response", async () => {
-    const client = new TypingAwareClient("https://matrix.example.org", "token")
+    const client = new SyncProbe()
     const order: string[] = []
-    client.onTyping = (roomId, userIds) => order.push(`typing ${roomId} ${userIds.join(",")}`)
-    client.on("room.event", () => order.push("event"))
-    const raw = sync({ [ROOM]: [OWNER] })
-    ;(raw.rooms as any).join[ROOM].timeline.events.push({ type: "m.room.topic", event_id: "$t", sender: OWNER, content: { topic: "x" } })
-    await (client as any).processSync(raw)
-    expect(order).toEqual([`typing ${ROOM} ${OWNER}`, "event"])
+    client.typingObserver = {
+      typing: (roomId, userIds) => order.push(`typing ${roomId} ${userIds.join(",")}`),
+      failed: (error) => order.push(`failed ${String(error)}`),
+    }
+    client.on("room.event", (_roomId: string, event: unknown) => order.push(`event ${eventId(event)}`))
+    await client.runSync(sync({ [ROOM]: { typing: [OWNER], timeline: [TOPIC_EVENT] } }))
+    expect(order).toEqual([`typing ${ROOM} ${OWNER}`, "event $t"])
   })
 
-  test("a throwing listener does not stop the sync from being processed", async () => {
-    const client = new TypingAwareClient("https://matrix.example.org", "token")
+  test("a throwing observer is reported as failed, and the sync is still processed", async () => {
+    const client = new SyncProbe()
+    const failures: unknown[] = []
     const events: string[] = []
-    client.onTyping = () => { throw new Error("boom") }
-    client.on("room.event", (_room: string, event: any) => events.push(event.event_id))
-    const raw = sync({ [ROOM]: [OWNER] })
-    ;(raw.rooms as any).join[ROOM].timeline.events.push({ type: "m.room.topic", event_id: "$t", sender: OWNER, content: { topic: "x" } })
-    await (client as any).processSync(raw)
+    const boom = new Error("boom")
+    client.typingObserver = { typing: () => { throw boom }, failed: (error) => failures.push(error) }
+    client.on("room.event", (_roomId: string, event: unknown) => events.push(eventId(event)))
+    await client.runSync(sync({ [ROOM]: { typing: [OWNER], timeline: [TOPIC_EVENT] } }))
+    expect(failures).toEqual([boom])
+    expect(events).toEqual(["$t"])
+  })
+
+  test("without an observer the sync is processed as the SDK does", async () => {
+    const client = new SyncProbe()
+    const events: string[] = []
+    client.on("room.event", (_roomId: string, event: unknown) => events.push(eventId(event)))
+    await client.runSync(sync({ [ROOM]: { typing: [OWNER], timeline: [TOPIC_EVENT] } }))
     expect(events).toEqual(["$t"])
   })
 })
 
-describe("the Matrix connector's typing forwarding", () => {
-  test("sends a reset per allowlisted room, then only the owner's transitions in allowlisted rooms", async () => {
-    const { MatrixConnector } = await import("../../connectors/matrix")
-    const connector = new MatrixConnector()
-    const sent: Array<Record<string, unknown>> = []
-    ;(connector as any).relay = { typing: async (request: Record<string, unknown>) => { sent.push(request) } }
-    ;(connector as any).allowedUsers = new Set([OWNER])
-    ;(connector as any).allowedChannels = new Set([ROOM])
-    const matrix = { getUserId: async () => BOT, onTyping: null as null | ((roomId: string, userIds: string[]) => void) }
-    await (connector as any).observeTyping(matrix, [ROOM], [OWNER])
-    matrix.onTyping!(ROOM, [])
-    matrix.onTyping!(OTHER_ROOM, [])
-    matrix.onTyping!(ROOM, [OWNER, BOT, STRANGER])
-    matrix.onTyping!(OTHER_ROOM, [OWNER])
-    matrix.onTyping!(ROOM, [BOT])
-    await Promise.resolve()
-    expect(sent.map(({ roomId, sender, state }) => ({ roomId, sender, state }))).toEqual([
-      { roomId: ROOM, sender: OWNER, state: "reset" },
-      { roomId: ROOM, sender: OWNER, state: "start" },
-      { roomId: ROOM, sender: OWNER, state: "stop" },
+describe("forwardTyping", () => {
+  test("sends a reset per room and sender, then only allowed senders' transitions; the bot never counts", () => {
+    const sent: TypingRequest[] = []
+    let clock = 1_000
+    const onTyping = forwardTyping({
+      botUserId: BOT,
+      rooms: [ROOM],
+      users: [OWNER, BOT],
+      allowed: (roomId, sender) => roomId === ROOM && (sender === OWNER || sender === BOT),
+      send: (request) => sent.push(request),
+      now: () => clock,
+    })
+    clock = 2_000
+    onTyping(ROOM, [])
+    onTyping(OTHER_ROOM, [])
+    onTyping(ROOM, [OWNER, BOT, STRANGER])
+    onTyping(OTHER_ROOM, [OWNER])
+    clock = 3_000
+    onTyping(ROOM, [BOT])
+    expect(sent).toEqual([
+      { route: "matrix", roomId: ROOM, sender: OWNER, state: "reset", observedAt: 1_000 },
+      { route: "matrix", roomId: ROOM, sender: BOT, state: "reset", observedAt: 1_000 },
+      { route: "matrix", roomId: ROOM, sender: OWNER, state: "start", observedAt: 2_000 },
+      { route: "matrix", roomId: ROOM, sender: OWNER, state: "stop", observedAt: 3_000 },
     ])
-    expect(sent.every((request) => request.route === "matrix" && typeof request.observedAt === "number")).toBe(true)
   })
-})
 
-describe("the Matrix connector's edits", () => {
-  test("an edit is forwarded under its own id and names the event it edits", async () => {
-    const { MatrixConnector } = await import("../../connectors/matrix")
-    const connector = new MatrixConnector()
-    const sent: Array<Record<string, unknown>> = []
-    ;(connector as any).relay = { inbound: async (request: Record<string, unknown>) => { sent.push(request); return { state: "accepted" } } }
-    const context = { roomId: ROOM, sender: OWNER, eventId: "$edit", threadRootEventId: "", sessionId: "s" }
-    const edit = { event_id: "$edit", origin_server_ts: 5, content: { body: "* hi", "m.new_content": { body: "hi" }, "m.relates_to": { rel_type: "m.replace", event_id: "$orig" } } }
-    await (connector as any).forwardToRelay(context, edit, "* hi", false)
-    await (connector as any).forwardToRelay({ ...context, eventId: "$plain" }, { event_id: "$plain", origin_server_ts: 6, content: { body: "hi" } }, "hi", false)
-    expect(sent.map(({ eventId, originalEventId }) => ({ eventId, originalEventId }))).toEqual([
-      { eventId: "$edit", originalEventId: "$orig" },
-      { eventId: "$plain", originalEventId: undefined },
-    ])
+  test("an owner already typing when observation begins gets a partial start", () => {
+    const sent: TypingRequest[] = []
+    const onTyping = forwardTyping({
+      botUserId: BOT, rooms: [ROOM], users: [OWNER], allowed: () => true, send: (request) => sent.push(request), now: () => 5,
+    })
+    onTyping(ROOM, [OWNER])
+    expect(sent.at(-1)).toEqual({ route: "matrix", roomId: ROOM, sender: OWNER, state: "start", partial: true, observedAt: 5 })
   })
 })

@@ -105,7 +105,7 @@ import {
   shouldHandleThreadReply,
   EncryptedRelations,
   extractReplyToEventId,
-  extractReplacedEventId,
+  relayInboundRequest,
   stripReplyFallback,
   extractReaction,
   isShortIdAnswer,
@@ -114,7 +114,7 @@ import { diagnoseEmptyResponse } from "../src/acp-response-diagnostics"
 import { resolveMatrixAccessToken, writePrivateFileAtomically } from "./matrix-auth"
 import { RelayClient, RelayError } from "../src/relay/client"
 import type { InboundRequest, OutboxItem, TypingRequest } from "../src/relay/types"
-import { TypingAwareClient, TypingTransitions } from "./matrix-typing"
+import { TypingAwareClient, forwardTyping } from "./matrix-typing"
 
 // Relay mode: this container is transport only. Accepted messages go to
 // the vibeterm-channels relay on the host, which prompts a Vibeterm coordinator session,
@@ -202,7 +202,7 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
 
     const matrix = new TypingAwareClient(HOMESERVER, accessToken, stateStorage, cryptoStorage)
     this.matrix = matrix
-    if (this.relay) await this.observeTyping(matrix)
+    if (this.relay) this.observeTyping(matrix, this.relay, await matrix.getUserId())
     AutojoinRoomsMixin.setupOnClient(this.matrix)
 
     this.matrix.on("room.failed_decryption", async (roomId: string, event: any, error: Error) => {
@@ -560,33 +560,29 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
 
   /**
    * Received typing goes to the relay for activity time, owner only, in
-   * allowlisted rooms; the bot itself never counts. A `reset` per room first
-   * says observation (re)starts there. Best effort: a lost transition makes
-   * the relay close that episode as incomplete, which is the honest outcome.
+   * allowlisted rooms; the bot itself never counts. Best effort: a lost
+   * transition makes the relay close that episode as incomplete, which is
+   * the honest outcome.
    */
-  private async observeTyping(
-    matrix: Pick<TypingAwareClient, "getUserId" | "onTyping">,
-    rooms: readonly string[] = ALLOWED_ROOMS,
-    users: readonly string[] = ALLOWED_USERS,
-  ): Promise<void> {
-    const myUserId = await matrix.getUserId()
-    const transitions = new TypingTransitions((roomId, sender) =>
-      sender !== myUserId && this.isChannelAllowedQuietly(roomId) && this.isUserAllowedQuietly(sender))
+  private observeTyping(matrix: TypingAwareClient, relay: RelayClient, botUserId: string): void {
     let lastError = ""
     const send = (request: TypingRequest) => {
-      void this.relay!.typing(request).then(() => { lastError = "" }, (err) => {
+      void relay.typing(request).then(() => { lastError = "" }, (err: unknown) => {
         const message = err instanceof Error ? err.message : String(err)
         if (message !== lastError) this.logError(`[RELAY] typing not forwarded: ${message}`)
         lastError = message
       })
     }
-    const observedAt = Date.now()
-    for (const roomId of rooms) {
-      for (const sender of users) send({ route: "matrix", roomId, sender, state: "reset", observedAt })
-    }
-    matrix.onTyping = (roomId, userIds) => {
-      const at = Date.now()
-      for (const transition of transitions.apply(roomId, userIds)) send({ route: "matrix", ...transition, observedAt: at })
+    matrix.typingObserver = {
+      typing: forwardTyping({
+        botUserId,
+        rooms: ALLOWED_ROOMS,
+        users: ALLOWED_USERS,
+        allowed: (roomId, sender) => this.isChannelAllowedQuietly(roomId) && this.isUserAllowedQuietly(sender),
+        send,
+        now: Date.now,
+      }),
+      failed: (error) => this.logError(`[RELAY] received typing dropped: ${error instanceof Error ? error.name : typeof error}`),
     }
   }
 
@@ -615,20 +611,7 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
   }
 
   private async forwardToRelay(context: MatrixEventContext, event: any, query: string, implicit: boolean, extra: Partial<InboundRequest> = {}): Promise<void> {
-    const request: InboundRequest = {
-      route: "matrix",
-      eventId: context.eventId,
-      roomId: context.roomId,
-      threadRootId: context.threadRootEventId,
-      sender: context.sender,
-      postedAt: typeof event?.origin_server_ts === "number" ? event.origin_server_ts : Date.now(),
-      text: query,
-      implicit,
-    }
-    const replyToEventId = extractReplyToEventId(event)
-    if (replyToEventId) request.replyToEventId = replyToEventId
-    const originalEventId = extractReplacedEventId(event)
-    if (originalEventId) request.originalEventId = originalEventId
+    const request = relayInboundRequest(context, event, query, implicit, Date.now())
     Object.assign(request, extra)
     for (let attempt = 0; ; attempt++) {
       try {

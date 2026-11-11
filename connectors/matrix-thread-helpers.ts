@@ -3,6 +3,7 @@
  *
  * Extracted so tests can import them without needing matrix-bot-sdk installed.
  */
+import type { InboundRequest } from "../src/relay/types"
 
 /**
  * Normalized context extracted from a Matrix room event.
@@ -199,11 +200,44 @@ export function extractReplyToEventId(event: any): string {
   return target
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function field(value: unknown, key: string): unknown {
+  return isRecord(value) ? value[key] : undefined
+}
+
 /** The event an edit (`m.replace`) replaces, or "" for anything else. */
-export function extractReplacedEventId(event: any): string {
-  const relation = event?.content?.["m.relates_to"]
-  if (relation?.rel_type !== "m.replace") return ""
-  return typeof relation.event_id === "string" ? relation.event_id : ""
+export function extractReplacedEventId(event: unknown): string {
+  const relation = field(field(event, "content"), "m.relates_to")
+  if (field(relation, "rel_type") !== "m.replace") return ""
+  const target = field(relation, "event_id")
+  return typeof target === "string" ? target : ""
+}
+
+/**
+ * What the connector sends the relay for one accepted Matrix event: `query`
+ * is the prompt with the trigger removed. A rich reply names the event it
+ * answers, and an edit the event it edits.
+ */
+export function relayInboundRequest(context: MatrixEventContext, event: unknown, query: string, implicit: boolean, now: number): InboundRequest {
+  const postedAt = field(event, "origin_server_ts")
+  const request: InboundRequest = {
+    route: "matrix",
+    eventId: context.eventId,
+    roomId: context.roomId,
+    threadRootId: context.threadRootEventId,
+    sender: context.sender,
+    postedAt: typeof postedAt === "number" ? postedAt : now,
+    text: query,
+    implicit,
+  }
+  const replyToEventId = extractReplyToEventId(event)
+  if (replyToEventId) request.replyToEventId = replyToEventId
+  const originalEventId = extractReplacedEventId(event)
+  if (originalEventId) request.originalEventId = originalEventId
+  return request
 }
 
 /** A reply's body without the quoted fallback older clients prepend: `> ` lines, then a blank line. */

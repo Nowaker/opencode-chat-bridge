@@ -440,6 +440,10 @@ class TestConnector extends BaseConnector<BaseSession> {
     return this.isChannelAllowed(channelId)
   }
 
+  public canUserAccessQuietly(userId: string): boolean {
+    return this.isUserAllowedQuietly(userId)
+  }
+
   public startQuery(sessionId: string, abortFn?: () => void) {
     return this.markQueryActive(sessionId, abortFn)
   }
@@ -480,6 +484,15 @@ class TestConnector extends BaseConnector<BaseSession> {
     sendFn: (text: string) => Promise<void>,
   ) {
     return this.handlePermissionReply(threadId, senderId, text, sendFn)
+  }
+}
+
+/** A TestConnector that keeps what it logs. */
+class LoggingConnector extends TestConnector {
+  readonly logged: string[] = []
+
+  protected override log(message: string): void {
+    this.logged.push(message)
   }
 }
 
@@ -669,6 +682,15 @@ describe("BaseConnector allowlist", () => {
   test("blocks an unlisted channel", () => {
     const connector = new TestConnector(["user-1"], ["C0C2U4Q51HP"])
     expect(connector.canChannelAccess("C0OTHERCHAN")).toBe(false)
+  })
+
+  test("the quiet user check gates the same way and logs no denial", () => {
+    const connector = new LoggingConnector(["user-1"])
+    expect(connector.canUserAccessQuietly("user-1")).toBe(true)
+    expect(connector.canUserAccessQuietly("user-2")).toBe(false)
+    expect(connector.logged).toEqual([])
+    expect(connector.canUserAccess("user-2")).toBe(false)
+    expect(connector.logged).toHaveLength(1)
   })
 
   test("gates users and channels independently", () => {
