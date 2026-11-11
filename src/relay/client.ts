@@ -2,7 +2,7 @@
  * The connector's side of the relay socket.
  */
 
-import type { InboundRequest, InboundResponse, OutboxResponse, RelayRoute } from "./types"
+import type { InboundRequest, InboundResponse, OutboxResponse, RelayRoute, TypingRequest } from "./types"
 
 /** `status` is absent when the relay was not reached at all. */
 export class RelayError extends Error {
@@ -54,6 +54,10 @@ export class RelayClient {
 
   async nack(outboxId: string, error: string, definite: boolean): Promise<void> {
     await this.call("POST", "/v1/outbox/nack", { outboxId, error, definite }, 15_000)
+  }
+
+  async typing(request: TypingRequest): Promise<void> {
+    await this.call("POST", "/v1/typing", request, 5_000)
   }
 
   health(): Promise<Record<string, unknown>> {

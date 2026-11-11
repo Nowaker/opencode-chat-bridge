@@ -53,6 +53,27 @@ export interface InboundRequest {
    * a question or permission it posted, as an answer to it.
    */
   reaction?: boolean
+  /**
+   * The message this one edits (Matrix `m.replace`). The edit is relayed as
+   * typed, under its own event id; activity time counts it as the original.
+   */
+  originalEventId?: string
+}
+
+/**
+ * A received typing transition (`POST /v1/typing`), Matrix only: the owner
+ * started or stopped typing in a room, or `reset`, sent when the connector
+ * (re)starts observing that room, after which earlier state is unknown.
+ */
+export interface TypingRequest {
+  route: RelayRoute
+  roomId: string
+  sender: string
+  state: "start" | "stop" | "reset"
+  /** When the connector saw it, ms since the epoch. */
+  observedAt: number
+  /** A start already under way when the connector began observing the room: its real start is unknown. */
+  partial?: true
 }
 
 export type InboundState = "accepted" | "duplicate" | "ignored" | "rejected"

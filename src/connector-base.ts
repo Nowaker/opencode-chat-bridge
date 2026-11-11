@@ -841,6 +841,11 @@ export abstract class BaseConnector<TSession extends BaseSession> {
     return Math.max(10, seconds) * 1000
   }
 
+  /** isUserAllowed without logging a denial, for signals a non-owner sends constantly, such as typing. */
+  protected isUserAllowedQuietly(userId: string): boolean {
+    return isAllowedId(userId, this.allowedUsers)
+  }
+
   protected isUserAllowed(userId: string): boolean {
     const allowed = isAllowedId(userId, this.allowedUsers)
     if (!allowed) {

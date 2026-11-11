@@ -13,6 +13,7 @@ import {
   shouldHandleThreadReply,
   EncryptedRelations,
   extractReplyToEventId,
+  extractReplacedEventId,
   stripReplyFallback,
   extractReaction,
   isShortIdAnswer,
@@ -301,6 +302,12 @@ describe("rich replies", () => {
     expect(extractReplyToEventId({ content: { "m.relates_to": { rel_type: "m.thread", event_id: "$root", is_falling_back: true, "m.in_reply_to": { event_id: "$last" } } } })).toBe("")
     expect(extractReplyToEventId({ content: { "m.relates_to": { rel_type: "m.thread", event_id: "$root", "m.in_reply_to": { event_id: "$quoted" } } } })).toBe("$quoted")
     expect(extractReplyToEventId({ content: { body: "2" } })).toBe("")
+  })
+
+  test("an edit names the event it replaces; nothing else does", () => {
+    expect(extractReplacedEventId({ content: { "m.relates_to": { rel_type: "m.replace", event_id: "$orig" } } })).toBe("$orig")
+    expect(extractReplacedEventId({ content: { "m.relates_to": { rel_type: "m.thread", event_id: "$root" } } })).toBe("")
+    expect(extractReplacedEventId({ content: { body: "2" } })).toBe("")
   })
 
   test("the quoted fallback older clients prepend is dropped", () => {

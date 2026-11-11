@@ -199,6 +199,13 @@ export function extractReplyToEventId(event: any): string {
   return target
 }
 
+/** The event an edit (`m.replace`) replaces, or "" for anything else. */
+export function extractReplacedEventId(event: any): string {
+  const relation = event?.content?.["m.relates_to"]
+  if (relation?.rel_type !== "m.replace") return ""
+  return typeof relation.event_id === "string" ? relation.event_id : ""
+}
+
 /** A reply's body without the quoted fallback older clients prepend: `> ` lines, then a blank line. */
 export function stripReplyFallback(body: string): string {
   if (!body.startsWith("> ")) return body
