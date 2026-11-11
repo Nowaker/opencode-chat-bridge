@@ -47,6 +47,12 @@ export interface InboundRequest {
    * permission the relay posted answers it, as a reply in its thread does.
    */
   replyToEventId?: string
+  /**
+   * An emoji reaction, not a message: `text` is the reaction key and
+   * `replyToEventId` the message it was put on. The relay takes one only on
+   * a question or permission it posted, as an answer to it.
+   */
+  reaction?: boolean
 }
 
 export type InboundState = "accepted" | "duplicate" | "ignored" | "rejected"

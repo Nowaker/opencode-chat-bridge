@@ -106,6 +106,8 @@ import {
   EncryptedRelations,
   extractReplyToEventId,
   stripReplyFallback,
+  extractReaction,
+  isShortIdAnswer,
 } from "./matrix-thread-helpers"
 import { diagnoseEmptyResponse } from "../src/acp-response-diagnostics"
 import { resolveMatrixAccessToken, writePrivateFileAtomically } from "./matrix-auth"
@@ -205,6 +207,10 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
 
     this.matrix.on("room.encrypted_event", (_roomId: string, event: any) => this.encryptedRelations.remember(event))
     this.matrix.on("room.message", (roomId: string, event: any) => this.handleRoomMessage(roomId, this.encryptedRelations.restore(event)))
+    // Reactions answer the relay's question posts; only relay mode has any.
+    this.matrix.on("room.event", (roomId: string, event: any) => {
+      if (this.relay && event?.type === "m.reaction") void this.handleReaction(roomId, this.encryptedRelations.restore(event))
+    })
     await this.matrix.start()
 
     if (this.relay) {
@@ -473,6 +479,11 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
       query = body.replace(myUserId, "").trim()
     } else if (botNameQuery !== null) {
       query = botNameQuery
+    } else if (this.relay !== null && !threadRootEventId && isShortIdAnswer(body)) {
+      // `Q5 2`: an answer to the relay post numbered 5, in a DM or not.
+      query = body
+      implicit = true
+      this.logInbound("QID", message.sender, context.sessionId, body)
     } else if (isDM) {
       query = body
     } else if (this.relay !== null && replyToEventId) {
@@ -555,7 +566,19 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
   }
 
   /** The relay dedupes on the event id, so a retry after a lost answer is never a second prompt. */
-  private async forwardToRelay(context: MatrixEventContext, event: any, query: string, implicit: boolean): Promise<void> {
+  /** A reaction on a relay post: forwarded as an answer to it; the relay ignores one on anything else. */
+  private async handleReaction(roomId: string, event: any): Promise<void> {
+    const reaction = extractReaction(event)
+    if (!reaction || !this.isChannelAllowed(roomId)) return
+    const myUserId = await this.matrix!.getUserId()
+    if (event.sender === myUserId || !this.isUserAllowed(event.sender)) return
+    if (typeof event.event_id !== "string" || this.isDuplicateEvent(event.event_id)) return
+    const context = normalizeMatrixEventContext({ roomId, sender: event.sender, text: reaction.key, eventId: event.event_id }, this.threadIsolation)
+    this.log(`[REACTION] ${event.sender} in ${roomId}: ${reaction.key.length} chars`)
+    await this.forwardToRelay(context, event, reaction.key, true, { reaction: true, replyToEventId: reaction.targetEventId })
+  }
+
+  private async forwardToRelay(context: MatrixEventContext, event: any, query: string, implicit: boolean, extra: Partial<InboundRequest> = {}): Promise<void> {
     const request: InboundRequest = {
       route: "matrix",
       eventId: context.eventId,
@@ -568,6 +591,7 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
     }
     const replyToEventId = extractReplyToEventId(event)
     if (replyToEventId) request.replyToEventId = replyToEventId
+    Object.assign(request, extra)
     for (let attempt = 0; ; attempt++) {
       try {
         const result = await this.relay!.inbound(request)
@@ -643,7 +667,8 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
     const content: Record<string, unknown> = { msgtype: item.kind === "notice" ? "m.notice" : "m.text", body }
     if (FORMAT_HTML) {
       content.format = "org.matrix.custom.html"
-      content.formatted_body = await marked.parse(body)
+      // A relay post keeps its line breaks: a question's header, text and options are separate lines.
+      content.formatted_body = await marked.parse(body, { breaks: true })
     }
     if (item.threadRootId) {
       content["m.relates_to"] = buildThreadRelation(item.threadRootId, item.replyToEventId || item.threadRootId)

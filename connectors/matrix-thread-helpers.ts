@@ -207,3 +207,22 @@ export function stripReplyFallback(body: string): string {
   while (index < lines.length && (lines[index] ?? "").startsWith(">")) index++
   return lines.slice(index).join("\n").trim()
 }
+
+/** An emoji reaction (`m.reaction`): the event it was put on and its key, or null. */
+export function extractReaction(event: any): { targetEventId: string; key: string } | null {
+  if (event?.type !== "m.reaction") return null
+  const relation = event?.content?.["m.relates_to"]
+  const target = relation?.event_id
+  const key = relation?.key
+  if (relation?.rel_type !== "m.annotation" || typeof target !== "string" || !target) return null
+  if (typeof key !== "string" || !key.trim() || key.length > 64) return null
+  return { targetEventId: target, key: key.trim() }
+}
+
+/**
+ * A message that answers a relay post by its short number, `Q5 2`. The relay
+ * answers it only while that number is open, and says so when it is not.
+ */
+export function isShortIdAnswer(text: string): boolean {
+  return /^\s*q\d{1,3}(?=$|[\s:.,)-])/i.test(text)
+}

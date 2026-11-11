@@ -14,6 +14,8 @@ import {
   EncryptedRelations,
   extractReplyToEventId,
   stripReplyFallback,
+  extractReaction,
+  isShortIdAnswer,
 } from "../../connectors/matrix-thread-helpers"
 
 // =============================================================================
@@ -305,5 +307,26 @@ describe("rich replies", () => {
     expect(stripReplyFallback("> <@bot:example.org> Q: deploy?\n> 1. Now\n\n2")).toBe("2")
     expect(stripReplyFallback("2")).toBe("2")
     expect(stripReplyFallback(">not a fallback")).toBe(">not a fallback")
+  })
+})
+
+// =============================================================================
+// Reactions and short-number answers
+// =============================================================================
+
+describe("reactions and Q-number answers", () => {
+  test("a reaction names its target and key; anything else is none", () => {
+    const reaction = { type: "m.reaction", content: { "m.relates_to": { rel_type: "m.annotation", event_id: "$post", key: "2️⃣" } } }
+    expect(extractReaction(reaction)).toEqual({ targetEventId: "$post", key: "2️⃣" })
+    expect(extractReaction({ ...reaction, type: "m.room.message" })).toBeNull()
+    expect(extractReaction({ type: "m.reaction", content: {} })).toBeNull()
+  })
+
+  test("Q5 and q12: count; a longer number or a word starting with q does not", () => {
+    expect(isShortIdAnswer("Q5 2")).toBe(true)
+    expect(isShortIdAnswer("q12: a, after lunch")).toBe(true)
+    expect(isShortIdAnswer("Q5")).toBe(true)
+    expect(isShortIdAnswer("Q2026 plan")).toBe(false)
+    expect(isShortIdAnswer("Quick question")).toBe(false)
   })
 })
