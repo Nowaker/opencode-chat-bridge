@@ -143,3 +143,45 @@ export function shouldHandleThreadReply(input: {
   if (text.includes(input.botUserId)) return false
   return true
 }
+
+/**
+ * Relations of encrypted events, kept between the encrypted event and its
+ * decrypted form.
+ *
+ * In an encrypted room `m.relates_to` travels in the CLEARTEXT content of the
+ * `m.room.encrypted` event, not inside the ciphertext, and matrix-bot-sdk's
+ * `CryptoClient.decryptRoomEvent` replaces the content with the decrypted one,
+ * dropping it. Without this a thread reply in an encrypted room reaches
+ * `room.message` with no thread at all, and is handled as a top-level message.
+ * `remember` runs on `room.encrypted_event`, which the SDK emits before it
+ * decrypts the same event; `restore` puts the relation back.
+ */
+export class EncryptedRelations {
+  private readonly relations = new Map<string, unknown>()
+
+  constructor(private readonly limit = 1_000) {}
+
+  remember(event: any): void {
+    const relation = event?.content?.["m.relates_to"]
+    const id = event?.event_id
+    if (typeof id !== "string" || relation === null || typeof relation !== "object") return
+    this.relations.delete(id)
+    this.relations.set(id, relation)
+    while (this.relations.size > this.limit) {
+      const oldest = this.relations.keys().next().value
+      if (oldest === undefined) break
+      this.relations.delete(oldest)
+    }
+  }
+
+  /** The event with its cleartext relation back, when decryption dropped it. */
+  restore<T>(event: T): T {
+    const raw = event as any
+    const id = raw?.event_id
+    if (typeof id !== "string" || !this.relations.has(id)) return event
+    const relation = this.relations.get(id)
+    this.relations.delete(id)
+    if (raw.content?.["m.relates_to"]) return event
+    return { ...raw, content: { ...(raw.content ?? {}), "m.relates_to": relation } }
+  }
+}
