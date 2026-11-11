@@ -114,7 +114,7 @@ import { diagnoseEmptyResponse } from "../src/acp-response-diagnostics"
 import { resolveMatrixAccessToken, writePrivateFileAtomically } from "./matrix-auth"
 import { RelayClient, RelayError } from "../src/relay/client"
 import type { InboundRequest, OutboxItem, TypingRequest } from "../src/relay/types"
-import { TypingAwareClient, forwardTyping } from "./matrix-typing"
+import { TypingAwareClient, TypingForwarder } from "./matrix-typing"
 
 // Relay mode: this container is transport only. Accepted messages go to
 // the vibeterm-channels relay on the host, which prompts a Vibeterm coordinator session,
@@ -123,6 +123,8 @@ import { TypingAwareClient, forwardTyping } from "./matrix-typing"
 const RELAY_SOCKET = process.env.RELAY_SOCKET || ""
 const RELAY_INBOUND_DELAYS_MS = [1_000, 3_000, 10_000, 30_000, 60_000]
 const RELAY_OUTBOX_WAIT_MS = 8_000
+/** How long a message waits for the typing transitions before it to reach the relay; then it goes on unmeasured. */
+const TYPING_FENCE_MS = 2_000
 const TYPING_TIMEOUT_MS = 30_000
 const TYPING_REFRESH_MS = 20_000
 
@@ -146,6 +148,7 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
   private readonly relay: RelayClient | null = RELAY_SOCKET ? new RelayClient(RELAY_SOCKET) : null
   private stopping = false
   private typingRooms = new Map<string, number>()
+  private typingForwarder: TypingForwarder | null = null
 
   constructor() {
     super({
@@ -566,22 +569,27 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
    */
   private observeTyping(matrix: TypingAwareClient, relay: RelayClient, botUserId: string): void {
     let lastError = ""
-    const send = (request: TypingRequest) => {
-      void relay.typing(request).then(() => { lastError = "" }, (err: unknown) => {
-        const message = err instanceof Error ? err.message : String(err)
+    const forwarder = new TypingForwarder({
+      stream: crypto.randomUUID(),
+      botUserId,
+      rooms: ALLOWED_ROOMS,
+      users: ALLOWED_USERS,
+      allowed: (roomId, sender) => this.isChannelAllowedQuietly(roomId) && this.isUserAllowedQuietly(sender),
+      send: async (request: TypingRequest) => {
+        await relay.typing(request)
+        lastError = ""
+      },
+      failed: (error) => {
+        const message = error instanceof Error ? error.message : String(error)
         if (message !== lastError) this.logError(`[RELAY] typing not forwarded: ${message}`)
         lastError = message
-      })
-    }
+      },
+      now: Date.now,
+    })
+    forwarder.start()
+    this.typingForwarder = forwarder
     matrix.typingObserver = {
-      typing: forwardTyping({
-        botUserId,
-        rooms: ALLOWED_ROOMS,
-        users: ALLOWED_USERS,
-        allowed: (roomId, sender) => this.isChannelAllowedQuietly(roomId) && this.isUserAllowedQuietly(sender),
-        send,
-        now: Date.now,
-      }),
+      typing: (roomId, userIds) => forwarder.observe(roomId, userIds),
       failed: (error) => this.logError(`[RELAY] received typing dropped: ${error instanceof Error ? error.name : typeof error}`),
     }
   }
@@ -613,6 +621,8 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
   private async forwardToRelay(context: MatrixEventContext, event: any, query: string, implicit: boolean, extra: Partial<InboundRequest> = {}): Promise<void> {
     const request = relayInboundRequest(context, event, query, implicit, Date.now())
     Object.assign(request, extra)
+    const typingWatermark = await this.typingForwarder?.fence(context.roomId, context.sender, TYPING_FENCE_MS)
+    if (typingWatermark) request.typingWatermark = typingWatermark
     for (let attempt = 0; ; attempt++) {
       try {
         const result = await this.relay!.inbound(request)

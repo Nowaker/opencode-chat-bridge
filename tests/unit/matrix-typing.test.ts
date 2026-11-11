@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { TypingAwareClient, TypingTransitions, forwardTyping, typingSets } from "../../connectors/matrix-typing"
+import { TypingAwareClient, TypingForwarder, TypingTransitions, typingSets } from "../../connectors/matrix-typing"
 import type { TypingRequest } from "../../src/relay/types"
 
 const ROOM = "!room:example.org"
@@ -120,39 +120,137 @@ describe("TypingAwareClient", () => {
   })
 })
 
-describe("forwardTyping", () => {
-  test("sends a reset per room and sender, then only allowed senders' transitions; the bot never counts", () => {
-    const sent: TypingRequest[] = []
-    let clock = 1_000
-    const onTyping = forwardTyping({
-      botUserId: BOT,
-      rooms: [ROOM],
-      users: [OWNER, BOT],
-      allowed: (roomId, sender) => roomId === ROOM && (sender === OWNER || sender === BOT),
-      send: (request) => sent.push(request),
-      now: () => clock,
-    })
-    clock = 2_000
-    onTyping(ROOM, [])
-    onTyping(OTHER_ROOM, [])
-    onTyping(ROOM, [OWNER, BOT, STRANGER])
-    onTyping(OTHER_ROOM, [OWNER])
-    clock = 3_000
-    onTyping(ROOM, [BOT])
-    expect(sent).toEqual([
-      { route: "matrix", roomId: ROOM, sender: OWNER, state: "reset", observedAt: 1_000 },
-      { route: "matrix", roomId: ROOM, sender: BOT, state: "reset", observedAt: 1_000 },
-      { route: "matrix", roomId: ROOM, sender: OWNER, state: "start", observedAt: 2_000 },
-      { route: "matrix", roomId: ROOM, sender: OWNER, state: "stop", observedAt: 3_000 },
+/** A relay socket whose typing POSTs the test settles one by one. */
+class SlowRelay {
+  readonly calls: TypingRequest[] = []
+  private readonly settles: Array<{ resolve: () => void; reject: (error: Error) => void }> = []
+
+  send = (request: TypingRequest): Promise<void> => {
+    this.calls.push(request)
+    return new Promise<void>((resolve, reject) => { this.settles.push({ resolve, reject }) })
+  }
+
+  /** Settles the oldest unsettled POST, then lets the forwarder hand out the next one. */
+  async settle(error?: Error): Promise<void> {
+    await drain()
+    const next = this.settles.shift()
+    if (!next) throw new Error("no POST in flight")
+    if (error) next.reject(error)
+    else next.resolve()
+    await drain()
+  }
+}
+
+/** Lets the forwarder's promise chain run up to its next POST; no timer involved. */
+async function drain(): Promise<void> {
+  for (let tick = 0; tick < 8; tick++) await Promise.resolve()
+}
+
+function forwarder(relay: SlowRelay, failures: unknown[] = [], clock = { ms: 1_000 }) {
+  return new TypingForwarder({
+    stream: "run-a", botUserId: BOT, rooms: [ROOM], users: [OWNER],
+    allowed: (roomId, sender) => roomId === ROOM && sender === OWNER,
+    send: relay.send, failed: (error) => failures.push(error), now: () => clock.ms,
+  })
+}
+
+const brief = (request: TypingRequest) => [request.state, request.seq, request.observedAt]
+
+describe("TypingForwarder", () => {
+  test("numbers each transition per room and sender, reset first, and never counts the bot or another room", async () => {
+    const relay = new SlowRelay()
+    const clock = { ms: 1_000 }
+    const typing = forwarder(relay, [], clock)
+    typing.start()
+    clock.ms = 2_000
+    typing.observe(ROOM, [])
+    typing.observe(OTHER_ROOM, [OWNER])
+    typing.observe(ROOM, [OWNER, BOT, STRANGER])
+    clock.ms = 3_000
+    typing.observe(ROOM, [BOT])
+    for (let sent = 0; sent < 3; sent++) await relay.settle()
+    expect(relay.calls).toEqual([
+      { route: "matrix", roomId: ROOM, sender: OWNER, state: "reset", observedAt: 1_000, stream: "run-a", seq: 0 },
+      { route: "matrix", roomId: ROOM, sender: OWNER, state: "start", observedAt: 2_000, stream: "run-a", seq: 1 },
+      { route: "matrix", roomId: ROOM, sender: OWNER, state: "stop", observedAt: 3_000, stream: "run-a", seq: 2 },
     ])
   })
 
-  test("an owner already typing when observation begins gets a partial start", () => {
-    const sent: TypingRequest[] = []
-    const onTyping = forwardTyping({
-      botUserId: BOT, rooms: [ROOM], users: [OWNER], allowed: () => true, send: (request) => sent.push(request), now: () => 5,
-    })
-    onTyping(ROOM, [OWNER])
-    expect(sent.at(-1)).toEqual({ route: "matrix", roomId: ROOM, sender: OWNER, state: "start", partial: true, observedAt: 5 })
+  test("an owner already typing when observation begins gets a partial start", async () => {
+    const relay = new SlowRelay()
+    const typing = forwarder(relay)
+    typing.start()
+    typing.observe(ROOM, [OWNER])
+    await relay.settle()
+    await relay.settle()
+    expect(relay.calls.at(-1)).toEqual({ route: "matrix", roomId: ROOM, sender: OWNER, state: "start", partial: true, observedAt: 1_000, stream: "run-a", seq: 1 })
+  })
+
+  test("a slow POST holds back the next one: transitions reach the relay one at a time, in order", async () => {
+    const relay = new SlowRelay()
+    const typing = forwarder(relay)
+    typing.start()
+    typing.observe(ROOM, [])
+    typing.observe(ROOM, [OWNER])
+    typing.observe(ROOM, [])
+    await drain()
+    expect(relay.calls.map(brief)).toEqual([["reset", 0, 1_000]])
+    await relay.settle()
+    expect(relay.calls.map((request) => request.seq)).toEqual([0, 1])
+    await relay.settle()
+    await relay.settle()
+    expect(relay.calls.map((request) => request.state)).toEqual(["reset", "start", "stop"])
+  })
+
+  test("a failed POST is reported, and the next transition still goes out with the following seq", async () => {
+    const relay = new SlowRelay()
+    const failures: unknown[] = []
+    const typing = forwarder(relay, failures)
+    typing.start()
+    typing.observe(ROOM, [])
+    typing.observe(ROOM, [OWNER])
+    typing.observe(ROOM, [])
+    await relay.settle()
+    const refused = new Error("relay down")
+    await relay.settle(refused)
+    await relay.settle()
+    expect(failures).toEqual([refused])
+    expect(relay.calls.map((request) => [request.state, request.seq])).toEqual([["reset", 0], ["start", 1], ["stop", 2]])
+  })
+
+  test("a message waits for the transitions before it, and its watermark names the last one handed out", async () => {
+    const relay = new SlowRelay()
+    const typing = forwarder(relay)
+    typing.start()
+    typing.observe(ROOM, [])
+    typing.observe(ROOM, [OWNER])
+    typing.observe(ROOM, [])
+    let watermark: unknown = "pending"
+    const fenced = typing.fence(ROOM, OWNER, 60_000).then((value) => { watermark = value })
+    await relay.settle()
+    await relay.settle()
+    expect(watermark).toBe("pending")
+    await relay.settle()
+    await fenced
+    expect(watermark).toEqual({ stream: "run-a", seq: 2 })
+  })
+
+  test("a stop still in flight holds a message back only up to the bound; the watermark still names the stop", async () => {
+    const relay = new SlowRelay()
+    const typing = forwarder(relay)
+    typing.start()
+    typing.observe(ROOM, [])
+    typing.observe(ROOM, [OWNER])
+    await relay.settle()
+    await relay.settle()
+    typing.observe(ROOM, [])
+    // The stop's POST never settles: the message goes on after the bound, naming seq 2, which the relay has not taken.
+    expect(await typing.fence(ROOM, OWNER, 20)).toEqual({ stream: "run-a", seq: 2 })
+    expect(relay.calls.map((request) => request.state)).toEqual(["reset", "start", "stop"])
+  })
+
+  test("a sender never observed gets no watermark", async () => {
+    const typing = forwarder(new SlowRelay())
+    expect(await typing.fence(ROOM, STRANGER, 0)).toBeUndefined()
   })
 })

@@ -58,6 +58,17 @@ export interface InboundRequest {
    * typed, under its own event id; activity time counts it as the original.
    */
   originalEventId?: string
+  /**
+   * The last typing transition the connector had handed out for this room
+   * and sender when it forwarded this message. The relay measures this
+   * input's typing only when it has taken every transition up to it.
+   */
+  typingWatermark?: TypingWatermark
+}
+
+export interface TypingWatermark {
+  stream: string
+  seq: number
 }
 
 /**
@@ -72,6 +83,10 @@ export interface TypingRequest {
   state: "start" | "stop" | "reset"
   /** When the connector saw it, ms since the epoch. */
   observedAt: number
+  /** The connector run that sent it; a new run sends `reset` first. */
+  stream: string
+  /** Its place among this run's transitions for this room and sender: `reset` is 0, then 1, 2, ... */
+  seq: number
   /** A start already under way when the connector began observing the room: its real start is unknown. */
   partial?: true
 }
