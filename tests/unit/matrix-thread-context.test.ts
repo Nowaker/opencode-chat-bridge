@@ -11,6 +11,7 @@ import {
   normalizeMatrixEventContext,
   buildThreadRelation,
   shouldHandleThreadReply,
+  EncryptedRelations,
 } from "../../connectors/matrix-thread-helpers"
 
 // =============================================================================
@@ -247,5 +248,41 @@ describe("shouldHandleThreadReply", () => {
       trigger: "!oc",
       botUserId: "@bot:server",
     })).toBe(false)
+  })
+})
+
+// =============================================================================
+// EncryptedRelations
+// =============================================================================
+
+describe("EncryptedRelations", () => {
+  const encrypted = {
+    event_id: "$reply",
+    type: "m.room.encrypted",
+    content: { algorithm: "m.megolm.v1.aes-sha2", ciphertext: "x", "m.relates_to": { rel_type: "m.thread", event_id: "$root" } },
+  }
+  // What matrix-bot-sdk's decryptRoomEvent hands on: the raw event with only the decrypted content.
+  const decrypted = { event_id: "$reply", type: "m.room.message", content: { msgtype: "m.text", body: "2" } }
+
+  test("puts a thread relation dropped by decryption back, so the reply stays in its thread", () => {
+    const relations = new EncryptedRelations()
+    relations.remember(encrypted)
+    expect(extractThreadRootId(decrypted)).toBe("")
+    expect(extractThreadRootId(relations.restore(decrypted))).toBe("$root")
+  })
+
+  test("leaves unencrypted events, and a relation the decrypted content kept, alone", () => {
+    const relations = new EncryptedRelations()
+    expect(relations.restore(decrypted)).toBe(decrypted)
+    relations.remember(encrypted)
+    const own = { ...decrypted, content: { ...decrypted.content, "m.relates_to": { rel_type: "m.thread", event_id: "$other" } } }
+    expect(extractThreadRootId(relations.restore(own))).toBe("$other")
+  })
+
+  test("keeps at most its limit of relations", () => {
+    const relations = new EncryptedRelations(2)
+    for (const id of ["$a", "$b", "$c"]) relations.remember({ ...encrypted, event_id: id })
+    expect(extractThreadRootId(relations.restore({ ...decrypted, event_id: "$a" }))).toBe("")
+    expect(extractThreadRootId(relations.restore({ ...decrypted, event_id: "$c" }))).toBe("$root")
   })
 })

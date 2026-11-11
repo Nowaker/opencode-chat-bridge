@@ -98,6 +98,7 @@ import {
   normalizeMatrixEventContext,
   buildThreadRelation,
   shouldHandleThreadReply,
+  EncryptedRelations,
 } from "./matrix-thread-helpers"
 import { diagnoseEmptyResponse } from "../src/acp-response-diagnostics"
 import { resolveMatrixAccessToken, writePrivateFileAtomically } from "./matrix-auth"
@@ -117,6 +118,7 @@ interface RoomSession extends BaseSession {
 
 export class MatrixConnector extends BaseConnector<RoomSession> {
   private matrix: MatrixClient | null = null
+  private readonly encryptedRelations = new EncryptedRelations()
   private threadIsolation: boolean
 
   constructor() {
@@ -174,7 +176,8 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
       this.log(`[CRYPTO] Failed to decrypt in ${roomId}: ${error.message}`)
     })
 
-    this.matrix.on("room.message", this.handleRoomMessage.bind(this))
+    this.matrix.on("room.encrypted_event", (_roomId: string, event: any) => this.encryptedRelations.remember(event))
+    this.matrix.on("room.message", (roomId: string, event: any) => this.handleRoomMessage(roomId, this.encryptedRelations.restore(event)))
     await this.matrix.start()
 
     this.startSessionExpiryLoop()
