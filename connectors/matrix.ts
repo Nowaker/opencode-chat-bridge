@@ -27,7 +27,6 @@ import os from "os"
 
 // matrix-bot-sdk with native Rust crypto for E2EE
 import {
-  AutojoinRoomsMixin,
   LogLevel,
   LogService,
   MatrixAuth,
@@ -116,6 +115,7 @@ import { resolveMatrixAccessToken, writePrivateFileAtomically } from "./matrix-a
 import { RelayClient, RelayError } from "../src/relay/client"
 import type { InboundRequest, OutboxItem, TypingRequest } from "../src/relay/types"
 import { TypingAwareClient, TypingForwarder } from "./matrix-typing"
+import { inviteDecision } from "./matrix-invites"
 
 // Relay mode: this container is transport only. Accepted messages go to
 // the vibeterm-channels relay on the host, which prompts a Vibeterm coordinator session,
@@ -206,8 +206,9 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
 
     const matrix = new TypingAwareClient(HOMESERVER, accessToken, stateStorage, cryptoStorage)
     this.matrix = matrix
-    if (this.relay) this.observeTyping(matrix, this.relay, await matrix.getUserId())
-    AutojoinRoomsMixin.setupOnClient(this.matrix)
+    const botUserId = await matrix.getUserId()
+    if (this.relay) this.observeTyping(matrix, this.relay, botUserId)
+    this.matrix.on("room.invite", (roomId: string, event: unknown) => this.handleInvite(roomId, event, botUserId))
 
     this.matrix.on("room.failed_decryption", async (roomId: string, event: any, error: Error) => {
       this.log(`[CRYPTO] Failed to decrypt in ${roomId}: ${error.message}`)
@@ -556,6 +557,22 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
 
     if (!this.checkRateLimit(message.sender)) return
     await this.processQuery(context, query)
+  }
+
+  /** An allowlisted user's invite is accepted; any other is declined. */
+  private async handleInvite(roomId: string, event: unknown, botUserId: string): Promise<void> {
+    const decision = inviteDecision(event, botUserId, (userId) => this.isUserAllowedQuietly(userId))
+    try {
+      if (decision.join) {
+        await this.matrix!.joinRoom(roomId)
+        this.log(`[INVITE] joined ${roomId}`)
+      } else {
+        await this.matrix!.leaveRoom(roomId)
+        this.log(`[INVITE] declined ${roomId}: ${decision.reason}`)
+      }
+    } catch (err) {
+      this.logError(`[INVITE] ${decision.join ? "join" : "decline"} of ${roomId} failed: ${err instanceof Error ? err.message : String(err)}`)
+    }
   }
 
   // ---------------------------------------------------------------------------
