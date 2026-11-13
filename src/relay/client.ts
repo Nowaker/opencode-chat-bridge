@@ -2,7 +2,19 @@
  * The connector's side of the relay socket.
  */
 
-import type { InboundRequest, InboundResponse, OutboxResponse, RelayRoute, TypingRequest } from "./types"
+import type {
+  InboundRequest,
+  InboundResponse,
+  OutboxResponse,
+  RelayRoute,
+  RoomClaimRequest,
+  RoomClaimResponse,
+  RoomCreatedRequest,
+  RoomGoneRequest,
+  RoomMemberRequest,
+  RoomsResponse,
+  TypingRequest,
+} from "./types"
 
 /** `status` is absent when the relay was not reached at all. */
 export class RelayError extends Error {
@@ -60,6 +72,26 @@ export class RelayClient {
 
   async typing(request: TypingRequest): Promise<void> {
     await this.call("POST", "/v1/typing", request, 5_000)
+  }
+
+  rooms(route: RelayRoute): Promise<RoomsResponse> {
+    return this.call("GET", `/v1/rooms?route=${route}`, undefined, 10_000)
+  }
+
+  async roomCreated(request: RoomCreatedRequest): Promise<void> {
+    await this.call("POST", "/v1/rooms/created", request, 10_000)
+  }
+
+  async roomMember(request: RoomMemberRequest): Promise<void> {
+    await this.call("POST", "/v1/rooms/member", request, 10_000)
+  }
+
+  roomClaim(request: RoomClaimRequest): Promise<RoomClaimResponse> {
+    return this.call("POST", "/v1/rooms/claim", request, 15_000)
+  }
+
+  async roomGone(request: RoomGoneRequest): Promise<void> {
+    await this.call("POST", "/v1/rooms/gone", request, 10_000)
   }
 
   health(): Promise<Record<string, unknown>> {

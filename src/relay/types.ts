@@ -138,3 +138,78 @@ export interface NackRequest {
   /** True when the platform refused the message; false when it may yet go through. */
   definite: boolean
 }
+
+/**
+ * Rooms beyond the configured ones (Matrix only). The relay owns the registry
+ * and the connector learns it from `GET /v1/rooms`: which rooms it may act in,
+ * which the relay wants created, and where the owner is. The connector does
+ * the Matrix work and reports back; a room's id, never its name, is what the
+ * allowlists hold.
+ */
+export const ROOM_KINDS = ["space", "project", "session", "dm"] as const
+export type RoomKind = (typeof ROOM_KINDS)[number]
+
+export const OWNER_MEMBERSHIPS = ["join", "invite", "leave", "ban", "knock"] as const
+export type OwnerMembership = (typeof OWNER_MEMBERSHIPS)[number]
+
+export interface RoomEntry {
+  roomId: string
+  kind: RoomKind
+  /** The project's path (auto-created project rooms), the session id, or "". */
+  key: string
+  /** The project's label, or the session id. */
+  label: string
+  /** An owner's membership there is `join`. */
+  ownerJoined: boolean
+}
+
+/** A room the relay wants created. Its `requestId` is stamped into the room, so a crash after creating never creates a second. */
+export interface RoomWanted {
+  requestId: string
+  kind: "space" | "project" | "dm"
+  name: string
+  topic: string
+}
+
+export interface RoomsResponse {
+  /** Created rooms invite them; their membership gates posting. */
+  owners: string[]
+  rooms: RoomEntry[]
+  /** The Space's room id once it exists; project rooms are created inside it. */
+  space: string | null
+  /** Configured rooms listed in the Space too. */
+  spaceChildren: string[]
+  wanted: RoomWanted[]
+  /** Rooms an owner names `vt <project>` or `vt ses_<id>` bind when the bot is invited. */
+  named: boolean
+}
+
+export interface RoomCreatedRequest {
+  route: RelayRoute
+  requestId: string
+  roomId: string
+}
+
+export interface RoomMemberRequest {
+  route: RelayRoute
+  roomId: string
+  user: string
+  membership: OwnerMembership
+}
+
+/** The bot joined a room an owner created and invited it to. */
+export interface RoomClaimRequest {
+  route: RelayRoute
+  roomId: string
+  inviter: string
+  /** Read only for this binding, never for authorization. */
+  name: string
+  encrypted: boolean
+}
+
+export type RoomClaimResponse = { state: "bound"; kind: RoomKind; label: string } | { state: "refused"; reason: string }
+
+export interface RoomGoneRequest {
+  route: RelayRoute
+  roomId: string
+}

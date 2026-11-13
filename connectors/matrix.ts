@@ -116,6 +116,7 @@ import { RelayClient, RelayError } from "../src/relay/client"
 import type { InboundRequest, OutboxItem, TypingRequest } from "../src/relay/types"
 import { TypingAwareClient, TypingForwarder } from "./matrix-typing"
 import { inviteDecision } from "./matrix-invites"
+import { RoomSync, type MatrixRoomsPort } from "./matrix-rooms"
 
 // Relay mode: this container is transport only. Accepted messages go to
 // the vibeterm-channels relay on the host, which prompts a Vibeterm coordinator session,
@@ -128,6 +129,8 @@ const RELAY_OUTBOX_WAIT_MS = 8_000
 const TYPING_FENCE_MS = 2_000
 const TYPING_TIMEOUT_MS = 30_000
 const TYPING_REFRESH_MS = 20_000
+/** How often the relay's room registry is read again; invites and membership events also trigger it. */
+const ROOM_SYNC_MS = 30_000
 
 // =============================================================================
 // Session Type
@@ -150,6 +153,8 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
   private stopping = false
   private typingRooms = new Map<string, number>()
   private typingForwarder: TypingForwarder | null = null
+  private roomSync: RoomSync | null = null
+  private roomSyncTimer: ReturnType<typeof setInterval> | null = null
 
   constructor() {
     super({
@@ -216,15 +221,23 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
 
     this.matrix.on("room.encrypted_event", (_roomId: string, event: any) => this.encryptedRelations.remember(event))
     this.matrix.on("room.message", (roomId: string, event: any) => this.handleRoomMessage(roomId, this.encryptedRelations.restore(event)))
+    if (this.relay) this.roomSync = this.startRoomSync(matrix, this.relay, botUserId)
     // Reactions answer the relay's question posts; only relay mode has any.
     this.matrix.on("room.event", (roomId: string, event: any) => {
       if (this.relay && event?.type === "m.reaction") void this.handleReaction(roomId, this.encryptedRelations.restore(event))
+      if (event?.type === "m.room.member") void this.roomSync?.memberEvent(roomId, event)
     })
+    this.matrix.on("room.leave", (roomId: string) => void this.roomSync?.left(roomId))
     await this.matrix.start()
 
     if (this.relay) {
       await this.logRelayHealth()
       void this.runRelayOutbox()
+      const roomSync = this.roomSync
+      if (roomSync) {
+        await roomSync.sync()
+        this.roomSyncTimer = setInterval(() => void roomSync.sync(), ROOM_SYNC_MS)
+      }
     } else {
       this.startSessionExpiryLoop()
     }
@@ -234,6 +247,7 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
   async stop(): Promise<void> {
     this.log("Stopping...")
     this.stopping = true
+    if (this.roomSyncTimer) clearInterval(this.roomSyncTimer)
     await this.updateTyping([])
     await this.disconnectAllSessions()
     if (this.matrix) this.matrix.stop()
@@ -566,6 +580,7 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
       if (decision.join) {
         await this.matrix!.joinRoom(roomId)
         this.log(`[INVITE] joined ${roomId}`)
+        if (!super.isChannelAllowedQuietly(roomId)) await this.roomSync?.invited(roomId, decision.inviter)
       } else {
         await this.matrix!.leaveRoom(roomId)
         this.log(`[INVITE] declined ${roomId}: ${decision.reason}`)
@@ -573,6 +588,62 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
     } catch (err) {
       this.logError(`[INVITE] ${decision.join ? "join" : "decline"} of ${roomId} failed: ${err instanceof Error ? err.message : String(err)}`)
     }
+  }
+
+  /** A configured room, or a room of the relay's registry. */
+  protected override isChannelAllowedQuietly(channelId: string): boolean {
+    return super.isChannelAllowedQuietly(channelId) || this.roomSync?.allows(channelId) === true
+  }
+
+  /** The relay's room registry, done with this client. */
+  private startRoomSync(matrix: MatrixClient, relay: RelayClient, botUserId: string): RoomSync {
+    const port: MatrixRoomsPort = {
+      joinedRooms: () => matrix.getJoinedRooms(),
+      createRoom: async (options) => {
+        const response: unknown = await matrix.doRequest("POST", "/_matrix/client/v3/createRoom", null, options)
+        const roomId = typeof response === "object" && response !== null && "room_id" in response ? response.room_id : undefined
+        if (typeof roomId !== "string" || !roomId) throw new Error("the homeserver answered createRoom without a room id")
+        return roomId
+      },
+      stateEvent: async (roomId, type, stateKey) => {
+        try {
+          const content: unknown = await matrix.getRoomStateEvent(roomId, type, stateKey)
+          return typeof content === "object" && content !== null && !Array.isArray(content) ? { ...content } : null
+        } catch (err) {
+          if (typeof err === "object" && err !== null && "statusCode" in err && err.statusCode === 404) return null
+          throw err
+        }
+      },
+      sendState: async (roomId, type, stateKey, content) => {
+        await matrix.sendStateEvent(roomId, type, stateKey, content)
+      },
+      accountData: async (type) => {
+        const content: unknown = await matrix.getSafeAccountData(type, {})
+        return typeof content === "object" && content !== null && !Array.isArray(content) ? { ...content } : {}
+      },
+      setAccountData: async (type, content) => {
+        await matrix.setAccountData(type, content)
+      },
+      leave: async (roomId) => {
+        await matrix.leaveRoom(roomId)
+      },
+      notice: async (roomId, text) => {
+        await matrix.sendNotice(roomId, this.safeOutboundText(text))
+      },
+    }
+    return new RoomSync({
+      matrix: port,
+      relay: {
+        rooms: () => relay.rooms("matrix"),
+        created: (requestId, roomId) => relay.roomCreated({ route: "matrix", requestId, roomId }),
+        member: (roomId, user, membership) => relay.roomMember({ route: "matrix", roomId, user, membership }),
+        claim: (roomId, inviter, name, encrypted) => relay.roomClaim({ route: "matrix", roomId, inviter, name, encrypted }),
+        gone: (roomId) => relay.roomGone({ route: "matrix", roomId }),
+      },
+      botUserId,
+      log: (line) => this.log(line),
+      now: Date.now,
+    })
   }
 
   // ---------------------------------------------------------------------------
