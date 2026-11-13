@@ -254,3 +254,53 @@ describe("TypingForwarder", () => {
     expect(await typing.fence(ROOM, STRANGER, 0)).toBeUndefined()
   })
 })
+
+describe("TypingForwarder, rooms allowed after start", () => {
+  /** A forwarder over ROOM plus whatever `rooms` allows later, as the relay's registry does. */
+  function registryForwarder(relay: SlowRelay, rooms: Set<string>, clock = { ms: 1_000 }) {
+    return new TypingForwarder({
+      stream: "run-a", botUserId: BOT, rooms: [ROOM], users: [OWNER],
+      allowed: (roomId, sender) => (roomId === ROOM || rooms.has(roomId)) && sender === OWNER,
+      send: relay.send, failed: () => {}, now: () => clock.ms,
+    })
+  }
+
+  async function settle(relay: SlowRelay, posts: number): Promise<void> {
+    for (let sent = 0; sent < posts; sent++) await relay.settle()
+  }
+
+  test("a room allowed later gets its own reset once, then numbers from it", async () => {
+    const relay = new SlowRelay()
+    const rooms = new Set<string>()
+    const clock = { ms: 1_000 }
+    const typing = registryForwarder(relay, rooms, clock)
+    typing.start()
+    clock.ms = 2_000
+    typing.watch(OTHER_ROOM)
+    rooms.add(OTHER_ROOM)
+    typing.watch(OTHER_ROOM)
+    typing.watch(OTHER_ROOM)
+    clock.ms = 3_000
+    typing.observe(OTHER_ROOM, [])
+    typing.observe(OTHER_ROOM, [OWNER])
+    await settle(relay, 3)
+    expect(relay.calls.filter((call) => call.roomId === OTHER_ROOM).map(brief)).toEqual([["reset", 0, 2_000], ["start", 1, 3_000]])
+    expect(await typing.fence(OTHER_ROOM, OWNER, 0)).toEqual({ stream: "run-a", seq: 1 })
+  })
+
+  test("typing in a newly allowed room before it is watched still starts with a reset, and the owner already typing is partial", async () => {
+    const relay = new SlowRelay()
+    const rooms = new Set<string>()
+    const typing = registryForwarder(relay, rooms)
+    typing.start()
+    typing.observe(OTHER_ROOM, [OWNER])
+    rooms.add(OTHER_ROOM)
+    typing.observe(OTHER_ROOM, [OWNER])
+    typing.watch(OTHER_ROOM)
+    await settle(relay, 3)
+    expect(relay.calls.filter((call) => call.roomId === OTHER_ROOM)).toEqual([
+      { route: "matrix", roomId: OTHER_ROOM, sender: OWNER, state: "reset", observedAt: 1_000, stream: "run-a", seq: 0 },
+      { route: "matrix", roomId: OTHER_ROOM, sender: OWNER, state: "start", partial: true, observedAt: 1_000, stream: "run-a", seq: 1 },
+    ])
+  })
+})

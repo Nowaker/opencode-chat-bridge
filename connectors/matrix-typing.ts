@@ -85,6 +85,11 @@ export class TypingTransitions {
   reset(): void {
     this.typing.clear()
   }
+
+  /** Forget one room: its next set is a new baseline. */
+  forget(roomId: string): void {
+    this.typing.delete(roomId)
+  }
 }
 
 export interface TypingForwarding {
@@ -119,6 +124,8 @@ export interface TypingForwarding {
 export class TypingForwarder {
   private readonly transitions: TypingTransitions
   private readonly seqs = new Map<string, number>()
+  /** Rooms whose observation began: each got a `reset` for every user. */
+  private readonly observed = new Set<string>()
   private tail: Promise<void> = Promise.resolve()
 
   constructor(private readonly options: TypingForwarding) {
@@ -127,14 +134,30 @@ export class TypingForwarder {
 
   /** Observation (re)starts now: a `reset` for every room and sender. */
   start(): void {
+    for (const roomId of this.options.rooms) this.watch(roomId)
+  }
+
+  /**
+   * Observation of a room that became allowed after `start` (a room of the
+   * relay's registry) begins now: a `reset` for every sender it allows there,
+   * once, as `start` gives a configured room. Without it this run's first
+   * transition there would follow the previous run's numbering, and the relay
+   * would count the next input in that room as a break.
+   */
+  watch(roomId: string): void {
+    if (this.observed.has(roomId)) return
+    const senders = this.options.users.filter((sender) => this.options.allowed(roomId, sender))
+    if (senders.length === 0) return
+    this.observed.add(roomId)
+    this.transitions.forget(roomId)
     const observedAt = this.options.now()
-    for (const roomId of this.options.rooms) {
-      for (const sender of this.options.users) this.enqueue({ roomId, sender, state: "reset" }, observedAt)
-    }
+    for (const sender of senders) this.enqueue({ roomId, sender, state: "reset" }, observedAt)
   }
 
   /** One room's current typist set, from the sync about to be processed. */
   observe(roomId: string, userIds: readonly string[]): void {
+    // A room allowed since start whose typing arrives before the room sync names it.
+    this.watch(roomId)
     const at = this.options.now()
     for (const transition of this.transitions.apply(roomId, userIds)) this.enqueue(transition, at)
   }

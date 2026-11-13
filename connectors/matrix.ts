@@ -643,6 +643,7 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
       botUserId,
       log: (line) => this.log(line),
       now: Date.now,
+      allowedRoom: (roomId) => this.typingForwarder?.watch(roomId),
     })
   }
 

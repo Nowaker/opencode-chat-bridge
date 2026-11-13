@@ -56,6 +56,8 @@ export interface RoomSyncOptions {
   botUserId: string
   log(line: string): void
   now(): number
+  /** A registry room became one this connector may act in. */
+  allowedRoom?(roomId: string): void
 }
 
 const ENCRYPTION = { type: "m.room.encryption", state_key: "", content: { algorithm: "m.megolm.v1.aes-sha2" } }
@@ -182,8 +184,10 @@ export class RoomSync {
 
   private adopt(registry: RoomsResponse): void {
     this.registry = registry
+    const before = new Set(this.allowed)
     this.allowed.clear()
     for (const room of registry.rooms) if (room.kind !== "space") this.allowed.add(room.roomId)
+    for (const roomId of this.allowed) if (!before.has(roomId)) this.options.allowedRoom?.(roomId)
   }
 
   private failed(what: string, error: unknown): void {
@@ -338,6 +342,7 @@ export class RoomSync {
       const response = await this.options.relay.claim(roomId, inviter, name, encrypted)
       if (response.state === "bound") {
         this.allowed.add(roomId)
+        this.options.allowedRoom?.(roomId)
         await this.options.matrix.notice(roomId, boundNotice(response))
         this.options.log(`[ROOMS] ${roomId} bound by its name to a ${response.kind}`)
         await this.sync()

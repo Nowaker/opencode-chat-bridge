@@ -100,8 +100,12 @@ function setup(clock = { at: 0 }) {
   const matrix = new FakeMatrix()
   const relay = new FakeRelay()
   const logs: string[] = []
-  const sync = new RoomSync({ matrix, relay, botUserId: BOT, log: (line) => logs.push(line), now: () => clock.at })
-  return { matrix, relay, sync, logs, clock }
+  const allowedRooms: string[] = []
+  const sync = new RoomSync({
+    matrix, relay, botUserId: BOT, log: (line) => logs.push(line), now: () => clock.at,
+    allowedRoom: (roomId) => allowedRooms.push(roomId),
+  })
+  return { matrix, relay, sync, logs, clock, allowedRooms }
 }
 
 describe("creating rooms", () => {
@@ -214,6 +218,25 @@ describe("membership", () => {
     await sync.memberEvent("!p:example.org", { type: "m.room.member", state_key: BOT, content: { membership: "leave" } })
     expect(relay.goneCalls).toEqual(["!p:example.org"])
     expect(sync.allows("!p:example.org")).toBe(false)
+  })
+})
+
+describe("rooms becoming allowed", () => {
+  test("each registry room is announced once when it becomes allowed, the Space never", async () => {
+    const { relay, sync, allowedRooms } = setup()
+    relay.response = registry({
+      space: "!space:example.org",
+      rooms: [
+        { roomId: "!space:example.org", kind: "space", key: "", label: "Vibeterm", ownerJoined: true },
+        { roomId: "!p:example.org", kind: "project", key: "/p", label: "p", ownerJoined: false },
+      ],
+    })
+    await sync.sync()
+    await sync.sync()
+    expect(allowedRooms).toEqual(["!p:example.org"])
+
+    await sync.invited("!n:example.org", OWNER)
+    expect(allowedRooms).toEqual(["!p:example.org", "!n:example.org"])
   })
 })
 
