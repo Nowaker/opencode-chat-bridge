@@ -168,8 +168,11 @@ export interface NackRequest {
  * the Matrix work and reports back; a room's id, never its name, is what the
  * allowlists hold.
  */
-export const ROOM_KINDS = ["space", "project", "session", "dm"] as const
+export const ROOM_KINDS = ["space", "project", "session", "dm", "questions"] as const
 export type RoomKind = (typeof ROOM_KINDS)[number]
+
+/** The rooms the relay asks the connector to create; `session` rooms are only ever the owner's. */
+export type WantedRoomKind = Exclude<RoomKind, "session">
 
 export const OWNER_MEMBERSHIPS = ["join", "invite", "leave", "ban", "knock"] as const
 export type OwnerMembership = (typeof OWNER_MEMBERSHIPS)[number]
@@ -188,7 +191,7 @@ export interface RoomEntry {
 /** A room the relay wants created. Its `requestId` is stamped into the room, so a crash after creating never creates a second. */
 export interface RoomWanted {
   requestId: string
-  kind: "space" | "project" | "dm"
+  kind: WantedRoomKind
   name: string
   topic: string
 }
@@ -219,7 +222,11 @@ export interface RoomMemberRequest {
   membership: OwnerMembership
 }
 
-/** The bot joined a room an owner created and invited it to. */
+/**
+ * The bot joined a room an owner created: one that owner invited it to
+ * (`source` "invite", the default), or one that owner listed in the Space
+ * (`source` "space"; `inviter` is the owner who listed it).
+ */
 export interface RoomClaimRequest {
   route: RelayRoute
   roomId: string
@@ -227,7 +234,11 @@ export interface RoomClaimRequest {
   /** Read only for this binding, never for authorization. */
   name: string
   encrypted: boolean
+  source?: RoomClaimSource
 }
+
+export const ROOM_CLAIM_SOURCES = ["invite", "space"] as const
+export type RoomClaimSource = (typeof ROOM_CLAIM_SOURCES)[number]
 
 export type RoomClaimResponse = { state: "bound"; kind: RoomKind; label: string } | { state: "refused"; reason: string }
 

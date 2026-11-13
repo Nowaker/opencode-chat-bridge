@@ -118,7 +118,7 @@ import { downloadMatrixAudio, matrixAudio, matrixVoiceRequest, type MatrixAudio,
 import type { InboundRequest, OutboxItem, TypingRequest } from "../src/relay/types"
 import { TypingAwareClient, TypingForwarder } from "./matrix-typing"
 import { inviteDecision } from "./matrix-invites"
-import { RoomSync, type MatrixRoomsPort } from "./matrix-rooms"
+import { hierarchyNext, RoomSync, spaceChildren, type MatrixRoomsPort } from "./matrix-rooms"
 
 // Relay mode: this container is transport only. Accepted messages go to
 // the vibeterm-channels relay on the host, which prompts a Vibeterm coordinator session,
@@ -634,6 +634,22 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
       notice: async (roomId, text) => {
         await matrix.sendNotice(roomId, this.safeOutboundText(text))
       },
+      hierarchy: async (spaceId) => {
+        const pages: unknown[] = []
+        let from = ""
+        // A few pages at most: a Space here holds tens of rooms.
+        for (let page = 0; page < 5; page++) {
+          const query: Record<string, string> = { max_depth: "1", limit: "100", ...(from ? { from } : {}) }
+          const response: unknown = await matrix.doRequest("GET", `/_matrix/client/v1/rooms/${encodeURIComponent(spaceId)}/hierarchy`, query)
+          pages.push(response)
+          from = hierarchyNext(response)
+          if (!from) break
+        }
+        return spaceChildren(spaceId, pages)
+      },
+      join: async (roomId, via) => {
+        await matrix.joinRoom(roomId, via)
+      },
     }
     return new RoomSync({
       matrix: port,
@@ -641,7 +657,7 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
         rooms: () => relay.rooms("matrix"),
         created: (requestId, roomId) => relay.roomCreated({ route: "matrix", requestId, roomId }),
         member: (roomId, user, membership) => relay.roomMember({ route: "matrix", roomId, user, membership }),
-        claim: (roomId, inviter, name, encrypted) => relay.roomClaim({ route: "matrix", roomId, inviter, name, encrypted }),
+        claim: (roomId, inviter, name, encrypted, source) => relay.roomClaim({ route: "matrix", roomId, inviter, name, encrypted, source }),
         gone: (roomId) => relay.roomGone({ route: "matrix", roomId }),
       },
       botUserId,

@@ -13,21 +13,39 @@
  * - lists project rooms and the configured rooms in the Space;
  * - reports each owner's membership in every registry room, and the bot
  *   leaving one;
- * - binds a room an owner created and invited the bot to, by its name, when
- *   the relay serves named rooms: the relay checks the name, the inviter and
- *   the room's encryption; a refused room gets the reason and the bot leaves.
+ * - binds a room an owner created, by its name, when the relay serves named
+ *   rooms: one the owner invited the bot to, or one the owner listed in the
+ *   Space (read from the Space's hierarchy, joined as a Space member). The
+ *   relay checks the name, the owner and the room's encryption; a refused room
+ *   gets the reason and the bot leaves;
+ * - backs off when the homeserver rate-limits it (`M_LIMIT_EXCEEDED`): the
+ *   pass stops, and the next one starts after `retry_after_ms`.
  *
  * A registry room's id joins the connector's allowlist once the relay has it;
  * the Space never does, as it carries no messages.
  */
 
-import type { OwnerMembership, RoomClaimResponse, RoomsResponse, RoomWanted } from "../src/relay/types"
+import type { OwnerMembership, RoomClaimResponse, RoomClaimSource, RoomsResponse, RoomWanted } from "../src/relay/types"
 import { OWNER_MEMBERSHIPS } from "../src/relay/types"
 
 /** The creation-content key a created room carries its relay request id under. */
 export const REQUEST_STAMP = "org.vibeterm.request_id"
 /** Every owner's membership in every registry room is read again this often; events keep it current in between. */
 const MEMBERSHIP_RESCAN_MS = 5 * 60_000
+/** How often the Space's rooms are read for rooms an owner added there. */
+const DISCOVERY_MS = 60_000
+/** The wait after a rate limit that names none. */
+const DEFAULT_RATE_LIMIT_MS = 10_000
+/** A name the relay may bind: a session id standing on its own anywhere, or `vt <project>`. */
+const BINDING_NAME = /(?<![A-Za-z0-9_])ses_[A-Za-z0-9]+(?![A-Za-z0-9_])|^\s*vt\s+\S/i
+
+/** A room listed in a Space, as its hierarchy shows it. */
+export interface SpaceChild {
+  roomId: string
+  name: string
+  /** Who sent the Space's `m.space.child` for it. */
+  listedBy: string
+}
 
 export interface MatrixRoomsPort {
   joinedRooms(): Promise<string[]>
@@ -40,13 +58,16 @@ export interface MatrixRoomsPort {
   setAccountData(type: string, content: Record<string, unknown>): Promise<void>
   leave(roomId: string): Promise<void>
   notice(roomId: string, text: string): Promise<void>
+  /** The rooms listed in a Space that the bot can see. */
+  hierarchy(spaceId: string): Promise<SpaceChild[]>
+  join(roomId: string, via: string[]): Promise<void>
 }
 
 export interface RoomsRelayPort {
   rooms(): Promise<RoomsResponse>
   created(requestId: string, roomId: string): Promise<void>
   member(roomId: string, user: string, membership: OwnerMembership): Promise<void>
-  claim(roomId: string, inviter: string, name: string, encrypted: boolean): Promise<RoomClaimResponse>
+  claim(roomId: string, inviter: string, name: string, encrypted: boolean, source: RoomClaimSource): Promise<RoomClaimResponse>
   gone(roomId: string): Promise<void>
 }
 
@@ -74,6 +95,60 @@ function serverOf(userId: string): string {
   return userId.slice(userId.indexOf(":") + 1)
 }
 
+/** The next page's token of a `GET /rooms/{space}/hierarchy` answer, or "" at the end. */
+export function hierarchyNext(response: unknown): string {
+  return isRecord(response) && typeof response["next_batch"] === "string" ? response["next_batch"] : ""
+}
+
+/**
+ * The child rooms in the pages of `GET /rooms/{space}/hierarchy`, each with
+ * who listed it: the sender of the Space's `m.space.child`, which only the
+ * Space's own entry (first page) carries, while a child's name is in its own
+ * entry, possibly on a later page.
+ */
+export function spaceChildren(spaceId: string, pages: readonly unknown[]): SpaceChild[] {
+  const rooms = pages.flatMap((page) => (isRecord(page) && Array.isArray(page["rooms"]) ? page["rooms"].filter(isRecord) : []))
+  const listedBy = new Map<string, string>()
+  for (const room of rooms) {
+    if (room["room_id"] !== spaceId || !Array.isArray(room["children_state"])) continue
+    for (const event of room["children_state"]) {
+      if (!isRecord(event) || event["type"] !== "m.space.child") continue
+      const content = event["content"]
+      const via = isRecord(content) ? content["via"] : undefined
+      const childId = event["state_key"]
+      const sender = event["sender"]
+      if (typeof childId === "string" && typeof sender === "string" && Array.isArray(via) && via.length > 0) listedBy.set(childId, sender)
+    }
+  }
+  const children: SpaceChild[] = []
+  for (const room of rooms) {
+    const roomId = room["room_id"]
+    if (typeof roomId !== "string" || roomId === spaceId) continue
+    const by = listedBy.get(roomId)
+    if (by === undefined) continue
+    children.push({ roomId, name: typeof room["name"] === "string" ? room["name"] : "", listedBy: by })
+  }
+  return children
+}
+
+/** How long the homeserver asked to wait, when `error` is its rate limit; null for any other error. */
+export function rateLimitMs(error: unknown): number | null {
+  if (!isRecord(error)) return null
+  const body = error["body"]
+  const errcode = error["errcode"] ?? (isRecord(body) ? body["errcode"] : undefined)
+  if (errcode !== "M_LIMIT_EXCEEDED" && error["statusCode"] !== 429) return null
+  const wait = error["retryAfterMs"] ?? (isRecord(body) ? body["retry_after_ms"] : undefined)
+  return typeof wait === "number" && Number.isFinite(wait) && wait > 0 ? wait : DEFAULT_RATE_LIMIT_MS
+}
+
+/** Ends a pass at a rate limit; the next pass starts after the wait. */
+class RateLimited extends Error {
+  constructor() {
+    super("rate limited")
+    this.name = "RateLimited"
+  }
+}
+
 /** The options a wanted room is created with. */
 export function createOptions(want: RoomWanted, registry: RoomsResponse, botUserId: string): Record<string, unknown> | null {
   const powerLevels = { users: Object.fromEntries([botUserId, ...registry.owners].map((user) => [user, 100])) }
@@ -89,7 +164,8 @@ export function createOptions(want: RoomWanted, registry: RoomsResponse, botUser
         creation_content: { ...creation, type: "m.space" },
         power_level_content_override: { ...powerLevels, events_default: 100 },
       }
-    case "project": {
+    case "project":
+    case "questions": {
       if (registry.space === null) return null
       return {
         name: want.name,
@@ -138,6 +214,10 @@ export class RoomSync {
   private lastRescan = 0
   private running: Promise<void> | null = null
   private lastError = ""
+  private blockedUntil = 0
+  private lastDiscovery = Number.NEGATIVE_INFINITY
+  /** Space rooms the bot joined or tried to, by the name they had then: tried again only under a new name. */
+  private readonly tried = new Map<string, string>()
 
   constructor(private readonly options: RoomSyncOptions) {}
 
@@ -157,29 +237,38 @@ export class RoomSync {
   }
 
   private async pass(): Promise<void> {
-    let registry: RoomsResponse
+    if (this.options.now() < this.blockedUntil) return
     try {
-      registry = await this.options.relay.rooms()
+      await this.steps()
     } catch (error) {
-      this.failed("rooms not read from the relay", error)
-      return
+      if (!(error instanceof RateLimited)) throw error
     }
-    this.adopt(registry)
+  }
+
+  private async steps(): Promise<void> {
+    if (!(await this.readRegistry())) return
+    const registry = this.registry
+    if (registry === null) return
+    // One room at a time: each is reported before the next is made, and a rate limit stops the rest.
     let changed = false
     for (const want of registry.wanted) changed = (await this.ensure(want, registry)) || changed
-    if (changed) {
-      try {
-        this.adopt(await this.options.relay.rooms())
-      } catch (error) {
-        this.failed("rooms not read again from the relay", error)
-        return
-      }
-    }
+    if (changed && !(await this.readRegistry())) return
     const current = this.registry ?? registry
     await this.ensureChildren(current)
     await this.ensureDirect(current)
-    await this.scanMemberships(current)
+    if ((await this.discover(current)) && !(await this.readRegistry())) return
+    await this.scanMemberships(this.registry ?? current)
     this.lastError = ""
+  }
+
+  private async readRegistry(): Promise<boolean> {
+    try {
+      this.adopt(await this.options.relay.rooms())
+      return true
+    } catch (error) {
+      this.failed("rooms not read from the relay", error)
+      return false
+    }
   }
 
   private adopt(registry: RoomsResponse): void {
@@ -190,10 +279,21 @@ export class RoomSync {
     for (const roomId of this.allowed) if (!before.has(roomId)) this.options.allowedRoom?.(roomId)
   }
 
+  /** Logged once while it repeats; a rate limit also holds every pass until its wait is over. */
   private failed(what: string, error: unknown): void {
-    const message = `${what}: ${error instanceof Error ? error.message : String(error)}`
+    const wait = rateLimitMs(error)
+    if (wait !== null) this.blockedUntil = Math.max(this.blockedUntil, this.options.now() + wait)
+    const message = wait === null
+      ? `${what}: ${error instanceof Error ? error.message : String(error)}`
+      : `${what}: rate limited by the homeserver; trying again in ${Math.ceil(wait / 1000)} s`
     if (message !== this.lastError) this.options.log(`[ROOMS] ${message}`)
     this.lastError = message
+  }
+
+  /** In a pass: a rate limit ends it. */
+  private passFailed(what: string, error: unknown): void {
+    this.failed(what, error)
+    if (rateLimitMs(error) !== null) throw new RateLimited()
   }
 
   /** The room made for `requestId` earlier, found by its stamp among the rooms the bot is in. */
@@ -225,7 +325,7 @@ export class RoomSync {
       await this.options.relay.created(want.requestId, roomId)
       return true
     } catch (error) {
-      this.failed(`room for ${want.requestId} not made`, error)
+      this.passFailed(`room for ${want.requestId} not made`, error)
       return false
     }
   }
@@ -234,7 +334,8 @@ export class RoomSync {
   private async ensureChildren(registry: RoomsResponse): Promise<void> {
     const space = registry.space
     if (space === null) return
-    const rooms = [...registry.spaceChildren, ...registry.rooms.filter((room) => room.kind === "project").map((room) => room.roomId)]
+    const listed = registry.rooms.filter((room) => room.kind === "project" || room.kind === "questions").map((room) => room.roomId)
+    const rooms = [...registry.spaceChildren, ...listed]
     for (const roomId of rooms) {
       const key = `${space}\u0000${roomId}`
       if (this.children.has(key)) continue
@@ -245,7 +346,7 @@ export class RoomSync {
         }
         this.children.add(key)
       } catch (error) {
-        this.failed(`${roomId} not listed in the Space`, error)
+        this.passFailed(`${roomId} not listed in the Space`, error)
       }
     }
   }
@@ -267,7 +368,7 @@ export class RoomSync {
       if (changed) await this.options.matrix.setAccountData("m.direct", next)
       this.directDone = dm.roomId
     } catch (error) {
-      this.failed("the direct chat not marked direct", error)
+      this.passFailed("the direct chat not marked direct", error)
     }
   }
 
@@ -283,7 +384,7 @@ export class RoomSync {
           const membership = member?.["membership"]
           await this.report(room.roomId, owner, isMembership(membership) ? membership : "leave")
         } catch (error) {
-          this.failed(`membership in ${room.roomId} not read`, error)
+          this.passFailed(`membership in ${room.roomId} not read`, error)
         }
       }
     }
@@ -336,23 +437,66 @@ export class RoomSync {
     if (this.registry === null) await this.sync()
     if (!this.registry?.named) return
     try {
-      const nameEvent = await this.options.matrix.stateEvent(roomId, "m.room.name", "")
-      const name = typeof nameEvent?.["name"] === "string" ? nameEvent["name"] : ""
-      const encrypted = (await this.options.matrix.stateEvent(roomId, "m.room.encryption", "")) !== null
-      const response = await this.options.relay.claim(roomId, inviter, name, encrypted)
-      if (response.state === "bound") {
-        this.allowed.add(roomId)
-        this.options.allowedRoom?.(roomId)
-        await this.options.matrix.notice(roomId, boundNotice(response))
-        this.options.log(`[ROOMS] ${roomId} bound by its name to a ${response.kind}`)
-        await this.sync()
-        return
-      }
-      await this.options.matrix.notice(roomId, `Not bound: ${response.reason}.`)
-      await this.options.matrix.leave(roomId)
-      this.options.log(`[ROOMS] ${roomId} refused: ${response.reason}`)
+      if (await this.bind(roomId, inviter, "invite")) await this.sync()
     } catch (error) {
       this.failed(`${roomId} not bound`, error)
     }
+  }
+
+  /**
+   * Rooms an owner listed in the Space whose name the relay may bind: joined
+   * as a Space member and claimed, each once per name. True when one bound.
+   */
+  private async discover(registry: RoomsResponse): Promise<boolean> {
+    const space = registry.space
+    if (!registry.named || space === null || this.options.now() - this.lastDiscovery < DISCOVERY_MS) return false
+    this.lastDiscovery = this.options.now()
+    let children: SpaceChild[]
+    try {
+      children = await this.options.matrix.hierarchy(space)
+    } catch (error) {
+      this.passFailed("the Space's rooms not read", error)
+      return false
+    }
+    let bound = false
+    for (const child of children) {
+      if (this.registered(child.roomId) || registry.spaceChildren.includes(child.roomId)) continue
+      if (!registry.owners.includes(child.listedBy) || !BINDING_NAME.test(child.name)) continue
+      if (this.tried.get(child.roomId) === child.name) continue
+      try {
+        await this.options.matrix.join(child.roomId, [serverOf(this.options.botUserId)])
+      } catch (error) {
+        this.passFailed(`${child.roomId} in the Space not joined`, error)
+        this.tried.set(child.roomId, child.name)
+        continue
+      }
+      this.tried.set(child.roomId, child.name)
+      this.options.log(`[ROOMS] joined ${child.roomId}, listed in the Space`)
+      try {
+        bound = (await this.bind(child.roomId, child.listedBy, "space")) || bound
+      } catch (error) {
+        this.passFailed(`${child.roomId} not bound`, error)
+      }
+    }
+    return bound
+  }
+
+  /** Claims a room the bot is in by its name: bound, or told why not and left. True when bound. */
+  private async bind(roomId: string, owner: string, source: RoomClaimSource): Promise<boolean> {
+    const nameEvent = await this.options.matrix.stateEvent(roomId, "m.room.name", "")
+    const name = typeof nameEvent?.["name"] === "string" ? nameEvent["name"] : ""
+    const encrypted = (await this.options.matrix.stateEvent(roomId, "m.room.encryption", "")) !== null
+    const response = await this.options.relay.claim(roomId, owner, name, encrypted, source)
+    if (response.state === "bound") {
+      this.allowed.add(roomId)
+      this.options.allowedRoom?.(roomId)
+      await this.options.matrix.notice(roomId, boundNotice(response))
+      this.options.log(`[ROOMS] ${roomId} bound by its name to a ${response.kind}`)
+      return true
+    }
+    await this.options.matrix.notice(roomId, `Not bound: ${response.reason}.`)
+    await this.options.matrix.leave(roomId)
+    this.options.log(`[ROOMS] ${roomId} refused: ${response.reason}`)
+    return false
   }
 }

@@ -1,6 +1,16 @@
 import { describe, expect, test } from "bun:test"
-import { createOptions, REQUEST_STAMP, RoomSync, type MatrixRoomsPort, type RoomsRelayPort } from "../../connectors/matrix-rooms"
-import type { OwnerMembership, RoomClaimResponse, RoomsResponse } from "../../src/relay/types"
+import {
+  createOptions,
+  hierarchyNext,
+  rateLimitMs,
+  REQUEST_STAMP,
+  RoomSync,
+  spaceChildren,
+  type MatrixRoomsPort,
+  type RoomsRelayPort,
+  type SpaceChild,
+} from "../../connectors/matrix-rooms"
+import type { OwnerMembership, RoomClaimResponse, RoomClaimSource, RoomsResponse } from "../../src/relay/types"
 
 const BOT = "@bot:example.org"
 const OWNER = "@owner:example.org"
@@ -31,6 +41,8 @@ class FakeMatrix implements MatrixRoomsPort {
     return [...this.joined]
   }
   async createRoom(options: Record<string, unknown>): Promise<string> {
+    const error = this.createErrors.shift()
+    if (error !== undefined) throw error
     this.created.push(options)
     const roomId = `!made${++this.seq}:example.org`
     this.joined.add(roomId)
@@ -55,6 +67,19 @@ class FakeMatrix implements MatrixRoomsPort {
     this.left.push(roomId)
     this.joined.delete(roomId)
   }
+  children: SpaceChild[] = []
+  hierarchyReads = 0
+  joins: string[] = []
+  /** Thrown by the next createRoom calls, one each, before any room is made. */
+  createErrors: unknown[] = []
+  async hierarchy(): Promise<SpaceChild[]> {
+    this.hierarchyReads++
+    return this.children.map((child) => ({ ...child }))
+  }
+  async join(roomId: string): Promise<void> {
+    this.joins.push(roomId)
+    this.joined.add(roomId)
+  }
   async notice(roomId: string, text: string): Promise<void> {
     this.notices.push({ roomId, text })
   }
@@ -65,7 +90,7 @@ class FakeRelay implements RoomsRelayPort {
   response = registry()
   createdCalls: Array<{ requestId: string; roomId: string }> = []
   members: Array<{ roomId: string; user: string; membership: OwnerMembership }> = []
-  claims: Array<{ roomId: string; inviter: string; name: string; encrypted: boolean }> = []
+  claims: Array<{ roomId: string; inviter: string; name: string; encrypted: boolean; source: RoomClaimSource }> = []
   claimAnswer: RoomClaimResponse = { state: "bound", kind: "project", label: "app" }
   goneCalls: string[] = []
   reads = 0
@@ -85,8 +110,8 @@ class FakeRelay implements RoomsRelayPort {
   async member(roomId: string, user: string, membership: OwnerMembership): Promise<void> {
     this.members.push({ roomId, user, membership })
   }
-  async claim(roomId: string, inviter: string, name: string, encrypted: boolean): Promise<RoomClaimResponse> {
-    this.claims.push({ roomId, inviter, name, encrypted })
+  async claim(roomId: string, inviter: string, name: string, encrypted: boolean, source: RoomClaimSource): Promise<RoomClaimResponse> {
+    this.claims.push({ roomId, inviter, name, encrypted, source })
     if (this.claimAnswer.state === "bound") this.response.rooms.push({ roomId, kind: this.claimAnswer.kind, key: "", label: this.claimAnswer.label, ownerJoined: true })
     return this.claimAnswer
   }
@@ -246,7 +271,7 @@ describe("rooms the owner names", () => {
     matrix.setState("!n:example.org", "m.room.name", "", { name: "vt app" })
     matrix.setState("!n:example.org", "m.room.encryption", "", { algorithm: "m.megolm.v1.aes-sha2" })
     await sync.invited("!n:example.org", OWNER)
-    expect(relay.claims).toEqual([{ roomId: "!n:example.org", inviter: OWNER, name: "vt app", encrypted: true }])
+    expect(relay.claims).toEqual([{ roomId: "!n:example.org", inviter: OWNER, name: "vt app", encrypted: true, source: "invite" }])
     expect(sync.allows("!n:example.org")).toBe(true)
     expect(matrix.notices).toEqual([{ roomId: "!n:example.org", text: expect.stringContaining("Bound to project app") }])
     expect(matrix.left).toEqual([])
@@ -269,5 +294,159 @@ describe("rooms the owner names", () => {
     expect(relay.claims).toEqual([])
     expect(matrix.left).toEqual([])
     expect(matrix.notices).toEqual([])
+  })
+})
+
+const LIMITED = { errcode: "M_LIMIT_EXCEEDED", statusCode: 429, retryAfterMs: 3_000, body: { errcode: "M_LIMIT_EXCEEDED", retry_after_ms: 3_000 } }
+
+describe("rate limits", () => {
+  test("the wait comes from the error, a default when it names none, and nothing for other errors", () => {
+    expect(rateLimitMs(LIMITED)).toBe(3_000)
+    expect(rateLimitMs({ statusCode: 429, body: { errcode: "M_LIMIT_EXCEEDED", retry_after_ms: 1_500 } })).toBe(1_500)
+    expect(rateLimitMs({ errcode: "M_LIMIT_EXCEEDED" })).toBe(10_000)
+    expect(rateLimitMs({ errcode: "M_FORBIDDEN", statusCode: 403 })).toBeNull()
+    expect(rateLimitMs(new Error("socket hang up"))).toBeNull()
+  })
+
+  test("a rate limit stops the pass, the next passes wait it out, then the rest is made one at a time", async () => {
+    const clock = { at: 0 }
+    const { matrix, relay, sync, logs } = setup(clock)
+    relay.response = registry({
+      space: "!space:example.org",
+      rooms: [{ roomId: "!space:example.org", kind: "space", key: "", label: "Vibeterm", ownerJoined: true }],
+      wanted: [
+        { requestId: "project:a", kind: "project", name: "a", topic: "" },
+        { requestId: "project:b", kind: "project", name: "b", topic: "" },
+      ],
+    })
+    matrix.createErrors.push(LIMITED)
+    await sync.sync()
+    expect(matrix.created).toEqual([])
+    expect(relay.createdCalls).toEqual([])
+    expect(logs).toEqual(["[ROOMS] room for project:a not made: rate limited by the homeserver; trying again in 3 s"])
+
+    clock.at = 2_999
+    const reads = relay.reads
+    await sync.sync()
+    expect(relay.reads).toBe(reads)
+
+    clock.at = 3_000
+    await sync.sync()
+    expect(relay.createdCalls.map((call) => call.requestId)).toEqual(["project:a", "project:b"])
+    expect(matrix.sent.map((sent) => sent.stateKey)).toEqual(relay.response.rooms.filter((room) => room.kind === "project").map((room) => room.roomId))
+  })
+})
+
+describe("the questions room", () => {
+  test("is made like a project room, inside the Space, and listed in it", async () => {
+    expect(createOptions({ requestId: "questions", kind: "questions", name: "Vibeterm questions", topic: "t" }, registry({ space: "!space:example.org" }), BOT)).toMatchObject({
+      name: "Vibeterm questions",
+      initial_state: [
+        { type: "m.room.encryption" },
+        { type: "m.space.parent", state_key: "!space:example.org" },
+        { type: "m.room.join_rules", content: { join_rule: "restricted" } },
+      ],
+    })
+    const { matrix, relay, sync } = setup()
+    relay.response = registry({
+      space: "!space:example.org",
+      rooms: [{ roomId: "!space:example.org", kind: "space", key: "", label: "Vibeterm", ownerJoined: true }],
+      wanted: [{ requestId: "questions", kind: "questions", name: "Vibeterm questions", topic: "" }],
+    })
+    await sync.sync()
+    const questions = relay.response.rooms.find((room) => room.kind === "questions")?.roomId
+    expect(matrix.sent).toEqual([{ roomId: "!space:example.org", type: "m.space.child", stateKey: questions, content: { via: ["example.org"] } }])
+    expect(sync.allows(questions ?? "")).toBe(true)
+  })
+})
+
+describe("rooms an owner adds to the Space", () => {
+  test("the hierarchy names who listed each child, across pages", () => {
+    const pages = [
+      {
+        rooms: [
+          {
+            room_id: "!space:example.org",
+            children_state: [
+              { type: "m.space.child", state_key: "!a:example.org", sender: OWNER, content: { via: ["example.org"] } },
+              { type: "m.space.child", state_key: "!b:example.org", sender: OWNER, content: { via: ["example.org"] } },
+              { type: "m.space.child", state_key: "!removed:example.org", sender: OWNER, content: {} },
+            ],
+          },
+          { room_id: "!a:example.org", name: "Deploy ses_abc" },
+        ],
+        next_batch: "p2",
+      },
+      { rooms: [{ room_id: "!b:example.org" }, { room_id: "!removed:example.org", name: "x" }, { room_id: "!stray:example.org", name: "y" }] },
+    ]
+    expect(hierarchyNext(pages[0])).toBe("p2")
+    expect(hierarchyNext(pages[1])).toBe("")
+    expect(spaceChildren("!space:example.org", pages)).toEqual([
+      { roomId: "!a:example.org", name: "Deploy ses_abc", listedBy: OWNER },
+      { roomId: "!b:example.org", name: "", listedBy: OWNER },
+    ])
+    expect(spaceChildren("!space:example.org", [null, { rooms: "x" }])).toEqual([])
+  })
+
+  function spaceSetup(clock = { at: 0 }) {
+    const started = setup(clock)
+    started.relay.response = registry({
+      space: "!space:example.org",
+      spaceChildren: [MAIN],
+      rooms: [{ roomId: "!space:example.org", kind: "space", key: "", label: "Vibeterm", ownerJoined: true }],
+    })
+    return started
+  }
+
+  test("a room an owner listed with a session id in its name is joined and claimed from the Space", async () => {
+    const { matrix, relay, sync, allowedRooms } = spaceSetup()
+    matrix.children = [
+      { roomId: "!s:example.org", name: "Deploy ses_abc123", listedBy: OWNER },
+      { roomId: "!chat:example.org", name: "random chat", listedBy: OWNER },
+      { roomId: "!theirs:example.org", name: "ses_abc999", listedBy: "@stranger:example.org" },
+      { roomId: MAIN, name: "Vibeterm AI", listedBy: OWNER },
+    ]
+    matrix.setState("!s:example.org", "m.room.name", "", { name: "Deploy ses_abc123" })
+    matrix.setState("!s:example.org", "m.room.encryption", "", { algorithm: "m.megolm.v1.aes-sha2" })
+    relay.claimAnswer = { state: "bound", kind: "session", label: "ses_abc123" }
+    await sync.sync()
+    expect(matrix.joins).toEqual(["!s:example.org"])
+    expect(relay.claims).toEqual([{ roomId: "!s:example.org", inviter: OWNER, name: "Deploy ses_abc123", encrypted: true, source: "space" }])
+    expect(sync.allows("!s:example.org")).toBe(true)
+    expect(allowedRooms).toContain("!s:example.org")
+    expect(matrix.notices).toEqual([{ roomId: "!s:example.org", text: expect.stringContaining("Bound to session ses_abc123") }])
+    // Its owner's membership is read in the same pass, once the registry has it.
+    expect(relay.members).toContainEqual({ roomId: "!s:example.org", user: OWNER, membership: "leave" })
+  })
+
+  test("a refused room is left and not tried again until it is renamed; the Space is read once a minute", async () => {
+    const clock = { at: 0 }
+    const { matrix, relay, sync } = spaceSetup(clock)
+    matrix.children = [{ roomId: "!s:example.org", name: "ses_short", listedBy: OWNER }]
+    relay.claimAnswer = { state: "refused", reason: "there is no session ses_short; use its full id" }
+    await sync.sync()
+    expect(matrix.left).toEqual(["!s:example.org"])
+    expect(matrix.notices).toEqual([{ roomId: "!s:example.org", text: "Not bound: there is no session ses_short; use its full id." }])
+
+    await sync.sync()
+    expect(matrix.hierarchyReads).toBe(1)
+    clock.at += 60_000
+    await sync.sync()
+    expect(matrix.hierarchyReads).toBe(2)
+    expect(matrix.joins).toEqual(["!s:example.org"])
+
+    matrix.children = [{ roomId: "!s:example.org", name: "ses_short1", listedBy: OWNER }]
+    clock.at += 60_000
+    await sync.sync()
+    expect(matrix.joins).toEqual(["!s:example.org", "!s:example.org"])
+  })
+
+  test("with named rooms off, the Space is not read", async () => {
+    const { matrix, relay, sync } = spaceSetup()
+    relay.response.named = false
+    matrix.children = [{ roomId: "!s:example.org", name: "ses_abc123", listedBy: OWNER }]
+    await sync.sync()
+    expect(matrix.hierarchyReads).toBe(0)
+    expect(matrix.joins).toEqual([])
   })
 })
