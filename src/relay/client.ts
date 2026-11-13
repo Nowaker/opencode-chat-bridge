@@ -44,8 +44,10 @@ export class RelayClient {
     return this.call("POST", "/v1/inbound", request, 15_000)
   }
 
-  outbox(route: RelayRoute, waitMs: number): Promise<OutboxResponse> {
-    return this.call("GET", `/v1/outbox?route=${route}&waitMs=${waitMs}`, undefined, waitMs + 15_000)
+  /** `reactions`: this connector posts `reaction` items; without it the relay never offers them. */
+  outbox(route: RelayRoute, waitMs: number, options: { reactions?: boolean } = {}): Promise<OutboxResponse> {
+    const reactions = options.reactions ? "&reactions=1" : ""
+    return this.call("GET", `/v1/outbox?route=${route}&waitMs=${waitMs}${reactions}`, undefined, waitMs + 15_000)
   }
 
   async ack(outboxId: string, chatEventId: string): Promise<void> {

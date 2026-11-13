@@ -106,6 +106,7 @@ import {
   EncryptedRelations,
   extractReplyToEventId,
   relayInboundRequest,
+  relayReactionContent,
   stripReplyFallback,
   extractReaction,
   isShortIdAnswer,
@@ -646,7 +647,7 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
     let lastError = ""
     while (!this.stopping) {
       try {
-        const batch = await this.relay!.outbox("matrix", RELAY_OUTBOX_WAIT_MS)
+        const batch = await this.relay!.outbox("matrix", RELAY_OUTBOX_WAIT_MS, { reactions: true })
         if (lastError) {
           this.log("[RELAY] outbox reachable again")
           lastError = ""
@@ -684,6 +685,21 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
     this.log(`[RELAY] posted ${item.outboxId} as ${chatEventId}`)
     await this.relay!.ack(item.outboxId, chatEventId)
       .catch((ackErr) => this.logError(`[RELAY] ack of ${item.outboxId} failed; it will be offered again under the same transaction id:`, ackErr))
+    if (item.kind === "reaction" && item.redacts) await this.redactRelayReaction(item, item.redacts)
+  }
+
+  /**
+   * The status reaction this one replaces. Best effort: a failure leaves both
+   * emoji on the message, which is cosmetic; the relay never offers it again.
+   */
+  private async redactRelayReaction(item: OutboxItem, eventId: string): Promise<void> {
+    const path = `/_matrix/client/v3/rooms/${encodeURIComponent(item.roomId)}/redact/` +
+      `${encodeURIComponent(eventId)}/${encodeURIComponent(`${item.txnId}-redact`)}`
+    try {
+      await this.matrix!.doRequest("PUT", path, null, {})
+    } catch (err) {
+      this.logError(`[RELAY] could not remove the earlier status reaction for ${item.outboxId}: ${err instanceof Error ? err.message : String(err)}`)
+    }
   }
 
   /**
@@ -693,7 +709,8 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
    * fresh id on every call, which would make that retry a second message.
    */
   private async sendRelayItem(item: OutboxItem): Promise<string> {
-    const matrix = this.matrix!
+    // In cleartext, as Element sends its own reactions: the emoji is a status, never chat content.
+    if (item.kind === "reaction") return this.sendRelayEvent(item, "m.reaction", relayReactionContent(item), false)
     const body = this.safeOutboundText(item.text)
     const content: Record<string, unknown> = { msgtype: item.kind === "notice" ? "m.notice" : "m.text", body }
     if (FORMAT_HTML) {
@@ -707,9 +724,15 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
       // Top-level, answering one message: a rich reply, where the owner replied.
       content["m.relates_to"] = { "m.in_reply_to": { event_id: item.replyToEventId } }
     }
-    let eventType = "m.room.message"
+    return this.sendRelayEvent(item, "m.room.message", content)
+  }
+
+  /** One event under the item's transaction id, encrypted in an encrypted room unless `encrypt` is false. */
+  private async sendRelayEvent(item: OutboxItem, type: string, content: Record<string, unknown>, encrypt = true): Promise<string> {
+    const matrix = this.matrix!
+    let eventType = type
     let payload: unknown = content
-    if (await matrix.crypto?.isRoomEncrypted(item.roomId)) {
+    if (encrypt && await matrix.crypto?.isRoomEncrypted(item.roomId)) {
       payload = await matrix.crypto.encryptRoomEvent(item.roomId, eventType, content)
       eventType = "m.room.encrypted"
     }

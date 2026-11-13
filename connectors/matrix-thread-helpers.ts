@@ -3,7 +3,7 @@
  *
  * Extracted so tests can import them without needing matrix-bot-sdk installed.
  */
-import type { InboundRequest } from "../src/relay/types"
+import type { InboundRequest, OutboxItem } from "../src/relay/types"
 
 /**
  * Normalized context extracted from a Matrix room event.
@@ -266,4 +266,9 @@ export function extractReaction(event: any): { targetEventId: string; key: strin
  */
 export function isShortIdAnswer(text: string): boolean {
   return /^\s*q\d{1,3}(?=$|[\s:.,)-])/i.test(text)
+}
+
+/** The bot's status emoji (`item.text`) on the event `item.replyToEventId`, as an `m.reaction`. */
+export function relayReactionContent(item: Pick<OutboxItem, "replyToEventId" | "text">): Record<string, unknown> {
+  return { "m.relates_to": { rel_type: "m.annotation", event_id: item.replyToEventId, key: item.text } }
 }

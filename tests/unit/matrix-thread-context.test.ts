@@ -15,6 +15,7 @@ import {
   extractReplyToEventId,
   extractReplacedEventId,
   relayInboundRequest,
+  relayReactionContent,
   stripReplyFallback,
   extractReaction,
   isShortIdAnswer,
@@ -348,5 +349,13 @@ describe("reactions and Q-number answers", () => {
     expect(isShortIdAnswer("Q5")).toBe(true)
     expect(isShortIdAnswer("Q2026 plan")).toBe(false)
     expect(isShortIdAnswer("Quick question")).toBe(false)
+  })
+})
+
+describe("relay status reactions", () => {
+  test("a reaction item is an m.annotation on the event it names, keyed by its emoji", () => {
+    expect(relayReactionContent({ replyToEventId: "$prompt", text: "⏳" })).toEqual({
+      "m.relates_to": { rel_type: "m.annotation", event_id: "$prompt", key: "⏳" },
+    })
   })
 })

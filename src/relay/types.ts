@@ -114,7 +114,9 @@ export interface OutboxItem {
   replyToEventId: string
   text: string
   /** `attention` is an item of the attention inbox; a reply in its thread answers it. */
-  kind: "reply" | "notice" | "attention"
+  kind: "reply" | "notice" | "attention" | "reaction"
+  /** A reaction only: the bot's earlier reaction in the same place, to redact once this one is sent. */
+  redacts?: string
   /** The `replyBy` of the message this answers, when it had one. */
   replyBy?: number
 }
