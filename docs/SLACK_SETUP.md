@@ -28,6 +28,7 @@ The Slack connector uses **Socket Mode** which allows real-time messaging withou
 | `channels:history` | Read messages in public channels |
 | `channels:read` | View channel info |
 | `app_mentions:read` | Respond when @mentioned |
+| `files:read` | Download voice notes (audio clips) for transcription in relay mode |
 
 Optional scopes for DM support:
 - `im:history` - Read direct messages

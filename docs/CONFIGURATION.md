@@ -100,6 +100,7 @@ What a connector does in relay mode:
 - Forwards an untriggered reply inside a thread too, marked `implicit`; the relay answers it only in a thread it serves, which includes the thread of an attention post, where a reply answers that question or permission.
 - Drains the relay's outbox and posts each item: a `reply` or an `attention` post as an ordinary message, a `notice` as a Matrix `m.notice`. Matrix sends each under the relay's transaction id, which the homeserver deduplicates; Slack has no such id, so a Slack post that may have gone out is never offered twice.
 - Uses the message's own id as the event id: the Matrix event id, or the Slack message `ts`, so the relay's reply thread is a real thread on the platform.
+- Hands the owner's voice notes over for transcription on the host (`POST /v1/voice`, `src/relay/voice.ts`): Matrix `m.audio`, Element's voice messages included, downloaded and, in an encrypted room, decrypted with the connector's own E2EE device (`connectors/matrix-media.ts`); Slack audio clips and shared audio files, downloaded with the bot token (`connectors/slack-media.ts`), which needs the `files:read` scope. Only an allowlisted sender's audio in an allowlisted room is downloaded, and nothing over 20 MiB. A note cannot carry the trigger, so a top-level note or a Reply is forwarded as a prompt, and a note in a thread is `implicit`. A download or hand-over that fails gets a line in the note's thread. The relay transcribes it with whisper.cpp; see its README, "Voice notes".
 
 
 ## OTP broker

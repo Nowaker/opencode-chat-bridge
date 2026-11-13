@@ -38,6 +38,8 @@ import {
   sanitizeServerPaths,
 } from "../src"
 import { RelayClient, RelayError } from "../src/relay/client"
+import { fetchVoiceAudio, forwardVoice } from "../src/relay/voice"
+import { downloadSlackFile, slackAudioFile, slackVoiceRequest, type SlackAudioFile } from "./slack-media"
 import type { InboundRequest, OutboxItem } from "../src/relay/types"
 
 // =============================================================================
@@ -66,7 +68,7 @@ const RELAY_SOCKET = process.env.RELAY_SOCKET || ""
 const RELAY_INBOUND_DELAYS_MS = [1_000, 3_000, 10_000, 30_000, 60_000]
 const RELAY_OUTBOX_WAIT_MS = 8_000
 
-type RelayPort = Pick<RelayClient, "inbound" | "outbox" | "ack" | "nack" | "health">
+type RelayPort = Pick<RelayClient, "inbound" | "outbox" | "ack" | "nack" | "health" | "voice">
 
 function parseSessionRetentionMins(env: NodeJS.ProcessEnv): number {
   const raw = env.SESSION_RETENTION_MINS
@@ -237,7 +239,9 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
   private readonly relay: RelayPort | null
   private stopping = false
 
-  constructor(options: { relay?: RelayPort | null } = {}) {
+  private readonly downloadFile: (url: string) => Promise<Uint8Array<ArrayBuffer>>
+
+  constructor(options: { relay?: RelayPort | null; downloadFile?: (url: string) => Promise<Uint8Array<ArrayBuffer>> } = {}) {
     super({
       connector: "slack",
       trigger: TRIGGER,
@@ -250,6 +254,7 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
     })
     this.threadIsolation = THREAD_ISOLATION
     this.relay = options.relay !== undefined ? options.relay : RELAY_SOCKET ? new RelayClient(RELAY_SOCKET) : null
+    this.downloadFile = options.downloadFile ?? ((url) => downloadSlackFile(url, BOT_TOKEN ?? ""))
   }
 
   // ---------------------------------------------------------------------------
@@ -396,6 +401,10 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
     // Only active when threadIsolation is enabled.
     // -------------------------------------------------------------------------
     app.message(async ({ message, body, client }) => {
+      if (this.relay) {
+        const audio = slackAudioFile(message)
+        if (audio) return await this.handleVoiceShare(message, body, client, audio)
+      }
       if (!this.threadIsolation) return
       if (!("text" in message) || !message.text) return
       if (!("user" in message) || !message.user) return
@@ -511,6 +520,43 @@ export class SlackConnector extends BaseConnector<ChannelSession> {
         await Bun.sleep(delay)
       }
     }
+  }
+
+  /** The owner's audio clip: downloaded with the bot token and handed to the relay to transcribe. */
+  async handleVoiceShare(message: any, body: any, slackClient: any, audio: SlackAudioFile): Promise<void> {
+    if (typeof message?.user !== "string" || typeof message?.channel !== "string" || message.bot_id) return
+    let context: SlackEventContext
+    try {
+      context = normalizeSlackEventContext({
+        teamId: body?.team_id || body?.team?.id || message.team || "",
+        channelId: message.channel,
+        userId: message.user,
+        eventTs: message.ts,
+        threadTs: message.thread_ts,
+      })
+    } catch (err) {
+      this.logError("[VOICE] Invalid event payload:", err)
+      return
+    }
+    if (!this.isChannelAllowed(context.channelId)) return
+    if (this.isDuplicateEvent(context.dedupeId)) return
+    if (!this.isUserAllowed(context.userId)) return
+    this.log(`[VOICE] ${context.userId} in ${context.channelId}: ${audio.mimeType}`)
+    const forwarding = {
+      relay: this.relay!,
+      delaysMs: RELAY_INBOUND_DELAYS_MS,
+      log: (line: string) => this.log(line),
+      warn: (text: string) =>
+        postThreadReply(slackClient, context.channelId, context.replyThreadTs, text).catch((err) =>
+          this.logError("[VOICE] could not say so in the thread:", err)),
+      stopping: () => this.stopping,
+    }
+    const bytes = await fetchVoiceAudio(forwarding, audio.declaredBytes, async () => {
+      const url = audio.url ?? (await slackClient.files.info({ file: audio.id }))?.file?.url_private_download
+      if (typeof url !== "string") throw new Error("Slack gave no download URL for the file")
+      return this.downloadFile(url)
+    })
+    if (bytes) await forwardVoice(forwarding, slackVoiceRequest(context, audio), bytes)
   }
 
   async runRelayOutbox(slackClient: any): Promise<void> {

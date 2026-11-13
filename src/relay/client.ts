@@ -14,6 +14,7 @@ import type {
   RoomMemberRequest,
   RoomsResponse,
   TypingRequest,
+  VoiceRequest,
 } from "./types"
 
 /** `status` is absent when the relay was not reached at all. */
@@ -32,14 +33,17 @@ export class RelayError extends Error {
 export class RelayClient {
   constructor(private readonly socketPath: string, private readonly fetchImpl: typeof fetch = fetch) {}
 
-  private async call<T>(method: "GET" | "POST", path: string, body: unknown, timeoutMs: number): Promise<T> {
+  private call<T>(method: "GET" | "POST", path: string, body: unknown, timeoutMs: number): Promise<T> {
+    return this.send(method, path, body === undefined ? {} : { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }, timeoutMs)
+  }
+
+  private async send<T>(method: "GET" | "POST", path: string, init: { headers?: Record<string, string>; body?: string | FormData }, timeoutMs: number): Promise<T> {
     let response: Response
     try {
       response = await this.fetchImpl(`http://relay${path}`, {
         method,
         unix: this.socketPath,
-        headers: body === undefined ? {} : { "content-type": "application/json" },
-        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        ...init,
         signal: AbortSignal.timeout(timeoutMs),
       } as RequestInit)
     } catch (error) {
@@ -54,6 +58,14 @@ export class RelayClient {
 
   inbound(request: InboundRequest): Promise<InboundResponse> {
     return this.call("POST", "/v1/inbound", request, 15_000)
+  }
+
+  /** A voice note: the relay answers once it has the audio, and transcribes it afterwards. */
+  voice(request: VoiceRequest, audio: Uint8Array<ArrayBuffer>): Promise<InboundResponse> {
+    const form = new FormData()
+    form.set("meta", JSON.stringify(request))
+    form.set("audio", new Blob([audio], { type: request.mimeType }), "voice")
+    return this.send("POST", "/v1/voice", { body: form }, 60_000)
   }
 
   /** `reactions`: this connector posts `reaction` items; without it the relay never offers them. */

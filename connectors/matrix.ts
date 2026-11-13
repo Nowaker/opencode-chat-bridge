@@ -113,6 +113,8 @@ import {
 import { diagnoseEmptyResponse } from "../src/acp-response-diagnostics"
 import { resolveMatrixAccessToken, writePrivateFileAtomically } from "./matrix-auth"
 import { RelayClient, RelayError } from "../src/relay/client"
+import { fetchVoiceAudio, forwardVoice } from "../src/relay/voice"
+import { downloadMatrixAudio, matrixAudio, matrixVoiceRequest, type MatrixAudio, type MatrixMediaClient } from "./matrix-media"
 import type { InboundRequest, OutboxItem, TypingRequest } from "../src/relay/types"
 import { TypingAwareClient, TypingForwarder } from "./matrix-typing"
 import { inviteDecision } from "./matrix-invites"
@@ -453,6 +455,8 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
   private async handleRoomMessage(roomId: string, event: any): Promise<void> {
     const message = new MessageEvent(event)
 
+    const audio = this.relay ? matrixAudio(event) : null
+    if (audio) return await this.handleVoiceMessage(roomId, event, audio)
     if (message.messageType !== "m.text") return
 
     if (!this.isChannelAllowed(roomId)) return
@@ -706,6 +710,38 @@ export class MatrixConnector extends BaseConnector<RoomSession> {
     const context = normalizeMatrixEventContext({ roomId, sender: event.sender, text: reaction.key, eventId: event.event_id }, this.threadIsolation)
     this.log(`[REACTION] ${event.sender} in ${roomId}: ${reaction.key.length} chars`)
     await this.forwardToRelay(context, event, reaction.key, true, { reaction: true, replyToEventId: reaction.targetEventId })
+  }
+
+  /** The owner's voice note: downloaded, decrypted in an encrypted room, and handed to the relay to transcribe. */
+  private async handleVoiceMessage(roomId: string, event: any, audio: MatrixAudio): Promise<void> {
+    if (!this.isChannelAllowed(roomId) || IGNORE_ROOMS.has(roomId)) return
+    const myUserId = await this.matrix!.getUserId()
+    if (event.sender === myUserId || !this.isUserAllowed(event.sender)) return
+    if (typeof event.event_id !== "string" || this.isDuplicateEvent(event.event_id)) return
+    const context = normalizeMatrixEventContext({
+      roomId,
+      sender: event.sender,
+      eventId: event.event_id,
+      threadRootEventId: extractThreadRootId(event),
+    }, this.threadIsolation)
+    this.log(`[VOICE] ${event.sender} in ${roomId}: ${audio.voice ? "voice message" : "audio"}, ${audio.mimeType}, ${audio.source.kind}`)
+    const client = this.matrix!
+    const media: MatrixMediaClient = {
+      downloadContent: (mxc) => client.downloadContent(mxc),
+      decryptMedia: (file) => {
+        if (!client.crypto) throw new Error("this client has no E2EE device to decrypt with")
+        return client.crypto.decryptMedia(file)
+      },
+    }
+    const forwarding = {
+      relay: this.relay!,
+      delaysMs: RELAY_INBOUND_DELAYS_MS,
+      log: (line: string) => this.log(line),
+      warn: (text: string) => this.sendNoticeReply(context, text),
+      stopping: () => this.stopping,
+    }
+    const bytes = await fetchVoiceAudio(forwarding, audio.declaredBytes, () => downloadMatrixAudio(media, audio.source))
+    if (bytes) await forwardVoice(forwarding, matrixVoiceRequest(context, event, audio, Date.now()), bytes)
   }
 
   private async forwardToRelay(context: MatrixEventContext, event: any, query: string, implicit: boolean, extra: Partial<InboundRequest> = {}): Promise<void> {

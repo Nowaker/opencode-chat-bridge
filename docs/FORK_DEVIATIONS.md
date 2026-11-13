@@ -336,6 +336,7 @@ something to create. The path is configuration, never a literal in source.
 - The relay can also post the attention inbox (every question and permission waiting on the owner) to a room, and a reply in such a post's thread answers it. The connector forwards that reply like any other thread reply; the relay tells the two apart.
 - The journal (`journal.jsonl`) records ids, hashes and lengths, never a message body. A prompt's text waits in a 0600 file only until its delivery settles, and a reply's text is read back from vibeterm-api by message id when it has to be offered again.
 - The relay checks the room and sender allowlists again, from the same env-file keys the connector reads.
+- Voice notes: the Matrix and Slack connectors download the owner's audio (decrypting it in an encrypted room with the connector's own device) and hand the bytes to the relay over the same socket (`POST /v1/voice`); the relay transcribes them on the host with whisper.cpp and relays the transcript as a typed message. The audio leaves the container only for the socket.
 - A message posted before the relay registered its session is ignored, and so is an untriggered thread reply in a thread the relay does not serve.
 - `createACPClient` throws in relay mode, so no code path can start an agent in the container, and the entrypoint skips the opencode download.
 - Of the connectors, Matrix and Slack speak relay mode. The relay's `whatsapp` route needs no connector (opencode-tools `_lib/vibeterm-channels/whatsapp-native.ts`):

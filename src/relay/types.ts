@@ -66,6 +66,28 @@ export interface InboundRequest {
   typingWatermark?: TypingWatermark
 }
 
+/**
+ * A voice note (`POST /v1/voice`): the fields of an `InboundRequest` that
+ * describe where it was posted, sent as the `meta` part of a multipart body
+ * whose `audio` part is the audio, already downloaded and, in an encrypted
+ * room, decrypted by the connector. The relay transcribes it on the host and
+ * relays the transcript as if it had been typed.
+ */
+export interface VoiceRequest {
+  route: RelayRoute
+  eventId: string
+  roomId: string
+  threadRootId: string
+  sender: string
+  postedAt: number
+  implicit: boolean
+  replyToEventId?: string
+  /** The audio's MIME type as the platform declared it, such as `audio/ogg`. */
+  mimeType: string
+  /** The duration the platform declared, ms; the relay measures the audio itself and uses this only in logs. */
+  declaredDurationMs?: number
+}
+
 export interface TypingWatermark {
   stream: string
   seq: number
